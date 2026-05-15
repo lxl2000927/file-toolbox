@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 
 Set-Location (Split-Path -Parent $PSScriptRoot)
 
-$Version = "1.1.0.0"
+$Version = "1.1.2.0"
 
 python -m pip install --upgrade pip
 python -m pip install --upgrade pyinstaller

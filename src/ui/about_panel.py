@@ -13,7 +13,7 @@ from utils.style_manager import StyleManager
 from utils.history_manager import HistoryManager, OperationType
 from PyQt6.QtCore import QUrl, QTimer
 
-CURRENT_VERSION = "1.1.0.0"
+CURRENT_VERSION = "1.1.2.0"
 GITHUB_REPO = "LXL2000927/file-toolbox"
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=1"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
