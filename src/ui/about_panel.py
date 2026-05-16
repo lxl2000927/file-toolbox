@@ -12,11 +12,10 @@ from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest, QNetworkRepl
 from utils.style_manager import StyleManager
 from utils.history_manager import HistoryManager, OperationType
 from PyQt6.QtCore import QUrl, QTimer
+from version import APP_NAME, APP_VERSION, GITHUB_REPO, GITHUB_RELEASES_PAGE
 
-CURRENT_VERSION = "1.1.2.0"
-GITHUB_REPO = "LXL2000927/file-toolbox"
+CURRENT_VERSION = APP_VERSION
 GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases?per_page=1"
-GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"
 
 
 class AboutPanel(QWidget):
@@ -58,10 +57,13 @@ class AboutPanel(QWidget):
             }}
         """)
 
-        html = """
+        html = f"""
         <div style="line-height: 1.6;">
-          <div style="font-size: 18px; font-weight: 700; margin-bottom: 10px;">
-            [ PDF Split ] - 重新定义PDF拆分的轻巧与强大
+          <div style="font-size: 18px; font-weight: 700; margin-bottom: 4px;">
+            {APP_NAME}
+          </div>
+          <div style="font-size: 13px; color: #6c757d; margin-bottom: 12px;">
+            当前版本：{APP_VERSION}
           </div>
 
           <div style="font-size: 14px; font-weight: 700; margin: 10px 0 6px 0;">
@@ -100,7 +102,7 @@ class AboutPanel(QWidget):
 
           <div style="margin-top: 14px; padding-top: 10px; border-top: 1px solid #dee2e6;">
             了解更多、获取支持或提出建议，请访问：
-            <a href="https://chatgpt.com/">https://chatgpt.com/</a>
+            <a href="https://github.com/{GITHUB_REPO}">https://github.com/{GITHUB_REPO}</a>
           </div>
         </div>
         """

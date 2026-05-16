@@ -883,6 +883,7 @@ class PdfScanSplitPanel(QWidget):
             qrcode_no_decode=bool(self.qrcode_no_decode_checkbox.isChecked()),
             qrcode_skip_pages=int(self.qrcode_skip_pages_spin.value() if self.qrcode_skip_checkbox.isChecked() else 0),
             qrcode_use_roi=bool(self.qrcode_use_roi_checkbox.isChecked()) and roi_ready,
+            qrcode_max_attempts=180,
         )
 
     def _get_detection_mode(self) -> str:
@@ -1019,6 +1020,7 @@ class PdfScanSplitPanel(QWidget):
             "qrcode_no_decode": bool(options.qrcode_no_decode),
             "qrcode_skip_pages": int(options.qrcode_skip_pages or 0),
             "qrcode_use_roi": bool(options.qrcode_use_roi),
+            "qrcode_max_attempts": int(options.qrcode_max_attempts or 180),
         }
         self._run_context = {
             "pdf_path": pdf_path,
@@ -1352,8 +1354,10 @@ class PdfScanSplitPanel(QWidget):
         cancelled = str(message or "").strip() == "已取消"
         if cancelled:
             self._append_log("任务已取消")
+            self.status_banner.set_message("已取消", "任务已取消。")
         else:
             self._append_log(f"任务失败：{message}")
+            self.status_banner.set_message("处理失败", str(message or "任务失败"))
         pdf_name = (self._run_context or {}).get("pdf_name") if self._run_context else ""
         elapsed_ms = int((time.perf_counter() - self._run_started_at) * 1000) if self._run_started_at else None
         if self.history_manager:

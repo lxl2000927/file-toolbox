@@ -39,9 +39,16 @@ class PdfScanSplitWorker(QThread):
 
     def cancel(self):
         self._cancelled = True
+        self.requestInterruption()
 
     def _cancel_check(self) -> bool:
-        return bool(self._cancelled)
+        return bool(self._cancelled or self.isInterruptionRequested())
+
+    def _emit_result_or_cancel(self, result):
+        if self._cancel_check():
+            self.failed.emit("已取消")
+            return
+        self.finishedWithResult.emit(result)
 
     def _progress(self, current: int, total: int):
         self.progressChanged.emit(int(current), int(total))
@@ -67,7 +74,7 @@ class PdfScanSplitWorker(QThread):
                     log=self._log,
                     cancel_check=self._cancel_check,
                 )
-                self.finishedWithResult.emit(result)
+                self._emit_result_or_cancel(result)
                 return
             if self._task == "probe_page":
                 result = PdfScanSplitEngine.probe_page(
@@ -77,7 +84,7 @@ class PdfScanSplitWorker(QThread):
                     page_index=self._probe_page_index,
                     cancel_check=self._cancel_check,
                 )
-                self.finishedWithResult.emit(result)
+                self._emit_result_or_cancel(result)
                 return
 
             result: PdfScanSplitResult = PdfScanSplitEngine.execute(
@@ -90,8 +97,11 @@ class PdfScanSplitWorker(QThread):
                 log=self._log,
                 cancel_check=self._cancel_check,
             )
-            self.finishedWithResult.emit(result)
+            self._emit_result_or_cancel(result)
         except Exception as e:
+            if self._cancel_check():
+                self.failed.emit("已取消")
+                return
             try:
                 self._log(traceback.format_exc())
             except Exception:
