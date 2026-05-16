@@ -1378,7 +1378,7 @@ class PdfScanSplitEngine:
         total_started_at = time.perf_counter()
         options = options or PdfScanSplitOptions()
         mode = (options.detection_mode or "qrcode").lower()
-        mode = mode if mode in ("feature", "qrcode", "stamp") else "qrcode"
+        mode = mode if mode in ("feature", "qrcode", "stamp", "auto") else "qrcode"
 
         doc = QPdfDocument(None)
         try:

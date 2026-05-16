@@ -23,6 +23,7 @@ class Worker(QRunnable):
         self.args = args
         self.kwargs = kwargs
         self.signals = WorkerSignals()
+        self.setAutoDelete(True)
 
     def run(self):
         try:
@@ -36,3 +37,7 @@ class Worker(QRunnable):
                     traceback=traceback.format_exc(),
                 )
             )
+        finally:
+            self.fn = None
+            self.args = None
+            self.kwargs = None

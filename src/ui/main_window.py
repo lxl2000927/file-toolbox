@@ -200,6 +200,7 @@ class MainWindow(QMainWindow):
                 if (
                     pdf_split_panel
                     and getattr(pdf_split_panel, "pdf_files", None)
+                    and pdf_split_panel.pdf_files
                     and hasattr(scan_panel, "pdf_path_input")
                     and not scan_panel.pdf_path_input.text().strip()
                 ):

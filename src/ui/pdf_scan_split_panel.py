@@ -744,7 +744,7 @@ class PdfScanSplitPanel(QWidget):
             if img is None:
                 raise ValueError("无法读取图像")
             if mode in ("qrcode", "stamp"):
-                vis = img
+                vis = img.copy()
                 if self._reference_roi:
                     x, y, w, h = self._reference_roi
                     cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
