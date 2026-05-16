@@ -393,6 +393,7 @@ class PdfScanSplitEngine:
         render_options: Optional[QPdfDocumentRenderOptions] = None,
         roi_base_size: tuple[int, int] | None = None,
         log: Optional[LogCallback] = None,
+        cancel_check: Optional[CancelCheck] = None,
     ) -> bool:
         needle = (options.qrcode_text_contains or "").strip()
         if options.qrcode_no_decode:
@@ -430,18 +431,30 @@ class PdfScanSplitEngine:
                 )
             return False
 
+        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
         if not PdfScanSplitEngine._qr_detect_likely(page_bgr_qr, detector=detector, cv2=cv2):
             return False
 
+        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
         retry_dpi = min(360, max(240, int(int(options.dpi) * 1.6)))
         if retry_dpi <= int(options.dpi):
             return False
-        page_bgr_retry = PdfScanSplitEngine._render_page_bgr(doc, page_index, retry_dpi, render_options=render_options)
+        page_bgr_retry = PdfScanSplitEngine._render_page_checked(
+            doc,
+            page_index,
+            retry_dpi,
+            render_options=render_options,
+            cancel_check=cancel_check,
+        )
+        if page_bgr_retry is None:
+            PdfScanSplitEngine._raise_if_cancelled(cancel_check)
+            return False
         if roi_base_size and options.reference_roi and options.qrcode_use_roi:
             dst_size = (int(page_bgr_retry.shape[1]), int(page_bgr_retry.shape[0]))
             page_roi = PdfScanSplitEngine._scale_roi(options.reference_roi, src_size=roi_base_size, dst_size=dst_size)
             page_roi = PdfScanSplitEngine._expand_roi(page_roi, dst_size=dst_size, pad_ratio=0.22)
             page_bgr_retry = PdfScanSplitEngine._apply_roi(page_bgr_retry, page_roi)
+        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
         infos_retry = PdfScanSplitEngine._detect_qrcodes(
             page_bgr_retry,
             detector=detector,
@@ -1375,7 +1388,9 @@ class PdfScanSplitEngine:
                         render_options=render_options,
                         roi_base_size=roi_base_size,
                         log=log,
+                        cancel_check=cancel_check,
                     )
+                    PdfScanSplitEngine._raise_if_cancelled(cancel_check)
 
                 if not marked and use_stamp:
                     marked, stamp_debug = PdfScanSplitEngine._detect_stamp_for_scan(i, page_bgr_stamp, cv2=cv2, log=log)

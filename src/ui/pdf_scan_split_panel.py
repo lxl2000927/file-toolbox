@@ -46,6 +46,7 @@ class PdfScanSplitPanel(QWidget):
         self._reference_image_path: str = ""
         self._worker: PdfScanSplitWorker | None = None
         self._worker_task: str = "scan_split"
+        self._closing = False
         self._zoom_step = 1.15
         self._reference_pixmap_original: QPixmap | None = None
         self._reference_zoom = 1.0
@@ -64,17 +65,19 @@ class PdfScanSplitPanel(QWidget):
         self._run_context: dict | None = None
         self._main_splitter: QSplitter | None = None
         self._splitter_adjusting = False
+        self._pdf_page_count_pending = False
+        self._pdf_page_count_path = ""
 
         self._setup_ui()
         self._connect_signals()
         self._restore_settings()
-        self._refresh_pdf_page_count()
+        self._schedule_pdf_page_count_refresh()
 
     def set_pdf_path(self, pdf_path: str):
         self._pdf_path = pdf_path or ""
         self.pdf_path_input.setText(self._pdf_path)
-        self._refresh_pdf_page_count()
         self._sync_image_state()
+        self._schedule_pdf_page_count_refresh()
         if self._pdf_path:
             self.status_banner.set_message("已选择PDF", os.path.basename(self._pdf_path))
         self._schedule_save_settings()
@@ -317,8 +320,8 @@ class PdfScanSplitPanel(QWidget):
         self.test_page_spin.setToolTip("对指定页进行一次识别测试，并输出匹配/内点统计")
 
         self.probe_button = QPushButton("测试单页")
-        self.probe_button.setFixedHeight(32)
-        self.probe_button.setProperty("variant", "outline")
+        self.probe_button.setMinimumHeight(32)
+        self.probe_button.setProperty("variant", "compact")
         self.probe_button.setAutoDefault(False)
         self.probe_button.setDefault(False)
 
@@ -329,8 +332,8 @@ class PdfScanSplitPanel(QWidget):
         self.quick_scan_pages_spin.setToolTip("只扫描前N页，便于快速调参")
 
         self.quick_scan_button = QPushButton("快速扫描前N页")
-        self.quick_scan_button.setFixedHeight(32)
-        self.quick_scan_button.setProperty("variant", "outline")
+        self.quick_scan_button.setMinimumHeight(32)
+        self.quick_scan_button.setProperty("variant", "compact")
         self.quick_scan_button.setAutoDefault(False)
         self.quick_scan_button.setDefault(False)
 
@@ -410,14 +413,14 @@ class PdfScanSplitPanel(QWidget):
         roi_row_layout.setSpacing(8)
 
         self.roi_select_button = QPushButton("框选区域")
-        self.roi_select_button.setProperty("variant", "outline")
-        self.roi_select_button.setFixedHeight(32)
+        self.roi_select_button.setProperty("variant", "compact")
+        self.roi_select_button.setMinimumHeight(32)
         self.roi_select_button.setAutoDefault(False)
         self.roi_select_button.setDefault(False)
 
         self.roi_clear_button = QPushButton("清除区域")
-        self.roi_clear_button.setProperty("variant", "outline")
-        self.roi_clear_button.setFixedHeight(32)
+        self.roi_clear_button.setProperty("variant", "compact")
+        self.roi_clear_button.setMinimumHeight(32)
         self.roi_clear_button.setAutoDefault(False)
         self.roi_clear_button.setDefault(False)
 
@@ -668,9 +671,13 @@ class PdfScanSplitPanel(QWidget):
         return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
+        old_size = event.oldSize()
+        new_size = event.size()
         super().resizeEvent(event)
-        QTimer.singleShot(0, self._set_reference_fit)
-        QTimer.singleShot(0, self._clamp_main_splitter)
+        if old_size == new_size or not self.isVisible():
+            return
+        QTimer.singleShot(60, self._set_reference_fit)
+        QTimer.singleShot(60, self._clamp_main_splitter)
 
     def _clamp_main_splitter(self):
         splitter = self._main_splitter
@@ -824,8 +831,20 @@ class PdfScanSplitPanel(QWidget):
             self._refresh_reference_keypoints()
             self._schedule_save_settings()
 
-    def _refresh_pdf_page_count(self):
+    def _schedule_pdf_page_count_refresh(self):
         path = self.pdf_path_input.text().strip()
+        if path == self._pdf_page_count_path and not self._pdf_page_count_pending:
+            return
+        self._pdf_page_count_path = path
+        if self._pdf_page_count_pending:
+            return
+        self._pdf_page_count_pending = True
+        QTimer.singleShot(0, self._refresh_pdf_page_count)
+
+    def _refresh_pdf_page_count(self):
+        self._pdf_page_count_pending = False
+        path = self.pdf_path_input.text().strip()
+        self._pdf_page_count_path = path
         total = 0
         if path and os.path.exists(path):
             try:
@@ -1177,13 +1196,18 @@ class PdfScanSplitPanel(QWidget):
         self._worker.finished.connect(self._cleanup_worker)
         self._worker.start()
 
-    def _on_stop(self):
+    def _request_worker_cancel(self, *, update_ui: bool = True) -> bool:
         if not self._worker or not self._worker.isRunning():
-            return
-        self._append_log("已请求停止…")
-        self.status_banner.set_message("正在取消", "已请求停止任务，请稍候…")
+            return False
+        if update_ui:
+            self._append_log("已请求停止…")
+            self.status_banner.set_message("正在取消", "已请求停止任务，请稍候…")
+            self.stop_button.setEnabled(False)
         self._worker.cancel()
-        self.stop_button.setEnabled(False)
+        return True
+
+    def _on_stop(self):
+        self._request_worker_cancel()
 
     def _cleanup_worker(self):
         w = self._worker
@@ -1382,6 +1406,8 @@ class PdfScanSplitPanel(QWidget):
             except Exception:
                 pass
         self._run_started_at = None
+        if self._closing:
+            return
         if cancelled:
             QMessageBox.information(self, "已取消", "任务已取消")
         else:
@@ -1572,12 +1598,18 @@ class PdfScanSplitPanel(QWidget):
             self._save_settings_timer.timeout.connect(self._save_settings)
         self._save_settings_timer.start(350)
 
-    def closeEvent(self, event):
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
-            if not self._worker.wait(10000):
-                QMessageBox.information(self, "提示", "任务仍在运行，请稍后再关闭")
-                event.ignore()
-                return
+    def prepare_close(self) -> bool:
+        self._closing = True
+        self._request_worker_cancel(update_ui=False)
+        if self._worker and self._worker.isRunning() and not self._worker.wait(10000):
+            QMessageBox.information(self, "提示", "任务仍在运行，请稍后再关闭")
+            self._closing = False
+            return False
         self._save_settings()
+        return True
+
+    def closeEvent(self, event):
+        if not self.prepare_close():
+            event.ignore()
+            return
         super().closeEvent(event)

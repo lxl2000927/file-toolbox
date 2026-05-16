@@ -73,7 +73,6 @@ class StyleManager:
                 padding: {cls.SIZES["padding"]} {cls.SIZES["padding_large"]};
                 font-size: 15px;
                 font-weight: 600;
-                line-height: 22px;
             }}
             
             QPushButton:hover {{
@@ -101,21 +100,6 @@ class StyleManager:
                 color: {cls.COLORS["gray_500"]};
             }}
 
-            QPushButton[variant="outline"] {{
-                background-color: {cls.COLORS["white"]};
-                color: {cls.COLORS["gray_900"]};
-                border: 1px solid {cls.COLORS["border"]};
-                font-weight: 600;
-                padding: 6px 10px;
-                font-size: 13px;
-                line-height: 19px;
-            }}
-
-            QPushButton[variant="outline"]:hover {{
-                background-color: {cls.COLORS["gray_100"]};
-                border-color: {cls.COLORS["gray_400"]};
-            }}
-
             QPushButton[variant="tab"] {{
                 background-color: {cls.COLORS["gray_100"]};
                 color: {cls.COLORS["gray_900"]};
@@ -140,7 +124,6 @@ class StyleManager:
                 padding: 6px 4px;
                 font-size: 12px;
                 font-weight: 600;
-                line-height: 18px;
                 text-align: center;
             }}
 
@@ -153,7 +136,7 @@ class StyleManager:
                 background-color: {cls.COLORS["primary_light"]};
                 color: {cls.COLORS["primary_dark"]};
                 border-color: {cls.COLORS["primary"]};
-                border-left: 4px solid {cls.COLORS["primary"]};
+                border-left: 5px solid {cls.COLORS["primary"]};
                 font-weight: 700;
             }}
 
@@ -173,6 +156,29 @@ class StyleManager:
             }}
 
             QPushButton[variant="outline"]:disabled {{
+                color: {cls.COLORS["gray_500"]};
+                background-color: {cls.COLORS["gray_100"]};
+                border-color: {cls.COLORS["border"]};
+            }}
+
+            QPushButton[variant="compact"] {{
+                background-color: {cls.COLORS["white"]};
+                color: {cls.COLORS["gray_900"]};
+                border: 1px solid {cls.COLORS["border"]};
+                border-radius: 8px;
+                padding: 4px 8px;
+                font-size: 13px;
+                font-weight: 600;
+                min-height: 22px;
+            }}
+
+            QPushButton[variant="compact"]:hover {{
+                background-color: {cls.COLORS["gray_100"]};
+                color: {cls.COLORS["gray_900"]};
+                border-color: {cls.COLORS["border"]};
+            }}
+
+            QPushButton[variant="compact"]:disabled {{
                 color: {cls.COLORS["gray_500"]};
                 background-color: {cls.COLORS["gray_100"]};
                 border-color: {cls.COLORS["border"]};
@@ -214,6 +220,10 @@ class StyleManager:
                 background-color: {cls.COLORS["gray_100"]};
                 border-color: {cls.COLORS["gray_400"]};
             }}
+
+            QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover {{
+                border-color: {cls.COLORS["gray_400"]};
+            }}
             
             QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{
                 border: 2px solid {cls.COLORS["primary"]};
@@ -221,16 +231,14 @@ class StyleManager:
             }}
             
             QComboBox QAbstractItemView {{
-                border: 1px solid {cls.COLORS["border"]};
-                border-radius: 8px;
+                border: none;
+                outline: none;
                 background-color: {cls.COLORS["white"]};
                 selection-background-color: transparent;
                 selection-color: {cls.COLORS["dark"]};
                 font-size: 15px;
                 line-height: 22px;
                 padding: 4px;
-                outline: 0px;
-                min-height: 38px;
             }}
             
             QComboBox QAbstractItemView::item {{
@@ -275,36 +283,28 @@ class StyleManager:
             QSpinBox, QDoubleSpinBox {{
                 border: 1px solid {cls.COLORS["border"]};
                 border-radius: {cls.SIZES["border_radius"]};
-                padding: 10px 12px;
+                padding: 10px 42px 10px 12px;
                 background-color: {cls.COLORS["white"]};
                 font-size: 15px;
                 line-height: 22px;
                 min-height: 38px;
             }}
-
-            QSpinBox, QDoubleSpinBox {{
-                padding-right: 34px;
-            }}
             
             QSpinBox:focus, QDoubleSpinBox:focus {{
                 border: 2px solid {cls.COLORS["primary"]};
-                padding: 8px 10px;
+                padding: 8px 40px 8px 10px;
             }}
             
             QLineEdit[compact="true"], QComboBox[compact="true"], QSpinBox[compact="true"], QDoubleSpinBox[compact="true"] {{
-                padding: 4px 6px;
+                padding: 4px 26px 4px 6px;
                 font-size: 13px;
                 line-height: 19px;
                 min-height: 26px;
             }}
 
-            QComboBox[compact="true"], QSpinBox[compact="true"], QDoubleSpinBox[compact="true"] {{
-                padding-right: 28px;
-            }}
-            
             QLineEdit[compact="true"]:focus, QComboBox[compact="true"]:focus, QSpinBox[compact="true"]:focus, QDoubleSpinBox[compact="true"]:focus {{
                 border: 2px solid {cls.COLORS["primary"]};
-                padding: 2px 4px;
+                padding: 2px 24px 2px 4px;
             }}
             
             QRadioButton, QCheckBox {{
@@ -385,8 +385,8 @@ class StyleManager:
                 left: 8px;
                 padding: 0 4px 0 4px;
                 border-bottom-width: 1px;
-                padding-bottom: 2px;
-                margin-bottom: 4px;
+                padding-bottom: 4px;
+                margin-bottom: 8px;
             }}
             
             QFormLayout {{

@@ -31,6 +31,8 @@ class AboutPanel(QWidget):
         self._max_attempts = 3
         self._rate_limit_reset_at = ""
         self._update_url = GITHUB_API_LATEST
+        self._logs_text_cache = None
+        self._logs_refresh_pending = False
         self._setup_ui()
 
     def _setup_ui(self):
@@ -174,27 +176,38 @@ class AboutPanel(QWidget):
 
         self.refresh_btn.clicked.connect(self._refresh_logs)
         self.export_btn.clicked.connect(self._export_logs)
-        self._refresh_logs()
+        self.refresh_logs_later()
 
         self.check_update_btn.clicked.connect(self._on_check_update_clicked)
         self.cancel_link_btn.clicked.connect(self._cancel_update_check)
         self.retry_btn.clicked.connect(self._retry_update_check)
 
-    def _refresh_logs(self):
-        if not self.history_manager or not getattr(self.history_manager, "history", None):
-            self.logs_view.setPlainText("")
+    def refresh_logs_later(self):
+        if self._logs_refresh_pending:
             return
-        lines = []
-        sid = str(getattr(self.history_manager, "session_id", "") or "")
-        for r in self.history_manager.get_recent_records(count=self.history_manager.max_history_size, session_id=sid):
-            status = "成功" if r.success else "失败"
-            op = r.operation_type.value
-            desc = r.description
-            ts = r.timestamp
-            lines.append(f"[{ts}] [{op}] {desc} - {status}")
-            if r.error_message:
-                lines.append(f"  错误: {r.error_message}")
-        self.logs_view.setPlainText("\n".join(lines))
+        self._logs_refresh_pending = True
+        QTimer.singleShot(0, self._refresh_logs)
+
+    def _refresh_logs(self):
+        self._logs_refresh_pending = False
+        if not self.history_manager or not getattr(self.history_manager, "history", None):
+            text = ""
+        else:
+            lines = []
+            sid = str(getattr(self.history_manager, "session_id", "") or "")
+            for r in self.history_manager.get_recent_records(count=self.history_manager.max_history_size, session_id=sid):
+                status = "成功" if r.success else "失败"
+                op = r.operation_type.value
+                desc = r.description
+                ts = r.timestamp
+                lines.append(f"[{ts}] [{op}] {desc} - {status}")
+                if r.error_message:
+                    lines.append(f"  错误: {r.error_message}")
+            text = "\n".join(lines)
+        if text == self._logs_text_cache:
+            return
+        self._logs_text_cache = text
+        self.logs_view.setPlainText(text)
 
     def _export_logs(self):
         path, _ = QFileDialog.getSaveFileName(self, "导出日志", "logs.txt", "文本文件 (*.txt);;JSON文件 (*.json)")

@@ -22,8 +22,12 @@ class EmptyStateWidget(QWidget):
         icon_label = QLabel()
         icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         if icon is not None:
-            pm = self.style().standardIcon(icon).pixmap(QSize(36, 36))
+            pm = self.style().standardIcon(icon).pixmap(QSize(28, 28))
             icon_label.setPixmap(pm)
+        icon_label.setFixedSize(56, 56)
+        icon_label.setStyleSheet(
+            "background-color: #f0f0f0; border-radius: 28px; padding: 0px;"
+        )
         layout.addWidget(icon_label)
 
         title_label = QLabel(str(title or ""))
@@ -39,8 +43,8 @@ class EmptyStateWidget(QWidget):
 
         self.action_button = QPushButton(str(action_text or ""))
         self.action_button.setVisible(bool(action_text))
-        self.action_button.setProperty("variant", "primary")
-        self.action_button.setFixedHeight(34)
+        self.action_button.setProperty("variant", "compact")
+        self.action_button.setMinimumHeight(34)
         if callable(action_callback):
             self.action_button.clicked.connect(action_callback)
         layout.addWidget(self.action_button)

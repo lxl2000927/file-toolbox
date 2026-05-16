@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QPushButton, QStackedWidget, QFrame, QLabel, QStyle
 )
-from PyQt6.QtCore import Qt, QSettings, QSize
+from PyQt6.QtCore import Qt, QSettings, QSize, QTimer
 from PyQt6.QtGui import QGuiApplication
 
 import os
@@ -21,13 +21,15 @@ class MainWindow(QMainWindow):
         history_path = os.path.join(base_dir, "FileToolbox", "history.json")
         self.history_manager = HistoryManager(storage_path=history_path)
         self._panels: dict[str, QWidget] = {}
+        self._pending_panel_key = ""
         self.setAcceptDrops(True)
         
         self._setup_ui()
         self.setMinimumSize(1180, 760)
         self._connect_signals()
         self._restore_window_state()
-        self._switch_panel("rename")
+        self._switch_panel("rename", immediate=True)
+        self._prepare_primary_panels()
 
     def _log_internal_error(self, where: str, exc: BaseException):
         if not self.history_manager:
@@ -56,8 +58,8 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
         
-        left_nav = self._create_left_navigation()
-        main_layout.addWidget(left_nav, 1)
+        self.left_nav = self._create_left_navigation()
+        main_layout.addWidget(self.left_nav, 1)
         
         self.content_area = self._create_content_area()
         main_layout.addWidget(self.content_area, 4)
@@ -137,9 +139,24 @@ class MainWindow(QMainWindow):
         content_layout.setSpacing(0)
         
         self.stacked_widget = QStackedWidget()
+        self.loading_panel = self._create_loading_panel()
+        self.stacked_widget.addWidget(self.loading_panel)
         content_layout.addWidget(self.stacked_widget)
 
         return content_frame
+
+    def _create_loading_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label = QLabel("正在加载…")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setFont(StyleManager.get_font("body"))
+        label.setStyleSheet(f"color: {StyleManager.COLORS['gray_600']};")
+        layout.addStretch(1)
+        layout.addWidget(label)
+        layout.addStretch(1)
+        return panel
     
     def _ensure_panel(self, key: str) -> QWidget:
         key = str(key or "").strip()
@@ -168,37 +185,87 @@ class MainWindow(QMainWindow):
         self._panels[key] = panel
         self.stacked_widget.addWidget(panel)
         return panel
+
+    def _prepare_primary_panels(self):
+        self._set_switch_updates_enabled(False)
+        try:
+            for key in ("scan_split", "pdf_split"):
+                self._ensure_panel(key)
+            current = self._panels.get("rename")
+            if current is not None:
+                self.stacked_widget.setCurrentWidget(current)
+                self._set_nav_checked("rename")
+                self._pending_panel_key = "rename"
+        finally:
+            self._set_switch_updates_enabled(True)
     
     def _connect_signals(self):
         self.rename_button.clicked.connect(lambda: self._switch_panel("rename"))
         self.scan_split_button.clicked.connect(lambda: self._switch_panel("scan_split"))
         self.pdf_split_button.clicked.connect(lambda: self._switch_panel("pdf_split"))
         self.about_button.clicked.connect(lambda: self._switch_panel("settings"))
-    
-    def _switch_panel(self, key: str):
-        key = str(key or "").strip()
-        panel = self._ensure_panel(key)
-        self.stacked_widget.setCurrentWidget(panel)
 
+    def _set_nav_checked(self, key: str):
         self.rename_button.setChecked(key == "rename")
         self.scan_split_button.setChecked(key == "scan_split")
         self.pdf_split_button.setChecked(key == "pdf_split")
         self.about_button.setChecked(key == "settings")
 
+    def _set_switch_updates_enabled(self, enabled: bool):
+        for widget in (getattr(self, "left_nav", None), getattr(self, "content_area", None), getattr(self, "stacked_widget", None)):
+            if widget is not None:
+                widget.setUpdatesEnabled(enabled)
+
+    def _switch_panel(self, key: str, *, immediate: bool = False):
+        key = str(key or "").strip()
+        if not key:
+            return
+        current = self.stacked_widget.currentWidget()
+        current_key = ""
+        for panel_key, panel in self._panels.items():
+            if panel is current:
+                current_key = panel_key
+                break
+        if key == current_key:
+            self._set_nav_checked(key)
+            return
+        self._pending_panel_key = key
+        self._set_nav_checked(key)
+        if immediate or key in self._panels:
+            self._finish_switch_panel(key)
+            return
+        self.stacked_widget.setCurrentWidget(self.loading_panel)
+        QTimer.singleShot(0, lambda key=key: self._finish_switch_panel(key))
+
+    def _finish_switch_panel(self, key: str):
+        key = str(key or "").strip()
+        if key and self._pending_panel_key and key != self._pending_panel_key:
+            return
+        self._set_switch_updates_enabled(False)
+        try:
+            panel = self._ensure_panel(key)
+            self.stacked_widget.setCurrentWidget(panel)
+            self._set_nav_checked(key)
+        finally:
+            self._set_switch_updates_enabled(True)
+            self.left_nav.update()
+            self.content_area.update()
+
         if key == "settings":
             try:
-                about_panel = self._ensure_panel("settings")
-                if hasattr(about_panel, "_refresh_logs"):
-                    about_panel._refresh_logs()
+                about_panel = self._panels.get("settings")
+                if hasattr(about_panel, "refresh_logs_later"):
+                    about_panel.refresh_logs_later()
             except Exception as e:
                 self._log_internal_error("刷新日志", e)
 
         if key == "scan_split":
             try:
-                scan_panel = self._ensure_panel("scan_split")
+                scan_panel = self._panels.get("scan_split")
                 pdf_split_panel = self._panels.get("pdf_split")
                 if (
-                    pdf_split_panel
+                    scan_panel
+                    and pdf_split_panel
                     and getattr(pdf_split_panel, "pdf_files", None)
                     and pdf_split_panel.pdf_files
                     and hasattr(scan_panel, "pdf_path_input")
@@ -294,6 +361,11 @@ class MainWindow(QMainWindow):
         self._apply_default_geometry()
     
     def closeEvent(self, event):
+        for panel in list(self._panels.values()):
+            prepare_close = getattr(panel, "prepare_close", None)
+            if callable(prepare_close) and not prepare_close():
+                event.ignore()
+                return
         self._save_window_state()
         super().closeEvent(event)
 
