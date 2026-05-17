@@ -370,10 +370,15 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
+        current = self.stacked_widget.currentWidget() if hasattr(self, "stacked_widget") else None
+        if event.mimeData().hasUrls() and current and type(current).dragEnterEvent is not QWidget.dragEnterEvent:
             event.acceptProposedAction()
+        else:
+            event.ignore()
 
     def dropEvent(self, event):
         current = self.stacked_widget.currentWidget() if hasattr(self, "stacked_widget") else None
-        if current and hasattr(current, "dropEvent"):
+        if current and type(current).dropEvent is not QWidget.dropEvent:
             current.dropEvent(event)
+        else:
+            event.ignore()

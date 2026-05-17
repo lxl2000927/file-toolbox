@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass, field
 
 from PyQt6.QtCore import Qt, QEvent, QPoint, QTimer, QSettings, QDateTime
 from PyQt6.QtGui import QImage, QPixmap, QTextCharFormat, QColor, QTextCursor
@@ -34,8 +35,26 @@ from ui.pdf_scan_split_worker import PdfScanSplitWorker
 from ui.roi_select_dialog import RoiSelectDialog
 from ui.widgets import AutoPopupComboBox
 from ui.widgets import EmptyStateWidget, StatusBanner
+from ui.widgets import StyledDoubleSpinBox, StyledSpinBox
 from utils.style_manager import StyleManager
 from utils.history_manager import HistoryManager, OperationType
+
+
+@dataclass
+class _ScanTaskRequest:
+    task: str
+    pdf_path: str
+    reference_image_path: str
+    options: PdfScanSplitOptions
+    output_dir: str = ""
+    prefix: str = ""
+    page_limit: int = 0
+    probe_page_index: int = 0
+    run_context: dict = field(default_factory=dict)
+    log_start_text: str = ""
+    status_text: str = ""
+    roi_fallback: bool = False
+    roi_tip: str = ""
 
 
 class PdfScanSplitPanel(QWidget):
@@ -206,7 +225,7 @@ class PdfScanSplitPanel(QWidget):
         self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
 
         self.qrcode_skip_checkbox = QCheckBox("命中后跳过")
-        self.qrcode_skip_pages_spin = QSpinBox()
+        self.qrcode_skip_pages_spin = StyledSpinBox()
         self.qrcode_skip_pages_spin.setRange(0, 200)
         self.qrcode_skip_pages_spin.setValue(0)
         self.qrcode_skip_pages_spin.setProperty("compact", True)
@@ -229,33 +248,33 @@ class PdfScanSplitPanel(QWidget):
         params_row_layout.setHorizontalSpacing(10)
         params_row_layout.setVerticalSpacing(8)
 
-        self.nfeatures_spin = QSpinBox()
+        self.nfeatures_spin = StyledSpinBox()
         self.nfeatures_spin.setRange(100, 5000)
         self.nfeatures_spin.setValue(1200)
         self.nfeatures_spin.setProperty("compact", True)
         self.nfeatures_spin.setToolTip("每页提取的ORB特征点上限。值越大越容易匹配到标记，但速度更慢。")
 
-        self.min_matches_spin = QSpinBox()
+        self.min_matches_spin = StyledSpinBox()
         self.min_matches_spin.setRange(5, 300)
         self.min_matches_spin.setValue(25)
         self.min_matches_spin.setProperty("compact", True)
         self.min_matches_spin.setToolTip("判定为标记页所需的最少“有效匹配”数量。值越大越严格，误报更少但更易漏检。")
 
-        self.ratio_spin = QDoubleSpinBox()
+        self.ratio_spin = StyledDoubleSpinBox()
         self.ratio_spin.setRange(0.5, 0.95)
         self.ratio_spin.setSingleStep(0.05)
         self.ratio_spin.setValue(0.75)
         self.ratio_spin.setProperty("compact", True)
         self.ratio_spin.setToolTip("KNN匹配的比例阈值（Lowe ratio test）。越小越严格，误匹配更少但可能漏检。")
 
-        self.ransac_spin = QDoubleSpinBox()
+        self.ransac_spin = StyledDoubleSpinBox()
         self.ransac_spin.setRange(1.0, 12.0)
         self.ransac_spin.setSingleStep(0.5)
         self.ransac_spin.setValue(5.0)
         self.ransac_spin.setProperty("compact", True)
         self.ransac_spin.setToolTip("RANSAC重投影阈值（像素）。越大越宽松，内点可能变多但误报风险增加。")
 
-        self.min_inlier_ratio_spin = QDoubleSpinBox()
+        self.min_inlier_ratio_spin = StyledDoubleSpinBox()
         self.min_inlier_ratio_spin.setRange(0.1, 0.9)
         self.min_inlier_ratio_spin.setSingleStep(0.05)
         self.min_inlier_ratio_spin.setValue(0.45)
@@ -313,7 +332,7 @@ class PdfScanSplitPanel(QWidget):
         tune_layout.setContentsMargins(0, 0, 0, 0)
         tune_layout.setSpacing(8)
 
-        self.test_page_spin = QSpinBox()
+        self.test_page_spin = StyledSpinBox()
         self.test_page_spin.setRange(1, 1)
         self.test_page_spin.setValue(1)
         self.test_page_spin.setProperty("compact", True)
@@ -325,7 +344,7 @@ class PdfScanSplitPanel(QWidget):
         self.probe_button.setAutoDefault(False)
         self.probe_button.setDefault(False)
 
-        self.quick_scan_pages_spin = QSpinBox()
+        self.quick_scan_pages_spin = StyledSpinBox()
         self.quick_scan_pages_spin.setRange(1, 800)
         self.quick_scan_pages_spin.setValue(30)
         self.quick_scan_pages_spin.setProperty("compact", True)
@@ -737,6 +756,10 @@ class PdfScanSplitPanel(QWidget):
             self._sync_roi_summary()
             return
         new_image = self._reference_loaded_path != self._reference_image_path
+        if new_image:
+            self._reference_roi = None
+            self._reference_zoom_custom = False
+            self._reference_zoom = 1.0
 
         try:
             import numpy as np
@@ -785,10 +808,6 @@ class PdfScanSplitPanel(QWidget):
             qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
             pix = QPixmap.fromImage(qimg)
             self._reference_pixmap_original = pix
-            if new_image:
-                self._reference_roi = None
-                self._reference_zoom_custom = False
-                self._reference_zoom = 1.0
             self._apply_reference_zoom()
             self._reference_loaded_path = self._reference_image_path
             QTimer.singleShot(0, self._set_reference_fit)
@@ -990,24 +1009,44 @@ class PdfScanSplitPanel(QWidget):
         self._refresh_reference_keypoints()
         self._schedule_save_settings()
 
-    def _on_start(self):
+    def _validate_launch(self, use_dialog: bool = False) -> dict | None:
         if not self.pdf_path_input.text().strip():
-            self.status_banner.set_message("提示", "请先选择PDF文件。")
-            return
+            if use_dialog:
+                QMessageBox.warning(self, "警告", "请先选择PDF文件")
+            else:
+                self.status_banner.set_message("提示", "请先选择PDF文件。")
+            return None
         mode = self._get_detection_mode()
         roi_requested = bool(self.qrcode_use_roi_checkbox.isChecked()) and mode in ("qrcode", "stamp", "auto")
         roi_ready = bool(self.reference_image_input.text().strip()) and bool(self._reference_roi)
         roi_fallback = roi_requested and (not roi_ready)
-        roi_tip = "已勾选“框选特征点”，但未选择图像或未框选区域，已按全页识别"
+        roi_tip = "已勾选\u201c框选特征点\u201d，但未选择图像或未框选区域，已按全页识别"
         if mode == "feature" and not self.reference_image_input.text().strip():
-            self.status_banner.set_message("提示", "特征匹配模式需要先选择参考图像。")
-            return
+            if use_dialog:
+                QMessageBox.warning(self, "警告", "请先选择参考图像")
+            else:
+                self.status_banner.set_message("提示", "特征匹配模式需要先选择参考图像。")
+            return None
         if self._worker and self._worker.isRunning():
-            self.status_banner.set_message("提示", "任务正在执行中。")
-            return
-
+            if use_dialog:
+                QMessageBox.information(self, "提示", "任务正在执行中")
+            else:
+                self.status_banner.set_message("提示", "任务正在执行中。")
+            return None
         options = self._build_options()
+        pdf_path = self.pdf_path_input.text().strip()
+        base = os.path.basename(pdf_path)
+        ref_image_path = self.reference_image_input.text().strip()
+        return {
+            "options": options,
+            "pdf_path": pdf_path,
+            "base": base,
+            "ref_image_path": ref_image_path,
+            "roi_fallback": roi_fallback,
+            "roi_tip": roi_tip,
+        }
 
+    def _start_task_ui(self, request: _ScanTaskRequest):
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setValue(0)
@@ -1015,13 +1054,43 @@ class PdfScanSplitPanel(QWidget):
         self.stop_button.setEnabled(True)
         self._run_started_at = time.perf_counter()
         self._run_log_lines = []
-        self._worker_task = "scan_split"
-        pdf_path = self.pdf_path_input.text().strip()
-        base = os.path.basename(pdf_path)
-        if roi_fallback:
-            self.status_banner.set_message("正在处理", f"正在扫描：{base}（ROI未设置，按全页识别）")
-        else:
-            self.status_banner.set_message("正在处理", f"正在扫描：{base}")
+        self._worker_task = request.task
+        self._run_context = request.run_context
+        self.status_banner.set_message("正在处理", request.status_text)
+        self._append_log(request.log_start_text)
+        if request.roi_fallback:
+            self._append_log(request.roi_tip)
+        self._save_settings()
+
+    def _create_worker(self, request: _ScanTaskRequest) -> PdfScanSplitWorker:
+        worker = PdfScanSplitWorker(
+            pdf_path=request.pdf_path,
+            reference_image_path=request.reference_image_path,
+            output_dir=request.output_dir,
+            prefix=request.prefix,
+            options=request.options,
+            task=request.task,
+            page_limit=request.page_limit,
+            probe_page_index=request.probe_page_index,
+            parent=self,
+        )
+        worker.progressChanged.connect(self._on_worker_progress)
+        worker.logAppended.connect(self._append_log)
+        worker.finishedWithResult.connect(self._on_worker_finished)
+        worker.failed.connect(self._on_worker_failed)
+        worker.finished.connect(self._cleanup_worker)
+        return worker
+
+    def _launch_task(self, request: _ScanTaskRequest):
+        self._start_task_ui(request)
+        self._worker = self._create_worker(request)
+        self._worker.start()
+
+    def _on_start(self):
+        common = self._validate_launch(use_dialog=False)
+        if common is None:
+            return
+        options = common["options"]
         options_dict = {
             "dpi": int(options.dpi),
             "nfeatures": int(options.nfeatures),
@@ -1041,10 +1110,10 @@ class PdfScanSplitPanel(QWidget):
             "qrcode_use_roi": bool(options.qrcode_use_roi),
             "qrcode_max_attempts": int(options.qrcode_max_attempts or 180),
         }
-        self._run_context = {
-            "pdf_path": pdf_path,
-            "pdf_name": base,
-            "reference_image_path": self.reference_image_input.text().strip(),
+        run_context = {
+            "pdf_path": common["pdf_path"],
+            "pdf_name": common["base"],
+            "reference_image_path": common["ref_image_path"],
             "output_dir": self.output_dir_input.text().strip(),
             "prefix": self.prefix_input.text().strip(),
             "options": options_dict,
@@ -1053,148 +1122,83 @@ class PdfScanSplitPanel(QWidget):
             try:
                 self.history_manager.add_record(
                     operation_type=OperationType.SCAN_SPLIT,
-                    description=f"开始扫描拆分：{base}",
-                    details=self._run_context,
+                    description=f"开始扫描拆分：{common['base']}",
+                    details=run_context,
                     success=True,
                 )
             except Exception:
                 pass
-        self._append_log("开始扫描拆分…")
-        if roi_fallback:
-            self._append_log(roi_tip)
-        self._save_settings()
-
-        self._worker = PdfScanSplitWorker(
-            pdf_path=self.pdf_path_input.text().strip(),
-            reference_image_path=self.reference_image_input.text().strip(),
+        status_text = (
+            f"正在扫描：{common['base']}（ROI未设置，按全页识别）"
+            if common["roi_fallback"]
+            else f"正在扫描：{common['base']}"
+        )
+        request = _ScanTaskRequest(
+            task="scan_split",
+            pdf_path=common["pdf_path"],
+            reference_image_path=common["ref_image_path"],
+            options=options,
             output_dir=self.output_dir_input.text().strip(),
             prefix=self.prefix_input.text().strip(),
-            options=options,
-            task="scan_split",
-            parent=self,
+            run_context=run_context,
+            log_start_text="开始扫描拆分…",
+            status_text=status_text,
+            roi_fallback=common["roi_fallback"],
+            roi_tip=common["roi_tip"],
         )
-        self._worker.progressChanged.connect(self._on_worker_progress)
-        self._worker.logAppended.connect(self._append_log)
-        self._worker.finishedWithResult.connect(self._on_worker_finished)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.finished.connect(self._cleanup_worker)
-        self._worker.start()
+        self._launch_task(request)
 
     def _on_probe_page(self):
-        if not self.pdf_path_input.text().strip():
-            QMessageBox.warning(self, "警告", "请先选择PDF文件")
+        common = self._validate_launch(use_dialog=True)
+        if common is None:
             return
-        mode = self._get_detection_mode()
-        roi_requested = bool(self.qrcode_use_roi_checkbox.isChecked()) and mode in ("qrcode", "stamp", "auto")
-        roi_ready = bool(self.reference_image_input.text().strip()) and bool(self._reference_roi)
-        roi_fallback = roi_requested and (not roi_ready)
-        roi_tip = "已勾选“框选特征点”，但未选择图像或未框选区域，已按全页识别"
-        if mode == "feature" and not self.reference_image_input.text().strip():
-            QMessageBox.warning(self, "警告", "请先选择参考图像")
-            return
-        if self._worker and self._worker.isRunning():
-            QMessageBox.information(self, "提示", "任务正在执行中")
-            return
-
-        options = self._build_options()
         page_index = int(self.test_page_spin.value()) - 1
-        pdf_path = self.pdf_path_input.text().strip()
-        base = os.path.basename(pdf_path)
-        self._run_context = {
+        run_context = {
             "task": "probe_page",
-            "pdf_path": pdf_path,
-            "pdf_name": base,
-            "reference_image_path": self.reference_image_input.text().strip(),
+            "pdf_path": common["pdf_path"],
+            "pdf_name": common["base"],
+            "reference_image_path": common["ref_image_path"],
             "page_index": int(page_index),
         }
-
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setValue(0)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self._run_started_at = time.perf_counter()
-        self._run_log_lines = []
-        self._worker_task = "probe_page"
-        self._append_log(f"开始单页测试：第 {page_index + 1} 页…")
-        if roi_fallback:
-            self._append_log(roi_tip)
-        self._save_settings()
-
-        self._worker = PdfScanSplitWorker(
-            pdf_path=self.pdf_path_input.text().strip(),
-            reference_image_path=self.reference_image_input.text().strip(),
-            output_dir="",
-            prefix="",
-            options=options,
+        request = _ScanTaskRequest(
             task="probe_page",
+            pdf_path=common["pdf_path"],
+            reference_image_path=common["ref_image_path"],
+            options=common["options"],
             probe_page_index=page_index,
-            parent=self,
+            run_context=run_context,
+            log_start_text=f"开始单页测试：第 {page_index + 1} 页…",
+            status_text=f"正在扫描：{common['base']}",
+            roi_fallback=common["roi_fallback"],
+            roi_tip=common["roi_tip"],
         )
-        self._worker.progressChanged.connect(self._on_worker_progress)
-        self._worker.logAppended.connect(self._append_log)
-        self._worker.finishedWithResult.connect(self._on_worker_finished)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.finished.connect(self._cleanup_worker)
-        self._worker.start()
+        self._launch_task(request)
 
     def _on_quick_scan(self):
-        if not self.pdf_path_input.text().strip():
-            QMessageBox.warning(self, "警告", "请先选择PDF文件")
+        common = self._validate_launch(use_dialog=True)
+        if common is None:
             return
-        mode = self._get_detection_mode()
-        roi_requested = bool(self.qrcode_use_roi_checkbox.isChecked()) and mode in ("qrcode", "stamp", "auto")
-        roi_ready = bool(self.reference_image_input.text().strip()) and bool(self._reference_roi)
-        roi_fallback = roi_requested and (not roi_ready)
-        roi_tip = "已勾选“框选特征点”，但未选择图像或未框选区域，已按全页识别"
-        if mode == "feature" and not self.reference_image_input.text().strip():
-            QMessageBox.warning(self, "警告", "请先选择参考图像")
-            return
-        if self._worker and self._worker.isRunning():
-            QMessageBox.information(self, "提示", "任务正在执行中")
-            return
-
-        options = self._build_options()
         limit = int(self.quick_scan_pages_spin.value())
-        pdf_path = self.pdf_path_input.text().strip()
-        base = os.path.basename(pdf_path)
-        self._run_context = {
+        run_context = {
             "task": "scan_only",
-            "pdf_path": pdf_path,
-            "pdf_name": base,
-            "reference_image_path": self.reference_image_input.text().strip(),
+            "pdf_path": common["pdf_path"],
+            "pdf_name": common["base"],
+            "reference_image_path": common["ref_image_path"],
             "page_limit": int(limit),
         }
-
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setRange(0, 0)
-        self.progress_bar.setValue(0)
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self._run_started_at = time.perf_counter()
-        self._run_log_lines = []
-        self._worker_task = "scan_only"
-        self._append_log(f"开始快速扫描前 {limit} 页（不输出文件）…")
-        if roi_fallback:
-            self._append_log(roi_tip)
-        self._save_settings()
-
-        self._worker = PdfScanSplitWorker(
-            pdf_path=self.pdf_path_input.text().strip(),
-            reference_image_path=self.reference_image_input.text().strip(),
-            output_dir="",
-            prefix="",
-            options=options,
+        request = _ScanTaskRequest(
             task="scan_only",
+            pdf_path=common["pdf_path"],
+            reference_image_path=common["ref_image_path"],
+            options=common["options"],
             page_limit=limit,
-            parent=self,
+            run_context=run_context,
+            log_start_text=f"开始快速扫描前 {limit} 页（不输出文件）…",
+            status_text=f"正在扫描：{common['base']}",
+            roi_fallback=common["roi_fallback"],
+            roi_tip=common["roi_tip"],
         )
-        self._worker.progressChanged.connect(self._on_worker_progress)
-        self._worker.logAppended.connect(self._append_log)
-        self._worker.finishedWithResult.connect(self._on_worker_finished)
-        self._worker.failed.connect(self._on_worker_failed)
-        self._worker.finished.connect(self._cleanup_worker)
-        self._worker.start()
+        self._launch_task(request)
 
     def _request_worker_cancel(self, *, update_ui: bool = True) -> bool:
         if not self._worker or not self._worker.isRunning():
@@ -1230,7 +1234,11 @@ class PdfScanSplitPanel(QWidget):
         self.start_button.setEnabled(True)
         self.progress_bar.setVisible(False)
 
-        if isinstance(result, dict):
+        if self._worker_task == "probe_page":
+            if not isinstance(result, dict):
+                self._append_log("单页测试完成，但返回结果类型异常")
+                self._run_started_at = None
+                return
             try:
                 elapsed_ms = int((time.perf_counter() - self._run_started_at) * 1000) if self._run_started_at else None
                 marked = bool(result.get("marked"))
@@ -1534,6 +1542,8 @@ class PdfScanSplitPanel(QWidget):
                     self._reference_roi = None
             self._sync_roi_summary()
             self._on_detection_mode_changed()
+            if self._reference_image_path:
+                self._refresh_reference_keypoints()
         finally:
             self._restoring_settings = False
 
@@ -1600,8 +1610,10 @@ class PdfScanSplitPanel(QWidget):
 
     def prepare_close(self) -> bool:
         self._closing = True
+        if self._save_settings_timer and self._save_settings_timer.isActive():
+            self._save_settings_timer.stop()
         self._request_worker_cancel(update_ui=False)
-        if self._worker and self._worker.isRunning() and not self._worker.wait(10000):
+        if self._worker and self._worker.isRunning() and not self._worker.wait(1000):
             QMessageBox.information(self, "提示", "任务仍在运行，请稍后再关闭")
             self._closing = False
             return False

@@ -1,6 +1,6 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QListWidget, QListWidgetItem,
-    QPushButton, QLabel, QGroupBox, QComboBox, QLineEdit, QSpinBox, QStyle,
+    QPushButton, QLabel, QGroupBox, QComboBox, QLineEdit, QStyle,
     QRadioButton, QButtonGroup, QFormLayout, QSizePolicy,
     QMessageBox, QFileDialog, QProgressBar, QStackedWidget, QCheckBox, QPlainTextEdit,
 )
@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt, QEvent, pyqtSignal, QSize, QThreadPool
 from PyQt6.QtGui import QFontDatabase
 from ui.widgets import AutoPopupComboBox
 from ui.widgets import EmptyStateWidget, StatusBanner
+from ui.widgets import StyledSpinBox
 from utils.file_picker import FilePicker
 from utils.style_manager import StyleManager
 from utils.history_manager import HistoryManager
@@ -29,6 +30,7 @@ class PdfSplitPanel(QWidget):
         self._active_workers: set[Worker] = set()
         self._executing = False
         self._previewing = False
+        self._closing = False
         self._preview_token = 0
         self.setAcceptDrops(True)
         
@@ -221,7 +223,7 @@ class PdfSplitPanel(QWidget):
         layout.setSpacing(8)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         
-        self.page_count_spin = QSpinBox()
+        self.page_count_spin = StyledSpinBox()
         self.page_count_spin.setRange(1, 1000)
         self.page_count_spin.setValue(1)
         self.page_count_spin.setProperty("compact", True)
@@ -236,7 +238,7 @@ class PdfSplitPanel(QWidget):
         layout.setSpacing(8)
         layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
         
-        self.size_spin = QSpinBox()
+        self.size_spin = StyledSpinBox()
         self.size_spin.setRange(1, 100)
         self.size_spin.setValue(10)
         self.size_spin.setProperty("compact", True)
@@ -281,7 +283,7 @@ class PdfSplitPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
         
-        self.bookmark_level_spin = QSpinBox()
+        self.bookmark_level_spin = StyledSpinBox()
         self.bookmark_level_spin.setRange(1, 10)
         self.bookmark_level_spin.setValue(1)
         self.bookmark_level_spin.setProperty("compact", True)
@@ -453,8 +455,8 @@ class PdfSplitPanel(QWidget):
             self._active_workers.discard(worker)
 
         def _on_finished(result):
-            if token != self._preview_token:
-                self._active_workers.discard(worker)
+            if token != self._preview_token or self._closing:
+                _finish_preview()
                 return
             lines = result if isinstance(result, list) else ["（无预览内容）"]
             self.preview_text.setPlainText("\n".join(lines))
@@ -462,8 +464,8 @@ class PdfSplitPanel(QWidget):
             _finish_preview()
 
         def _on_error(err):
-            if token != self._preview_token:
-                self._active_workers.discard(worker)
+            if token != self._preview_token or self._closing:
+                _finish_preview()
                 return
             message = getattr(err, "message", None) or str(err)
             exc_type = getattr(err, "exc_type", None)
@@ -506,7 +508,12 @@ class PdfSplitPanel(QWidget):
             self._executing = False
             self.progress_bar.setRange(0, max(1, len(self.pdf_files)))
             self.progress_bar.setValue(len(self.pdf_files))
-            if result.get("failed", 0) == 0:
+            if self._closing:
+                self._active_workers.discard(worker)
+                return
+            if not isinstance(result, dict):
+                QMessageBox.critical(self, "错误", "拆分任务返回结果异常")
+            elif result.get("failed", 0) == 0:
                 total_outputs = 0
                 for op in (result.get("operations") or []):
                     try:
@@ -528,6 +535,9 @@ class PdfSplitPanel(QWidget):
 
         def _on_error(err):
             self._executing = False
+            if self._closing:
+                self._active_workers.discard(worker)
+                return
             message = getattr(err, "message", None) or str(err)
             exc_type = getattr(err, "exc_type", None)
             if exc_type:
@@ -598,6 +608,17 @@ class PdfSplitPanel(QWidget):
     def dropEvent(self, event):
         self._add_files(self._extract_paths_from_drop_event(event))
         event.acceptProposedAction()
+
+    def prepare_close(self) -> bool:
+        self._closing = True
+        self._preview_token += 1
+        self._previewing = False
+        self._executing = False
+        return True
+
+    def closeEvent(self, event):
+        self.prepare_close()
+        super().closeEvent(event)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.DragEnter:

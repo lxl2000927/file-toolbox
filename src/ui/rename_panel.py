@@ -1,13 +1,14 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QTreeWidget, QTreeWidgetItem,
-    QPushButton, QLabel, QGroupBox, QComboBox, QLineEdit, QSpinBox,
+    QPushButton, QLabel, QGroupBox, QComboBox, QLineEdit,
     QRadioButton, QButtonGroup, QTabWidget, QGridLayout,
     QMessageBox, QCheckBox, QToolButton, QStyle, QMenu, QSizePolicy, QHeaderView, QStyleOptionButton, QStyleOptionHeader
 )
 from PyQt6.QtCore import Qt, QEvent, QRect, QPoint, pyqtSignal, QTimer, QThreadPool
 from PyQt6.QtGui import QColor, QPen
 from ui.widgets import AutoPopupComboBox
+from ui.widgets import StyledSpinBox
 from utils.file_picker import FilePicker
 from utils.style_manager import StyleManager
 from core.rename_engine import RenameEngine
@@ -236,6 +237,7 @@ class RenamePanel(QWidget):
         self._sort_order = Qt.SortOrder.AscendingOrder
         self._thread_pool = QThreadPool.globalInstance()
         self._active_workers: set[Worker] = set()
+        self._closing = False
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(180)
@@ -423,7 +425,7 @@ class RenamePanel(QWidget):
         self.insert_position_combo.setProperty("compact", True)
         self.insert_position_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
 
-        self.insert_index_spin = QSpinBox()
+        self.insert_index_spin = StyledSpinBox()
         self.insert_index_spin.setRange(1, 9999)
         self.insert_index_spin.setValue(1)
         self.insert_index_spin.valueChanged.connect(self._on_rules_changed)
@@ -484,19 +486,19 @@ class RenamePanel(QWidget):
         insert_number_layout.setColumnStretch(2, 0)
         insert_number_layout.setColumnStretch(3, 1)
 
-        self.number_start_input = QSpinBox()
+        self.number_start_input = StyledSpinBox()
         self.number_start_input.setRange(1, 999999)
         self.number_start_input.setValue(1)
         self.number_start_input.valueChanged.connect(self._on_rules_changed)
         self.number_start_input.setProperty("compact", True)
 
-        self.number_step_input = QSpinBox()
+        self.number_step_input = StyledSpinBox()
         self.number_step_input.setRange(1, 999999)
         self.number_step_input.setValue(1)
         self.number_step_input.valueChanged.connect(self._on_rules_changed)
         self.number_step_input.setProperty("compact", True)
 
-        self.number_digits_input = QSpinBox()
+        self.number_digits_input = StyledSpinBox()
         self.number_digits_input.setRange(1, 6)
         self.number_digits_input.setValue(1)
         self.number_digits_input.valueChanged.connect(self._on_rules_changed)
@@ -823,7 +825,7 @@ class RenamePanel(QWidget):
         self.smart_insert_position_combo.setProperty("compact", True)
         self.smart_insert_position_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContentsOnFirstShow)
 
-        self.smart_insert_index_spin = QSpinBox()
+        self.smart_insert_index_spin = StyledSpinBox()
         self.smart_insert_index_spin.setRange(1, 9999)
         self.smart_insert_index_spin.setValue(1)
         self.smart_insert_index_spin.valueChanged.connect(self._on_rules_changed)
@@ -946,19 +948,19 @@ class RenamePanel(QWidget):
         insert_number_layout.setHorizontalSpacing(10)
         insert_number_layout.setVerticalSpacing(6)
 
-        self.custom_number_start_input = QSpinBox()
+        self.custom_number_start_input = StyledSpinBox()
         self.custom_number_start_input.setRange(1, 999999)
         self.custom_number_start_input.setValue(1)
         self.custom_number_start_input.valueChanged.connect(self._on_rules_changed)
         self.custom_number_start_input.setProperty("compact", True)
 
-        self.custom_number_step_input = QSpinBox()
+        self.custom_number_step_input = StyledSpinBox()
         self.custom_number_step_input.setRange(1, 999999)
         self.custom_number_step_input.setValue(1)
         self.custom_number_step_input.valueChanged.connect(self._on_rules_changed)
         self.custom_number_step_input.setProperty("compact", True)
 
-        self.custom_number_digits_input = QSpinBox()
+        self.custom_number_digits_input = StyledSpinBox()
         self.custom_number_digits_input.setRange(1, 6)
         self.custom_number_digits_input.setValue(1)
         self.custom_number_digits_input.valueChanged.connect(self._on_rules_changed)
@@ -1120,7 +1122,12 @@ class RenamePanel(QWidget):
         def _on_finished(result):
             self._executing = False
             self.execute_button.setEnabled(True)
-            if result.get("failed", 0) == 0:
+            if self._closing:
+                self._active_workers.discard(worker)
+                return
+            if not isinstance(result, dict):
+                QMessageBox.critical(self, "错误", "重命名任务返回结果异常")
+            elif result.get("failed", 0) == 0:
                 QMessageBox.information(self, "成功", f"成功处理 {result.get('successful', 0)} 个文件")
             else:
                 error_msg = f"成功 {result.get('successful', 0)} 个，失败 {result.get('failed', 0)} 个\n"
@@ -1128,7 +1135,7 @@ class RenamePanel(QWidget):
                 if errs:
                     error_msg += "\n错误信息:\n" + "\n".join(errs[:3])
                 QMessageBox.warning(self, "部分失败", error_msg)
-            if result.get("successful", 0) > 0:
+            if isinstance(result, dict) and result.get("successful", 0) > 0:
                 self.undo_button.setEnabled(True)
             self._update_preview()
             self._active_workers.discard(worker)
@@ -1136,6 +1143,9 @@ class RenamePanel(QWidget):
         def _on_error(err):
             self._executing = False
             self.execute_button.setEnabled(True)
+            if self._closing:
+                self._active_workers.discard(worker)
+                return
             message = getattr(err, "message", None) or str(err)
             exc_type = getattr(err, "exc_type", None)
             if exc_type:
@@ -1528,6 +1538,16 @@ class RenamePanel(QWidget):
     def dropEvent(self, event):
         self._add_files(self._extract_paths_from_drop_event(event))
         event.acceptProposedAction()
+
+    def prepare_close(self) -> bool:
+        self._closing = True
+        self._preview_timer.stop()
+        self._executing = False
+        return True
+
+    def closeEvent(self, event):
+        self.prepare_close()
+        super().closeEvent(event)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.DragEnter:

@@ -296,7 +296,7 @@ class StyleManager:
             }}
             
             QLineEdit[compact="true"], QComboBox[compact="true"], QSpinBox[compact="true"], QDoubleSpinBox[compact="true"] {{
-                padding: 4px 26px 4px 6px;
+                padding: 4px 30px 4px 6px;
                 font-size: 13px;
                 line-height: 19px;
                 min-height: 26px;
@@ -304,7 +304,7 @@ class StyleManager:
 
             QLineEdit[compact="true"]:focus, QComboBox[compact="true"]:focus, QSpinBox[compact="true"]:focus, QDoubleSpinBox[compact="true"]:focus {{
                 border: 2px solid {cls.COLORS["primary"]};
-                padding: 2px 24px 2px 4px;
+                padding: 2px 28px 2px 4px;
             }}
             
             QRadioButton, QCheckBox {{
