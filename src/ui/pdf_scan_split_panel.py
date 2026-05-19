@@ -22,15 +22,13 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPlainTextEdit,
     QScrollArea,
-    QSpinBox,
-    QDoubleSpinBox,
     QCheckBox,
     QStackedWidget,
     QStyle,
 )
 from PyQt6.QtWidgets import QDialog
 
-from core.pdf_scan_split_engine import PdfScanSplitOptions, PdfScanSplitResult
+from core.pdf_scan_split_engine import PdfScanSplitEngine, PdfScanSplitOptions, PdfScanSplitResult
 from ui.pdf_scan_split_worker import PdfScanSplitWorker
 from ui.roi_select_dialog import RoiSelectDialog
 from ui.widgets import AutoPopupComboBox
@@ -131,7 +129,7 @@ class PdfScanSplitPanel(QWidget):
         self.pdf_path_input.setProperty("compact", True)
 
         self.select_pdf_button = QPushButton("选择PDF")
-        self.select_pdf_button.setFixedHeight(38)
+        self.select_pdf_button.setFixedSize(128, 38)
         self.select_pdf_button.setProperty("variant", "primary")
         self.select_pdf_button.setAutoDefault(False)
         self.select_pdf_button.setDefault(False)
@@ -151,8 +149,8 @@ class PdfScanSplitPanel(QWidget):
         self.output_dir_input.setProperty("compact", True)
 
         self.select_output_button = QPushButton("选择输出目录")
-        self.select_output_button.setFixedHeight(38)
-        self.select_output_button.setProperty("variant", "outline")
+        self.select_output_button.setFixedSize(128, 38)
+        self.select_output_button.setProperty("variant", "primary")
         self.select_output_button.setAutoDefault(False)
         self.select_output_button.setDefault(False)
 
@@ -178,12 +176,12 @@ class PdfScanSplitPanel(QWidget):
         ref_row_layout.setSpacing(8)
 
         self.reference_image_input = QLineEdit()
-        self.reference_image_input.setPlaceholderText("选择参考图像（用于特征匹配）")
+        self.reference_image_input.setPlaceholderText("选择参考文件（图像或PDF）")
         self.reference_image_input.setReadOnly(True)
         self.reference_image_input.setProperty("compact", True)
 
-        self.select_reference_button = QPushButton("选择图像")
-        self.select_reference_button.setFixedHeight(38)
+        self.select_reference_button = QPushButton("选择参考")
+        self.select_reference_button.setFixedSize(128, 38)
         self.select_reference_button.setProperty("variant", "primary")
         self.select_reference_button.setAutoDefault(False)
         self.select_reference_button.setDefault(False)
@@ -202,7 +200,7 @@ class PdfScanSplitPanel(QWidget):
         mode_label.setStyleSheet(f"color: {StyleManager.get_color('gray_700')};")
 
         self.detect_mode_combo = AutoPopupComboBox()
-        self.detect_mode_combo.addItems(["自动(二维码/印章/特征点)", "二维码识别", "印章识别", "特征匹配(参考图像)"])
+        self.detect_mode_combo.addItems(["自动(二维码/印章/特征点)", "二维码识别", "印章识别", "特征匹配(参考文件)"])
         self.detect_mode_combo.setProperty("compact", True)
 
         self.qrcode_text_input = QLineEdit()
@@ -211,6 +209,7 @@ class PdfScanSplitPanel(QWidget):
 
         mode_row_layout.addWidget(mode_label)
         mode_row_layout.addWidget(self.detect_mode_combo, 1)
+        mode_row_layout.addWidget(self.qrcode_text_input, 1)
         function_layout.addWidget(mode_row)
 
         qr_opts = QWidget()
@@ -221,8 +220,8 @@ class PdfScanSplitPanel(QWidget):
         self.qrcode_no_decode_checkbox = QCheckBox("二维码不解码内容")
         self.qrcode_no_decode_checkbox.setToolTip("仅检测二维码存在，不读取内容（更快；将忽略“二维码内容包含”筛选）")
         self.qrcode_use_roi_checkbox = QCheckBox("框选特征点")
-        self.qrcode_use_roi_checkbox.setChecked(True)
-        self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
+        self.qrcode_use_roi_checkbox.setChecked(False)
+        self.qrcode_use_roi_checkbox.setToolTip("选择参考文件并框选ROI后，仅识别该区域，可提升速度与稳定性")
 
         self.qrcode_skip_checkbox = QCheckBox("命中后跳过")
         self.qrcode_skip_pages_spin = StyledSpinBox()
@@ -239,7 +238,6 @@ class PdfScanSplitPanel(QWidget):
         qr_opts_layout.addWidget(self.qrcode_skip_pages_spin)
         qr_opts_layout.addWidget(skip_label)
 
-        function_layout.addWidget(self.qrcode_text_input)
         function_layout.addWidget(qr_opts)
 
         params_row = QWidget()
@@ -282,14 +280,17 @@ class PdfScanSplitPanel(QWidget):
         self.min_inlier_ratio_spin.setToolTip("内点比例阈值。用于兜底判定：比例越高越严格。")
 
         self.preset_combo = AutoPopupComboBox()
-        self.preset_combo.addItems(["预设：均衡(默认)", "预设：更严格(少误报)", "预设：更宽松(少漏检)"])
+        self.preset_combo.addItems(["预设：均衡", "预设：严格", "预设：宽松", "预设：高召回"])
         self.preset_combo.setProperty("compact", True)
+        self.preset_combo.setToolTip("仅影响特征匹配参数；二维码/印章模式不会使用这些特征点参数")
 
         self.marker_as_first_page_checkbox = QCheckBox("标记页作为新文件第一页")
         self.marker_as_first_page_checkbox.setChecked(True)
+        self.marker_as_first_page_checkbox.setToolTip("标记页保留输出时，作为下一份拆分文件的第一页")
 
         self.exclude_marker_page_checkbox = QCheckBox("标记页不输出")
         self.exclude_marker_page_checkbox.setChecked(False)
+        self.exclude_marker_page_checkbox.setToolTip("勾选后标记页只作为分隔符，不写入任何输出文件")
 
         self.enable_multithread_checkbox = QCheckBox("启用多线程优化")
         self.enable_multithread_checkbox.setChecked(False)
@@ -299,38 +300,60 @@ class PdfScanSplitPanel(QWidget):
         self.enable_gpu_checkbox.setChecked(False)
         self.enable_gpu_checkbox.setToolTip("优先尝试OpenCL/CUDA加速；若当前环境不可用会自动回退到CPU")
 
+        self.max_segment_pages_checkbox = QCheckBox("单份最多页数")
+        self.max_segment_pages_checkbox.setChecked(False)
+        self.max_segment_pages_checkbox.setToolTip("启用后检查超长分段，帮助发现漏检的标记页")
+
+        self.max_segment_pages_spin = StyledSpinBox()
+        self.max_segment_pages_spin.setRange(1, 100)
+        self.max_segment_pages_spin.setValue(10)
+        self.max_segment_pages_spin.setProperty("compact", True)
+        self.max_segment_pages_spin.setToolTip("单份PDF允许的最大页数，包含标记页")
+
+        max_pages_row = QWidget()
+        max_pages_layout = QHBoxLayout(max_pages_row)
+        max_pages_layout.setContentsMargins(0, 0, 0, 0)
+        max_pages_layout.setSpacing(6)
+        max_pages_layout.addWidget(self.max_segment_pages_spin, 1)
+        max_pages_label = QLabel("页")
+        max_pages_label.setStyleSheet(f"color: {StyleManager.get_color('gray_700')};")
+        max_pages_layout.addWidget(max_pages_label)
+
         params_row_layout.addWidget(QLabel("特征点数量:"), 0, 0)
         params_row_layout.addWidget(self.nfeatures_spin, 0, 1)
-        params_row_layout.addWidget(QLabel("最小匹配数:"), 1, 0)
-        params_row_layout.addWidget(self.min_matches_spin, 1, 1)
-        params_row_layout.addWidget(QLabel("比例阈值:"), 2, 0)
-        params_row_layout.addWidget(self.ratio_spin, 2, 1)
-        params_row_layout.addWidget(QLabel("RANSAC阈值:"), 3, 0)
-        params_row_layout.addWidget(self.ransac_spin, 3, 1)
-        params_row_layout.addWidget(QLabel("内点比例阈值:"), 4, 0)
-        params_row_layout.addWidget(self.min_inlier_ratio_spin, 4, 1)
-        params_row_layout.addWidget(QLabel("参数预设:"), 5, 0)
-        params_row_layout.addWidget(self.preset_combo, 5, 1)
-        params_row_layout.addWidget(self.marker_as_first_page_checkbox, 6, 0, 1, 2)
-        params_row_layout.addWidget(self.exclude_marker_page_checkbox, 7, 0, 1, 2)
-        params_row_layout.addWidget(self.enable_multithread_checkbox, 8, 0, 1, 2)
-        params_row_layout.addWidget(self.enable_gpu_checkbox, 9, 0, 1, 2)
+        params_row_layout.addWidget(QLabel("最小匹配数:"), 0, 2)
+        params_row_layout.addWidget(self.min_matches_spin, 0, 3)
+        params_row_layout.addWidget(QLabel("比例阈值:"), 1, 0)
+        params_row_layout.addWidget(self.ratio_spin, 1, 1)
+        params_row_layout.addWidget(QLabel("RANSAC阈值:"), 1, 2)
+        params_row_layout.addWidget(self.ransac_spin, 1, 3)
+        params_row_layout.addWidget(QLabel("内点比例阈值:"), 2, 0)
+        params_row_layout.addWidget(self.min_inlier_ratio_spin, 2, 1)
+        params_row_layout.addWidget(QLabel("参数预设:"), 2, 2)
+        params_row_layout.addWidget(self.preset_combo, 2, 3)
+        params_row_layout.addWidget(self.max_segment_pages_checkbox, 3, 0, 1, 2)
+        params_row_layout.addWidget(max_pages_row, 3, 2, 1, 2)
+        params_row_layout.addWidget(self.marker_as_first_page_checkbox, 4, 0, 1, 2)
+        params_row_layout.addWidget(self.exclude_marker_page_checkbox, 4, 2, 1, 2)
+        params_row_layout.addWidget(self.enable_multithread_checkbox, 5, 0, 1, 2)
+        params_row_layout.addWidget(self.enable_gpu_checkbox, 5, 2, 1, 2)
 
         self.params_help_label = QLabel(
-            "说明：特征点数量越大越容易匹配到标记但会变慢；最小匹配数越大判定越严格（误报更少、漏检更可能）；"
-            "比例阈值越小越严格（误匹配更少、漏检更可能）；RANSAC阈值与内点比例阈值影响“内点”判定。"
+            "说明：参数预设仅用于自动/特征匹配中的参考文件兜底；二维码和印章优先按图像特征识别。"
+            "单份最多页数用于发现疑似漏检造成的超长分段。"
         )
         self.params_help_label.setWordWrap(True)
         self.params_help_label.setFont(StyleManager.get_font("small"))
         self.params_help_label.setStyleSheet(f"color: {StyleManager.get_color('gray_600')};")
-        params_row_layout.addWidget(self.params_help_label, 10, 0, 1, 2)
+        params_row_layout.addWidget(self.params_help_label, 6, 0, 1, 4)
         function_layout.addWidget(params_row)
 
         tune_group = QGroupBox("调参工具（不输出文件）")
         tune_group.setProperty("compact", True)
+        tune_group.setProperty("relaxed", True)
         tune_layout = QHBoxLayout(tune_group)
-        tune_layout.setContentsMargins(0, 0, 0, 0)
-        tune_layout.setSpacing(8)
+        tune_layout.setContentsMargins(8, 10, 8, 8)
+        tune_layout.setSpacing(10)
 
         self.test_page_spin = StyledSpinBox()
         self.test_page_spin.setRange(1, 1)
@@ -402,22 +425,22 @@ class PdfScanSplitPanel(QWidget):
         self.log_text = QPlainTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("这里会实时显示进度与错误信息")
-        self.log_text.setMinimumHeight(120)
+        self.log_text.setMinimumHeight(150)
         progress_layout.addWidget(self.log_text, 1)
 
-        self.progress_group.setMinimumHeight(170)
+        self.progress_group.setMinimumHeight(210)
 
-        self.image_group = QGroupBox("图像输入（预览 / 特征点）")
+        self.image_group = QGroupBox("参考输入（预览 / 特征点）")
         self.image_group.setProperty("compact", True)
         image_layout = QVBoxLayout(self.image_group)
         image_layout.setContentsMargins(0, 0, 0, 0)
         image_layout.setSpacing(8)
 
         self.image_empty = EmptyStateWidget(
-            title="未选择PDF",
-            subtitle="选择PDF后可预览页面并进行框选ROI / 调参测试。",
-            action_text="选择PDF",
-            action_callback=self._on_select_pdf,
+            title="未选择参考文件",
+            subtitle="可选择图像或PDF作为参考，用于预览、框选ROI和特征匹配。",
+            action_text="选择参考",
+            action_callback=self._on_select_reference_image,
             icon=QStyle.StandardPixmap.SP_FileDialogStart,
         )
 
@@ -454,7 +477,7 @@ class PdfScanSplitPanel(QWidget):
         roi_row_layout.addWidget(self.roi_clear_button)
         image_body_layout.addWidget(roi_row)
 
-        self.keypoint_info_label = QLabel("未加载图像")
+        self.keypoint_info_label = QLabel("未加载参考文件")
         self.keypoint_info_label.setStyleSheet(f"color: {StyleManager.get_color('gray_600')};")
         image_body_layout.addWidget(self.keypoint_info_label)
 
@@ -485,8 +508,8 @@ class PdfScanSplitPanel(QWidget):
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(12)
-        left_layout.addWidget(self.image_group, 3)
-        left_layout.addWidget(self.progress_group, 1)
+        left_layout.addWidget(self.image_group, 5)
+        left_layout.addWidget(self.progress_group, 2)
 
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
@@ -515,9 +538,11 @@ class PdfScanSplitPanel(QWidget):
         self.min_matches_spin.valueChanged.connect(self._schedule_save_settings)
         self.ratio_spin.valueChanged.connect(self._schedule_save_settings)
         self.marker_as_first_page_checkbox.stateChanged.connect(self._schedule_save_settings)
-        self.exclude_marker_page_checkbox.stateChanged.connect(self._schedule_save_settings)
+        self.exclude_marker_page_checkbox.stateChanged.connect(self._on_exclude_marker_changed)
         self.enable_multithread_checkbox.stateChanged.connect(self._schedule_save_settings)
         self.enable_gpu_checkbox.stateChanged.connect(self._schedule_save_settings)
+        self.max_segment_pages_checkbox.stateChanged.connect(self._on_max_segment_pages_changed)
+        self.max_segment_pages_spin.valueChanged.connect(self._schedule_save_settings)
         self.detect_mode_combo.currentIndexChanged.connect(self._on_detection_mode_changed)
         self.qrcode_no_decode_checkbox.stateChanged.connect(self._on_detection_mode_changed)
         self.qrcode_use_roi_checkbox.stateChanged.connect(self._on_detection_mode_changed)
@@ -537,6 +562,8 @@ class PdfScanSplitPanel(QWidget):
         if self._main_splitter is not None:
             self._main_splitter.splitterMoved.connect(lambda *_: self._clamp_main_splitter())
         self._on_detection_mode_changed()
+        self._on_exclude_marker_changed()
+        self._on_max_segment_pages_changed()
 
     def _on_select_pdf(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择PDF文件", "", "PDF Files (*.pdf)")
@@ -551,11 +578,18 @@ class PdfScanSplitPanel(QWidget):
         self.output_dir_input.setText(path)
 
     def _on_select_reference_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择参考图像", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择参考文件",
+            "",
+            "Reference Files (*.png *.jpg *.jpeg *.bmp *.pdf);;Images (*.png *.jpg *.jpeg *.bmp);;PDF Files (*.pdf)",
+        )
         if not path:
             return
         self._reference_image_path = path
         self.reference_image_input.setText(path)
+        self._sync_image_state()
+        self._refresh_reference_keypoints()
         self._on_detection_mode_changed()
         self._schedule_save_settings()
 
@@ -736,7 +770,7 @@ class PdfScanSplitPanel(QWidget):
                 label = "二维码模式：不计算特征点，可用于框选特征点" if mode == "qrcode" else "印章模式：不计算特征点，可用于框选特征点"
                 self.keypoint_info_label.setText(label)
             else:
-                label = "二维码模式：可选加载图像并框选特征点" if mode == "qrcode" else "印章模式：可选加载图像并框选特征点"
+                label = "二维码模式：可选加载参考文件并框选特征点" if mode == "qrcode" else "印章模式：可选加载参考文件并框选特征点"
                 self.keypoint_info_label.setText(label)
                 self.image_view.setPixmap(QPixmap())
                 self._reference_pixmap_original = None
@@ -746,7 +780,7 @@ class PdfScanSplitPanel(QWidget):
                 self._sync_roi_summary()
                 return
         if not self._reference_image_path:
-            self.keypoint_info_label.setText("未加载图像")
+            self.keypoint_info_label.setText("未加载参考文件")
             self.image_view.setPixmap(QPixmap())
             self._reference_pixmap_original = None
             self._reference_zoom = 1.0
@@ -769,19 +803,16 @@ class PdfScanSplitPanel(QWidget):
             return
 
         try:
-            data = np.fromfile(self._reference_image_path, dtype=np.uint8)
-            img = cv2.imdecode(data, cv2.IMREAD_COLOR)
-            if img is None:
-                raise ValueError("无法读取图像")
+            img = PdfScanSplitEngine._read_reference_bgr(self._reference_image_path, dpi=180)
             if mode in ("qrcode", "stamp"):
                 vis = img.copy()
                 if self._reference_roi:
                     x, y, w, h = self._reference_roi
                     cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                    label = "二维码模式：已加载图像（已框选特征点）" if mode == "qrcode" else "印章模式：已加载图像（已框选特征点）"
+                    label = "二维码模式：已加载参考文件（已框选特征点）" if mode == "qrcode" else "印章模式：已加载参考文件（已框选特征点）"
                     self.keypoint_info_label.setText(label)
                 else:
-                    label = "二维码模式：已加载图像（未框选特征点）" if mode == "qrcode" else "印章模式：已加载图像（未框选特征点）"
+                    label = "二维码模式：已加载参考文件（未框选特征点）" if mode == "qrcode" else "印章模式：已加载参考文件（未框选特征点）"
                     self.keypoint_info_label.setText(label)
             else:
                 orb = cv2.ORB_create(nfeatures=int(self.nfeatures_spin.value()))
@@ -798,10 +829,10 @@ class PdfScanSplitPanel(QWidget):
                     ]
                     cv2.rectangle(vis, (x, y), (x + w, y + h), (255, 0, 0), 2)
                     self.keypoint_info_label.setText(
-                        f"已加载图像：检测到 {len(kps)} 个特征点（框选区域内 {len(in_roi)} 个用于匹配）"
+                        f"已加载参考文件：检测到 {len(kps)} 个特征点（框选区域内 {len(in_roi)} 个用于匹配）"
                     )
                 else:
-                    self.keypoint_info_label.setText(f"已加载图像：检测到 {len(kps)} 个特征点")
+                    self.keypoint_info_label.setText(f"已加载参考文件：检测到 {len(kps)} 个特征点")
 
             rgb = cv2.cvtColor(vis, cv2.COLOR_BGR2RGB)
             h, w, _ = rgb.shape
@@ -813,7 +844,7 @@ class PdfScanSplitPanel(QWidget):
             QTimer.singleShot(0, self._set_reference_fit)
             self._sync_roi_summary()
         except Exception as e:
-            self.keypoint_info_label.setText(f"图像处理失败：{str(e)}")
+            self.keypoint_info_label.setText(f"参考文件处理失败：{str(e)}")
 
     def _clear_reference_roi(self):
         self._reference_roi = None
@@ -830,7 +861,7 @@ class PdfScanSplitPanel(QWidget):
 
     def _open_roi_dialog(self):
         if not self._reference_image_path:
-            QMessageBox.information(self, "提示", "请先选择参考图像")
+            QMessageBox.information(self, "提示", "请先选择参考文件")
             return
         try:
             dialog = RoiSelectDialog(
@@ -885,14 +916,28 @@ class PdfScanSplitPanel(QWidget):
                 self.test_page_spin.setValue(1)
 
     def _sync_image_state(self):
-        has_pdf = bool(self.pdf_path_input.text().strip())
+        has_reference = bool(self.reference_image_input.text().strip())
         if hasattr(self, "image_stack"):
-            self.image_stack.setCurrentIndex(1 if has_pdf else 0)
-        if not has_pdf:
+            self.image_stack.setCurrentIndex(1 if has_reference else 0)
+        if not has_reference:
             self._reference_pixmap_original = None
             self.image_view.clear()
-            self.keypoint_info_label.setText("未加载图像")
+            self.keypoint_info_label.setText("未加载参考文件")
             self.roi_summary_label.setText("未框选区域")
+
+    def _on_exclude_marker_changed(self):
+        excluded = bool(self.exclude_marker_page_checkbox.isChecked())
+        self.marker_as_first_page_checkbox.setEnabled(not excluded)
+        if excluded:
+            self.marker_as_first_page_checkbox.setChecked(False)
+            self.marker_as_first_page_checkbox.setToolTip("标记页不输出时，此选项不生效")
+        else:
+            self.marker_as_first_page_checkbox.setToolTip("标记页保留输出时，作为下一份拆分文件的第一页")
+        self._schedule_save_settings()
+
+    def _on_max_segment_pages_changed(self):
+        self.max_segment_pages_spin.setEnabled(bool(self.max_segment_pages_checkbox.isChecked()))
+        self._schedule_save_settings()
 
     def _build_options(self) -> PdfScanSplitOptions:
         mode = self._get_detection_mode()
@@ -904,6 +949,10 @@ class PdfScanSplitPanel(QWidget):
         if mode == "auto":
             dpi = 220
         roi_ready = bool(self.reference_image_input.text().strip()) and bool(self._reference_roi)
+        use_reference_roi = bool(self.qrcode_use_roi_checkbox.isChecked()) and roi_ready
+        qrcode_no_decode = bool(self.qrcode_no_decode_checkbox.isChecked()) and mode in ("qrcode", "auto")
+        qrcode_text_contains = self.qrcode_text_input.text().strip() if mode in ("qrcode", "auto") and not qrcode_no_decode else ""
+        max_segment_pages = int(self.max_segment_pages_spin.value()) if self.max_segment_pages_checkbox.isChecked() else 0
         return PdfScanSplitOptions(
             dpi=dpi,
             nfeatures=int(self.nfeatures_spin.value()),
@@ -911,17 +960,18 @@ class PdfScanSplitPanel(QWidget):
             min_matches=int(self.min_matches_spin.value()),
             ransac_reproj_threshold=float(self.ransac_spin.value()),
             min_inlier_ratio=float(self.min_inlier_ratio_spin.value()),
-            marker_as_first_page=bool(self.marker_as_first_page_checkbox.isChecked()),
+            marker_as_first_page=bool(self.marker_as_first_page_checkbox.isChecked()) and not bool(self.exclude_marker_page_checkbox.isChecked()),
             exclude_marker_page=bool(self.exclude_marker_page_checkbox.isChecked()),
             enable_multithread=bool(self.enable_multithread_checkbox.isChecked()),
             enable_gpu=bool(self.enable_gpu_checkbox.isChecked()),
-            reference_roi=self._reference_roi,
+            reference_roi=self._reference_roi if use_reference_roi else None,
             detection_mode=mode,
-            qrcode_text_contains=self.qrcode_text_input.text().strip(),
-            qrcode_no_decode=bool(self.qrcode_no_decode_checkbox.isChecked()),
+            qrcode_text_contains=qrcode_text_contains,
+            qrcode_no_decode=qrcode_no_decode,
             qrcode_skip_pages=int(self.qrcode_skip_pages_spin.value() if self.qrcode_skip_checkbox.isChecked() else 0),
-            qrcode_use_roi=bool(self.qrcode_use_roi_checkbox.isChecked()) and roi_ready,
+            qrcode_use_roi=use_reference_roi and mode in ("qrcode", "stamp", "auto"),
             qrcode_max_attempts=180,
+            max_segment_pages=max_segment_pages,
         )
 
     def _get_detection_mode(self) -> str:
@@ -939,18 +989,19 @@ class PdfScanSplitPanel(QWidget):
     def _on_detection_mode_changed(self):
         mode = self._get_detection_mode()
         use_roi_for_qr = bool(self.qrcode_use_roi_checkbox.isChecked()) if hasattr(self, "qrcode_use_roi_checkbox") else False
-        needs_ref = (mode in ("feature", "auto")) or (mode in ("qrcode", "stamp") and use_roi_for_qr)
 
-        self.reference_image_input.setEnabled(needs_ref)
-        self.select_reference_button.setEnabled(needs_ref)
-        self.roi_select_button.setEnabled(needs_ref and bool(self._reference_image_path))
-        self.roi_clear_button.setEnabled(needs_ref)
+        self.reference_image_input.setEnabled(True)
+        self.select_reference_button.setEnabled(True)
+        self.roi_select_button.setEnabled(bool(self._reference_image_path))
+        self.roi_clear_button.setEnabled(bool(self._reference_image_path))
 
         no_decode = bool(self.qrcode_no_decode_checkbox.isChecked()) if hasattr(self, "qrcode_no_decode_checkbox") else False
+        roi_capable = mode in ("qrcode", "stamp", "auto", "feature")
+        skip_capable = mode in ("qrcode", "stamp", "auto", "feature")
         self.qrcode_no_decode_checkbox.setEnabled(mode in ("qrcode", "auto"))
-        self.qrcode_use_roi_checkbox.setEnabled(mode in ("qrcode", "stamp", "auto"))
-        self.qrcode_skip_checkbox.setEnabled(mode in ("qrcode", "stamp", "auto"))
-        self.qrcode_skip_pages_spin.setEnabled(mode in ("qrcode", "stamp", "auto") and bool(self.qrcode_skip_checkbox.isChecked()))
+        self.qrcode_use_roi_checkbox.setEnabled(roi_capable)
+        self.qrcode_skip_checkbox.setEnabled(skip_capable)
+        self.qrcode_skip_pages_spin.setEnabled(skip_capable and bool(self.qrcode_skip_checkbox.isChecked()))
 
         self.qrcode_text_input.setEnabled(mode in ("qrcode", "auto") and (not no_decode))
 
@@ -963,23 +1014,23 @@ class PdfScanSplitPanel(QWidget):
         self.preset_combo.setEnabled(feature_related)
 
         if mode == "auto":
-            self.reference_image_input.setPlaceholderText("选择参考图像（可选，用于特征匹配兜底）")
-            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
+            self.reference_image_input.setPlaceholderText("选择参考文件（可选，用于特征匹配兜底）")
+            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小二维码/印章识别区域，并限制特征匹配范围")
         elif mode == "qrcode":
             if use_roi_for_qr:
-                self.reference_image_input.setPlaceholderText("选择图像并框选特征点（可选）")
+                self.reference_image_input.setPlaceholderText("选择参考文件并框选ROI（可选）")
             else:
-                self.reference_image_input.setPlaceholderText("二维码模式不需要参考图像")
-            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
+                self.reference_image_input.setPlaceholderText("可选：选择参考文件用于预览或框选ROI")
+            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小二维码识别范围，提升速度与稳定性")
         elif mode == "stamp":
             if use_roi_for_qr:
-                self.reference_image_input.setPlaceholderText("选择图像并框选特征点（可选）")
+                self.reference_image_input.setPlaceholderText("选择参考文件并框选ROI（可选）")
             else:
-                self.reference_image_input.setPlaceholderText("印章模式不需要参考图像")
-            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
+                self.reference_image_input.setPlaceholderText("可选：选择参考文件用于预览或框选ROI")
+            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小印章识别范围，提升速度与稳定性")
         else:
-            self.reference_image_input.setPlaceholderText("选择参考图像（用于特征匹配）")
-            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小识别范围，提升速度与稳定性")
+            self.reference_image_input.setPlaceholderText("选择参考文件（图像或PDF，用于特征匹配）")
+            self.qrcode_use_roi_checkbox.setToolTip("使用框选区域(ROI)缩小特征匹配范围，提升速度与稳定性")
 
         self._refresh_reference_keypoints()
         self._schedule_save_settings()
@@ -988,13 +1039,19 @@ class PdfScanSplitPanel(QWidget):
         if self._restoring_settings:
             return
         name = self.preset_combo.currentText().strip()
-        if "更严格" in name:
+        if "严格" in name:
             self.nfeatures_spin.setValue(1000)
             self.ratio_spin.setValue(0.70)
             self.min_matches_spin.setValue(35)
             self.ransac_spin.setValue(4.0)
             self.min_inlier_ratio_spin.setValue(0.55)
-        elif "更宽松" in name:
+        elif "高召回" in name:
+            self.nfeatures_spin.setValue(3000)
+            self.ratio_spin.setValue(0.90)
+            self.min_matches_spin.setValue(12)
+            self.ransac_spin.setValue(8.0)
+            self.min_inlier_ratio_spin.setValue(0.25)
+        elif "宽松" in name:
             self.nfeatures_spin.setValue(2000)
             self.ratio_spin.setValue(0.85)
             self.min_matches_spin.setValue(18)
@@ -1017,15 +1074,15 @@ class PdfScanSplitPanel(QWidget):
                 self.status_banner.set_message("提示", "请先选择PDF文件。")
             return None
         mode = self._get_detection_mode()
-        roi_requested = bool(self.qrcode_use_roi_checkbox.isChecked()) and mode in ("qrcode", "stamp", "auto")
+        roi_requested = bool(self.qrcode_use_roi_checkbox.isChecked()) and mode in ("qrcode", "stamp", "auto", "feature")
         roi_ready = bool(self.reference_image_input.text().strip()) and bool(self._reference_roi)
         roi_fallback = roi_requested and (not roi_ready)
-        roi_tip = "已勾选\u201c框选特征点\u201d，但未选择图像或未框选区域，已按全页识别"
+        roi_tip = "已勾选\u201c框选特征点\u201d，但未选择参考文件或未框选区域，已按全页识别"
         if mode == "feature" and not self.reference_image_input.text().strip():
             if use_dialog:
-                QMessageBox.warning(self, "警告", "请先选择参考图像")
+                QMessageBox.warning(self, "警告", "请先选择参考文件")
             else:
-                self.status_banner.set_message("提示", "特征匹配模式需要先选择参考图像。")
+                self.status_banner.set_message("提示", "特征匹配模式需要先选择参考文件。")
             return None
         if self._worker and self._worker.isRunning():
             if use_dialog:
@@ -1109,6 +1166,7 @@ class PdfScanSplitPanel(QWidget):
             "qrcode_skip_pages": int(options.qrcode_skip_pages or 0),
             "qrcode_use_roi": bool(options.qrcode_use_roi),
             "qrcode_max_attempts": int(options.qrcode_max_attempts or 180),
+            "max_segment_pages": int(options.max_segment_pages or 0),
         }
         run_context = {
             "pdf_path": common["pdf_path"],
@@ -1281,12 +1339,15 @@ class PdfScanSplitPanel(QWidget):
             return
         pdf_name = (self._run_context or {}).get("pdf_name") if self._run_context else ""
         elapsed_ms = int((time.perf_counter() - self._run_started_at) * 1000) if self._run_started_at else None
+        suspect_segments = list(getattr(result, "suspect_segments", None) or [])
 
         if self._worker_task == "scan_only":
             if result.marker_pages:
                 self._append_log(f"快速扫描结束：识别到标记页：{', '.join(str(p + 1) for p in result.marker_pages)}")
             else:
                 self._append_log("快速扫描结束：未识别到标记页")
+            if suspect_segments:
+                self._append_log(f"快速扫描提示：发现 {len(suspect_segments)} 个疑似超长分段，请检查日志中的页码范围")
             if elapsed_ms is not None:
                 if elapsed_ms < 1000:
                     self._append_log(f"快速扫描耗时：{elapsed_ms}ms")
@@ -1299,6 +1360,7 @@ class PdfScanSplitPanel(QWidget):
                         "reference_image_path": self.reference_image_input.text().strip(),
                         "page_limit": int(self.quick_scan_pages_spin.value()),
                         "marker_pages": [int(p) for p in (result.marker_pages or [])],
+                        "suspect_segments": suspect_segments[:20],
                         "elapsed_ms": elapsed_ms,
                         "log_tail": self._run_log_lines[-40:],
                     }
@@ -1331,6 +1393,7 @@ class PdfScanSplitPanel(QWidget):
                             "success": False,
                             "total_pages": int(getattr(result, "total_pages", 0) or 0),
                             "marker_pages": [int(p) for p in (result.marker_pages or [])],
+                            "suspect_segments": suspect_segments[:20],
                             "output_files": [],
                             "elapsed_ms": elapsed_ms,
                             "log_tail": self._run_log_lines[-40:],
@@ -1349,6 +1412,8 @@ class PdfScanSplitPanel(QWidget):
             return
 
         self._append_log(f"任务完成：生成 {len(result.output_files)} 个文件")
+        if suspect_segments:
+            self._append_log(f"任务提示：发现 {len(suspect_segments)} 个疑似超长分段，请检查日志中的页码范围")
         if elapsed_ms is not None:
             if elapsed_ms < 1000:
                 self._append_log(f"总耗时：{elapsed_ms}ms")
@@ -1362,6 +1427,7 @@ class PdfScanSplitPanel(QWidget):
                         "success": True,
                         "total_pages": int(getattr(result, "total_pages", 0) or 0),
                         "marker_pages": [int(p) for p in (result.marker_pages or [])],
+                        "suspect_segments": suspect_segments[:20],
                         "output_count": int(len(result.output_files)),
                         "output_files": list(result.output_files[:20]),
                         "elapsed_ms": elapsed_ms,
@@ -1377,7 +1443,10 @@ class PdfScanSplitPanel(QWidget):
             except Exception:
                 pass
         self._run_started_at = None
-        QMessageBox.information(self, "完成", f"扫描拆分完成，共生成 {len(result.output_files)} 个文件")
+        done_message = f"扫描拆分完成，共生成 {len(result.output_files)} 个文件"
+        if suspect_segments:
+            done_message += f"\n注意：发现 {len(suspect_segments)} 个疑似超长分段，请查看日志确认。"
+        QMessageBox.information(self, "完成", done_message)
 
     def _on_worker_failed(self, message: str):
         self.stop_button.setEnabled(False)
@@ -1427,165 +1496,22 @@ class PdfScanSplitPanel(QWidget):
     def _restore_settings(self):
         self._restoring_settings = True
         try:
-            s = self._settings()
-            mode_value = str(s.value("detectModeValue", "") or "").strip()
-            if mode_value:
-                target_idx = -1
-                for i in range(int(self.detect_mode_combo.count() or 0)):
-                    if self._get_detection_mode_for_text(str(self.detect_mode_combo.itemText(i) or "")) == mode_value:
-                        target_idx = i
-                        break
-                if target_idx >= 0:
-                    self.detect_mode_combo.setCurrentIndex(int(target_idx))
-            else:
-                mode_index = s.value("detectModeIndex", None)
-                if mode_index is not None:
-                    try:
-                        idx = int(mode_index)
-                        if int(self.detect_mode_combo.count() or 0) == 4 and 0 <= idx <= 2:
-                            idx = idx + 1
-                        self.detect_mode_combo.setCurrentIndex(int(idx))
-                    except Exception:
-                        pass
-
-            def _set_int(key: str, widget: QSpinBox, *, default: int):
-                v = s.value(key, None)
-                if v is None:
-                    widget.setValue(int(default))
-                    return
-                try:
-                    widget.setValue(int(v))
-                except Exception:
-                    widget.setValue(int(default))
-
-            def _set_float(key: str, widget: QDoubleSpinBox, *, default: float):
-                v = s.value(key, None)
-                if v is None:
-                    widget.setValue(float(default))
-                    return
-                try:
-                    widget.setValue(float(v))
-                except Exception:
-                    widget.setValue(float(default))
-
-            _set_int("nfeatures", self.nfeatures_spin, default=1200)
-            _set_int("minMatches", self.min_matches_spin, default=25)
-            _set_float("ratio", self.ratio_spin, default=0.75)
-            _set_float("ransacReprojThreshold", self.ransac_spin, default=5.0)
-            _set_float("minInlierRatio", self.min_inlier_ratio_spin, default=0.45)
-
-            _set_int("quickScanPages", self.quick_scan_pages_spin, default=30)
-            _set_int("testPage", self.test_page_spin, default=1)
-
-            def _to_bool(v, default: bool = False) -> bool:
-                if v is None:
-                    return bool(default)
-                if isinstance(v, bool):
-                    return bool(v)
-                try:
-                    return bool(int(v))
-                except Exception:
-                    s2 = str(v).strip().lower()
-                    if s2 in ("1", "true", "yes", "y", "on"):
-                        return True
-                    if s2 in ("0", "false", "no", "n", "off", ""):
-                        return False
-                    return bool(default)
-
-            self.marker_as_first_page_checkbox.setChecked(_to_bool(s.value("markerAsFirst", 1), True))
-            self.exclude_marker_page_checkbox.setChecked(_to_bool(s.value("excludeMarker", 0), False))
-            self.enable_multithread_checkbox.setChecked(_to_bool(s.value("enableMultithread", 0), False))
-            self.enable_gpu_checkbox.setChecked(_to_bool(s.value("enableGpu", 0), False))
-
-            self.qrcode_no_decode_checkbox.setChecked(_to_bool(s.value("qrNoDecode", 0), False))
-            self.qrcode_use_roi_checkbox.setChecked(_to_bool(s.value("qrUseRoi", 1), True))
-            self.qrcode_skip_checkbox.setChecked(_to_bool(s.value("qrSkipEnabled", 0), False))
-            _set_int("qrSkipPages", self.qrcode_skip_pages_spin, default=0)
-            self.qrcode_text_input.setText(str(s.value("qrTextContains", "") or ""))
-
-            preset_index = s.value("presetIndex", None)
-            if preset_index is not None:
-                try:
-                    self.preset_combo.setCurrentIndex(int(preset_index))
-                except Exception:
-                    pass
-
-            pdf_path = str(s.value("pdfPath", "") or "")
-            if pdf_path and os.path.exists(pdf_path):
-                self._pdf_path = pdf_path
-                self.pdf_path_input.setText(pdf_path)
-                self._sync_image_state()
-
-            ref_path = str(s.value("refImagePath", "") or "")
-            if ref_path and os.path.exists(ref_path):
-                self._reference_image_path = ref_path
-                self.reference_image_input.setText(ref_path)
-
-            output_dir = str(s.value("outputDir", "") or "")
-            if output_dir and os.path.exists(output_dir):
-                self.output_dir_input.setText(output_dir)
-
-            self.prefix_input.setText(str(s.value("prefix", "") or ""))
-
-            roi = s.value("referenceRoi", None)
-            if roi:
-                try:
-                    if isinstance(roi, str):
-                        parts = [int(x) for x in roi.split(",") if x.strip()]
-                        if len(parts) == 4:
-                            self._reference_roi = (parts[0], parts[1], parts[2], parts[3])
-                    else:
-                        parts = list(roi)
-                        if len(parts) == 4:
-                            self._reference_roi = (int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]))
-                except Exception:
-                    self._reference_roi = None
+            self._clear_saved_settings()
             self._sync_roi_summary()
             self._on_detection_mode_changed()
-            if self._reference_image_path:
-                self._refresh_reference_keypoints()
         finally:
             self._restoring_settings = False
 
-    def _save_settings(self):
+    def _clear_saved_settings(self):
         try:
             s = self._settings()
-            s.setValue("detectModeIndex", int(self.detect_mode_combo.currentIndex()))
-            s.setValue("detectModeValue", str(self._get_detection_mode() or "qrcode"))
-            s.setValue("nfeatures", int(self.nfeatures_spin.value()))
-            s.setValue("minMatches", int(self.min_matches_spin.value()))
-            s.setValue("ratio", float(self.ratio_spin.value()))
-            s.setValue("ransacReprojThreshold", float(self.ransac_spin.value()))
-            s.setValue("minInlierRatio", float(self.min_inlier_ratio_spin.value()))
-            s.setValue("presetIndex", int(self.preset_combo.currentIndex()))
-
-            s.setValue("markerAsFirst", 1 if self.marker_as_first_page_checkbox.isChecked() else 0)
-            s.setValue("excludeMarker", 1 if self.exclude_marker_page_checkbox.isChecked() else 0)
-            s.setValue("enableMultithread", 1 if self.enable_multithread_checkbox.isChecked() else 0)
-            s.setValue("enableGpu", 1 if self.enable_gpu_checkbox.isChecked() else 0)
-
-            s.setValue("qrNoDecode", 1 if self.qrcode_no_decode_checkbox.isChecked() else 0)
-            s.setValue("qrUseRoi", 1 if self.qrcode_use_roi_checkbox.isChecked() else 0)
-            s.setValue("qrSkipEnabled", 1 if self.qrcode_skip_checkbox.isChecked() else 0)
-            s.setValue("qrSkipPages", int(self.qrcode_skip_pages_spin.value()))
-            s.setValue("qrTextContains", str(self.qrcode_text_input.text().strip()))
-
-            s.setValue("quickScanPages", int(self.quick_scan_pages_spin.value()))
-            s.setValue("testPage", int(self.test_page_spin.value()))
-
-            s.setValue("pdfPath", str(self.pdf_path_input.text().strip()))
-            s.setValue("refImagePath", str(self.reference_image_input.text().strip()))
-            s.setValue("outputDir", str(self.output_dir_input.text().strip()))
-            s.setValue("prefix", str(self.prefix_input.text().strip()))
-
-            if self._reference_roi:
-                x, y, w, h = self._reference_roi
-                s.setValue("referenceRoi", f"{int(x)},{int(y)},{int(w)},{int(h)}")
-            else:
-                s.remove("referenceRoi")
+            s.clear()
             s.sync()
         except Exception:
-            return
+            pass
+
+    def _save_settings(self):
+        self._clear_saved_settings()
 
     def _get_detection_mode_for_text(self, text: str) -> str:
         text = str(text or "").strip()
@@ -1617,7 +1543,7 @@ class PdfScanSplitPanel(QWidget):
             QMessageBox.information(self, "提示", "任务仍在运行，请稍后再关闭")
             self._closing = False
             return False
-        self._save_settings()
+        self._clear_saved_settings()
         return True
 
     def closeEvent(self, event):

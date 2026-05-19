@@ -1,5 +1,5 @@
 APP_NAME = "PDF Split"
-APP_VERSION = "1.1.5"
-APP_FILE_VERSION = "1.1.5.0"
+APP_VERSION = "1.2.0"
+APP_FILE_VERSION = "1.2.0.0"
 GITHUB_REPO = "LXL2000927/file-toolbox"
 GITHUB_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases"

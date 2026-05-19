@@ -10,6 +10,8 @@ except Exception:
     PyPDF2 = None
 import re
 
+from utils.path_utils import make_unique_output_path, make_unique_temp_path
+
 
 class SplitMode(Enum):
     BY_PAGE_COUNT = "by_page_count"
@@ -93,7 +95,7 @@ class PdfSplitEngine:
             raise RuntimeError(str(msg))
         ops = result.get("operations") or []
         if not ops:
-            return []
+            raise RuntimeError("拆分结果为空")
         first = ops[0] or {}
         files = first.get("output_files") or []
         return [str(p) for p in files if p]
@@ -143,25 +145,6 @@ class PdfSplitEngine:
         }
         return self._execute_single(pdf_path, config)
 
-    @staticmethod
-    def make_unique_output_path(output_dir: str, filename: str, used_paths: set[str]) -> str:
-        name = filename or "output.pdf"
-        if not name.lower().endswith(".pdf"):
-            name = f"{name}.pdf"
-        base, ext = os.path.splitext(name)
-        candidate = os.path.join(output_dir, name)
-        if candidate not in used_paths and not os.path.exists(candidate):
-            used_paths.add(candidate)
-            return candidate
-        counter = 2
-        while True:
-            new_name = f"{base}_{counter}{ext}"
-            candidate = os.path.join(output_dir, new_name)
-            if candidate not in used_paths and not os.path.exists(candidate):
-                used_paths.add(candidate)
-                return candidate
-            counter += 1
-    
     def set_config(self, config_dict: Dict[str, Any]):
         self.config = PdfSplitConfig(config_dict)
     
@@ -389,13 +372,20 @@ class PdfSplitEngine:
             if total_pages <= 0:
                 raise RuntimeError("PDF文件没有页面")
 
-            if (
-                len(outputs) == 1
-                and outputs[0].page_range
-                and outputs[0].page_range == (1, total_pages)
-            ):
-                out_path = self.make_unique_output_path(output_dir, outputs[0].filename, used_paths)
-                shutil.copy2(pdf_path, out_path)
+            if len(outputs) == 1 and outputs[0].page_range and outputs[0].page_range == (1, total_pages):
+                out_path = make_unique_output_path(output_dir, outputs[0].filename, used_paths)
+                tmp_name = os.path.basename(out_path)
+                tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
+                try:
+                    shutil.copy2(pdf_path, tmp_path)
+                    os.replace(tmp_path, out_path)
+                except Exception:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise
                 return [out_path]
 
             output_paths: list[str] = []
@@ -409,8 +399,9 @@ class PdfSplitEngine:
                 start = max(1, min(start, total_pages))
                 end = max(start, min(end, total_pages))
 
-                out_path = self.make_unique_output_path(output_dir, planned.filename, used_paths)
-                tmp_path = f"{out_path}.tmp"
+                out_path = make_unique_output_path(output_dir, planned.filename, used_paths)
+                tmp_name = os.path.basename(out_path)
+                tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
                 try:
                     with open(tmp_path, "wb") as out_f:
                         writer = PyPDF2.PdfWriter()

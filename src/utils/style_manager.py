@@ -388,6 +388,16 @@ class StyleManager:
                 padding-bottom: 4px;
                 margin-bottom: 8px;
             }}
+
+            QGroupBox[compact="true"][relaxed="true"] {{
+                padding-top: 12px;
+                padding-bottom: 10px;
+            }}
+
+            QGroupBox[compact="true"][relaxed="true"]::title {{
+                padding-bottom: 5px;
+                margin-bottom: 10px;
+            }}
             
             QFormLayout {{
                 margin: 8px 0px;

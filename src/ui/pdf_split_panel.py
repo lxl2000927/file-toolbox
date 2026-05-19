@@ -13,6 +13,7 @@ from utils.file_picker import FilePicker
 from utils.style_manager import StyleManager
 from utils.history_manager import HistoryManager
 from utils.async_worker import Worker
+from utils.path_utils import make_unique_output_path
 from core.pdf_split_engine import PdfSplitEngine, SplitMode
 import os
 
@@ -32,6 +33,8 @@ class PdfSplitPanel(QWidget):
         self._previewing = False
         self._closing = False
         self._preview_token = 0
+        self._last_preview_cache_key = None
+        self._last_preview_plans = {}
         self.setAcceptDrops(True)
         
         self._setup_ui()
@@ -420,6 +423,9 @@ class PdfSplitPanel(QWidget):
         
         return config
     
+    def _build_preview_cache_key(self, files: list[str], config: dict) -> tuple:
+        return (tuple(files), tuple(sorted(config.items())))
+
     def _on_preview(self):
         if not self.pdf_files:
             self.status_banner.set_message("提示", "请先添加PDF文件后再预览。")
@@ -432,6 +438,9 @@ class PdfSplitPanel(QWidget):
         self._previewing = True
         self._preview_token += 1
         token = self._preview_token
+        cache_key = self._build_preview_cache_key(files, config)
+        self._last_preview_cache_key = None
+        self._last_preview_plans = {}
         self.preview_button.setEnabled(False)
         self.copy_preview_button.setEnabled(False)
         if not self._executing:
@@ -442,7 +451,7 @@ class PdfSplitPanel(QWidget):
         self.preview_text.setPlainText("正在生成预览，请稍候…")
         self.status_banner.set_message("正在预览", "正在读取PDF并生成拆分计划…")
 
-        worker = Worker(self._generate_preview_lines_for_files, files, config)
+        worker = Worker(self._generate_preview_data_for_files, files, config)
         self._active_workers.add(worker)
 
         def _finish_preview():
@@ -458,15 +467,21 @@ class PdfSplitPanel(QWidget):
             if token != self._preview_token or self._closing:
                 _finish_preview()
                 return
-            lines = result if isinstance(result, list) else ["（无预览内容）"]
+            data = result if isinstance(result, dict) else {}
+            lines = data.get("lines") if isinstance(data.get("lines"), list) else ["（无预览内容）"]
+            plans = data.get("plans") if isinstance(data.get("plans"), dict) else {}
             self.preview_text.setPlainText("\n".join(lines))
             self.status_banner.set_message("预览已生成", f"共 {len(files)} 个文件。")
+            self._last_preview_cache_key = cache_key
+            self._last_preview_plans = plans
             _finish_preview()
 
         def _on_error(err):
             if token != self._preview_token or self._closing:
                 _finish_preview()
                 return
+            self._last_preview_cache_key = None
+            self._last_preview_plans = {}
             message = getattr(err, "message", None) or str(err)
             exc_type = getattr(err, "exc_type", None)
             if exc_type:
@@ -490,6 +505,9 @@ class PdfSplitPanel(QWidget):
                 return
         
         config = self._build_config()
+        files = list(self.pdf_files)
+        cache_key = self._build_preview_cache_key(files, config)
+        planned_outputs = self._last_preview_plans if self._last_preview_cache_key == cache_key else None
         
         self._executing = True
         self._preview_token += 1
@@ -501,7 +519,7 @@ class PdfSplitPanel(QWidget):
         self.progress_bar.setValue(0)
         self.status_banner.set_message("正在处理", "正在拆分，请稍候…")
 
-        worker = Worker(self.engine.execute_split, list(self.pdf_files), config)
+        worker = Worker(self.engine.execute_split, files, config, planned_outputs)
         self._active_workers.add(worker)
 
         def _on_finished(result):
@@ -553,13 +571,15 @@ class PdfSplitPanel(QWidget):
         worker.signals.error.connect(_on_error)
         self._thread_pool.start(worker)
 
-    def _generate_preview_lines_for_files(self, files: list[str], config: dict) -> list[str]:
+    def _generate_preview_data_for_files(self, files: list[str], config: dict) -> dict:
         lines: list[str] = []
+        plans: dict[str, dict] = {}
         used_paths: set[str] = set()
 
         for pdf_path in files:
             base = os.path.basename(pdf_path)
             plan = self.engine.plan_outputs_for_file(pdf_path, config)
+            plans[pdf_path] = plan
             if not plan.get("valid"):
                 lines.append(f"{base}  [FAIL] {plan.get('message') or '文件无效'}")
                 continue
@@ -573,7 +593,7 @@ class PdfSplitPanel(QWidget):
             for out in outputs:
                 name = getattr(out, "filename", "") or ""
                 page_range = getattr(out, "page_range", None)
-                unique_path = self.engine.make_unique_output_path(target_dir, name, used_paths)
+                unique_path = make_unique_output_path(target_dir, name, used_paths)
                 unique_name = os.path.basename(unique_path)
                 if page_range and isinstance(page_range, tuple) and len(page_range) == 2:
                     lines.append(f"  - {unique_name}  ({page_range[0]}-{page_range[1]})")
@@ -583,10 +603,15 @@ class PdfSplitPanel(QWidget):
             lines.append("")
 
         if not lines:
-            return ["（无预览内容）"]
-        if lines and lines[-1] == "":
+            lines = ["（无预览内容）"]
+        elif lines[-1] == "":
             lines.pop()
-        return lines
+        return {"lines": lines, "plans": plans}
+
+    def _generate_preview_lines_for_files(self, files: list[str], config: dict) -> list[str]:
+        data = self._generate_preview_data_for_files(files, config)
+        lines = data.get("lines")
+        return lines if isinstance(lines, list) else ["（无预览内容）"]
 
     def _generate_preview_lines(self, config: dict) -> list[str]:
         return self._generate_preview_lines_for_files(list(self.pdf_files), config)

@@ -10,6 +10,8 @@ from PyQt6.QtCore import QSize, QEventLoop, QTimer
 from PyQt6.QtGui import QImage
 from PyQt6.QtPdf import QPdfDocument, QPdfDocumentRenderOptions
 
+from utils.path_utils import make_unique_output_path, make_unique_temp_path
+
 
 ProgressCallback = Callable[[int, int], None]
 LogCallback = Callable[[str], None]
@@ -33,6 +35,7 @@ class PdfScanSplitOptions:
     qrcode_skip_pages: int = 0
     qrcode_use_roi: bool = False
     qrcode_max_attempts: int = 180
+    max_segment_pages: int = 0
     enable_multithread: bool = False
     enable_gpu: bool = False
 
@@ -42,6 +45,7 @@ class PdfScanSplitResult:
     output_files: list[str]
     marker_pages: list[int]
     total_pages: int
+    suspect_segments: list[dict] | None = None
 
 
 @dataclass(frozen=True)
@@ -150,27 +154,30 @@ class PdfScanSplitEngine:
         ref_des = None
         ref_size: tuple[int, int] | None = None
         roi_base_size: tuple[int, int] | None = None
+        ref_img_full = None
 
-        if use_feature and reference_image_path and os.path.exists(reference_image_path):
-            ref_img_full = PdfScanSplitEngine._read_image_bgr(reference_image_path)
-            ref_size = (int(ref_img_full.shape[1]), int(ref_img_full.shape[0]))
-            roi_base_size = ref_size
+        if reference_image_path and os.path.exists(reference_image_path):
+            try:
+                ref_img_full = PdfScanSplitEngine._read_reference_bgr(reference_image_path)
+                ref_size = (int(ref_img_full.shape[1]), int(ref_img_full.shape[0]))
+                roi_base_size = ref_size
+            except Exception:
+                if mode == "feature":
+                    raise
+                ref_img_full = None
+                ref_size = None
+                roi_base_size = None
+
+        if use_feature and ref_img_full is not None:
             ref_img = PdfScanSplitEngine._apply_roi(ref_img_full, options.reference_roi)
             ref_kps, ref_des = PdfScanSplitEngine._extract_features(ref_img, options.nfeatures, orb=orb, cv2=cv2)
             if ref_des is None or len(ref_kps) < 4:
                 if mode == "feature":
-                    raise RuntimeError("参考图像未检测到足够特征点")
+                    raise RuntimeError("参考文件未检测到足够特征点")
                 ref_kps = []
                 ref_des = None
-        else:
-            if mode == "feature":
-                raise FileNotFoundError("参考图像不存在")
-            if reference_image_path and os.path.exists(reference_image_path) and options.reference_roi:
-                try:
-                    roi_img_full = PdfScanSplitEngine._read_image_bgr(reference_image_path)
-                    roi_base_size = (int(roi_img_full.shape[1]), int(roi_img_full.shape[0]))
-                except Exception:
-                    roi_base_size = None
+        elif mode == "feature":
+            raise FileNotFoundError("参考文件不存在")
 
         return _DetectionContext(
             mode=mode,
@@ -263,13 +270,16 @@ class PdfScanSplitEngine:
     def _log_execute_scan_start(mode: str, total_pages: int, log: Optional[LogCallback]) -> None:
         if not log:
             return
-        log(f"PDF页数：{total_pages}")
+        if total_pages > 0:
+            log(f"PDF页数：{total_pages}")
         if mode == "qrcode":
             log("开始识别标记页（二维码模式）…")
         elif mode == "feature":
             log("开始识别标记页（特征匹配模式）…")
         elif mode == "stamp":
             log("开始识别标记页（印章识别模式）…")
+        elif mode == "auto":
+            log("开始识别标记页（自动模式：二维码/印章/特征匹配）…")
 
     @staticmethod
     def _log_execute_summary(
@@ -283,7 +293,7 @@ class PdfScanSplitEngine:
         if not log:
             return
         log(f"拆分写入完成：{len(outputs)} 个文件，用时 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)}")
-        log(f"总耗时：{PdfScanSplitEngine._fmt_seconds(total_elapsed_s)}（识别 {PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)} + 写入 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)}）")
+        log(f"总耗时：{PdfScanSplitEngine._fmt_seconds(total_elapsed_s)} (识别 {PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)} + 写入 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)})")
 
     @staticmethod
     def _prepare_page_images(
@@ -338,7 +348,15 @@ class PdfScanSplitEngine:
         }
 
     @staticmethod
-    def _detect_qr_for_probe(result: dict, page_bgr_qr, options: PdfScanSplitOptions, *, detector=None, cv2=None) -> None:
+    def _detect_qr_for_probe(
+        result: dict,
+        page_bgr_qr,
+        options: PdfScanSplitOptions,
+        *,
+        detector=None,
+        cv2=None,
+        cancel_check: Optional[CancelCheck] = None,
+    ) -> None:
         needle = (options.qrcode_text_contains or "").strip()
         if options.qrcode_no_decode:
             present = PdfScanSplitEngine._qr_detect_confident(page_bgr_qr, detector=detector, cv2=cv2)
@@ -358,6 +376,7 @@ class PdfScanSplitEngine:
             detector=detector,
             cv2=cv2,
             max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
+            cancel_check=cancel_check,
         )
         result["qrcode"]["infos"] = list(infos or [])
         if infos:
@@ -410,6 +429,7 @@ class PdfScanSplitEngine:
             detector=detector,
             cv2=cv2,
             max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
+            cancel_check=cancel_check,
         )
         if infos:
             matched_infos = PdfScanSplitEngine._match_texts(infos, needle)
@@ -460,6 +480,7 @@ class PdfScanSplitEngine:
             detector=detector,
             cv2=cv2,
             max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
+            cancel_check=cancel_check,
         )
         if infos_retry:
             matched_infos = PdfScanSplitEngine._match_texts(infos_retry, needle)
@@ -679,8 +700,28 @@ class PdfScanSplitEngine:
         data = np.fromfile(path, dtype=np.uint8)
         img = cv2.imdecode(data, cv2.IMREAD_COLOR)
         if img is None:
-            raise ValueError("无法读取参考图像")
+            raise ValueError("无法读取参考文件")
         return img
+
+    @staticmethod
+    def _is_pdf_path(path: str) -> bool:
+        return str(path or "").lower().endswith(".pdf")
+
+    @staticmethod
+    def _read_reference_bgr(path: str, *, page_index: int = 0, dpi: int = 180):
+        if PdfScanSplitEngine._is_pdf_path(path):
+            return PdfScanSplitEngine._render_pdf_reference_bgr(path, page_index=page_index, dpi=dpi)
+        return PdfScanSplitEngine._read_image_bgr(path)
+
+    @staticmethod
+    def _render_pdf_reference_bgr(path: str, *, page_index: int = 0, dpi: int = 180):
+        doc = QPdfDocument(None)
+        try:
+            total = PdfScanSplitEngine._load_ready_pdf(doc, path)
+            idx = PdfScanSplitEngine._validate_page_index(page_index, total)
+            return PdfScanSplitEngine._render_page_bgr(doc, idx, dpi, render_options=QPdfDocumentRenderOptions())
+        finally:
+            doc.close()
 
     @staticmethod
     def _qimage_to_bgr(image: QImage):
@@ -768,7 +809,14 @@ class PdfScanSplitEngine:
         return good_count, inliers, inlier_ratio
 
     @staticmethod
-    def _detect_qrcodes(img_bgr, *, detector=None, cv2=None, max_robust_attempts: int | None = None) -> list[str]:
+    def _detect_qrcodes(
+        img_bgr,
+        *,
+        detector=None,
+        cv2=None,
+        max_robust_attempts: int | None = None,
+        cancel_check: Optional[CancelCheck] = None,
+    ) -> list[str]:
         if cv2 is None:
             np, cv2 = PdfScanSplitEngine._require_deps()
         else:
@@ -783,6 +831,9 @@ class PdfScanSplitEngine:
             except Exception:
                 max_robust_attempts = 180
         max_robust_attempts = max(24, int(max_robust_attempts or 180))
+
+        def _cancelled() -> bool:
+            return PdfScanSplitEngine._is_cancelled(cancel_check)
 
         def _min_area_threshold(gray_img) -> float:
             h, w = gray_img.shape[:2]
@@ -1072,7 +1123,7 @@ class PdfScanSplitEngine:
             attempts = 0
 
             def _can_try() -> bool:
-                return attempts < max_robust_attempts
+                return attempts < max_robust_attempts and not _cancelled()
 
             def _counted_decode(fn):
                 nonlocal attempts
@@ -1082,12 +1133,16 @@ class PdfScanSplitEngine:
                 return fn()
 
             for pre in _preprocess_variants(gray_img):
+                if _cancelled():
+                    return []
                 infos = _counted_decode(lambda: _decode_variants(pre, allow_warp=True))
                 if infos:
                     return infos
                 if not _can_try():
                     return []
                 for rot in _rotate_variants(pre):
+                    if _cancelled():
+                        return []
                     infos = _counted_decode(lambda: _decode_variants(rot, allow_warp=True))
                     if infos:
                         return infos
@@ -1097,6 +1152,8 @@ class PdfScanSplitEngine:
                     if not _can_try():
                         return []
                     for scaled in _scale_variants(rot):
+                        if _cancelled():
+                            return []
                         infos = _counted_decode(lambda: _decode_variants(scaled, allow_warp=True))
                         if infos:
                             return infos
@@ -1125,6 +1182,8 @@ class PdfScanSplitEngine:
         ]
 
         for x, y, rw, rh in rois:
+            if _cancelled():
+                return []
             roi = gray_full[y : y + rh, x : x + rw]
             if roi.size <= 0:
                 continue
@@ -1133,6 +1192,8 @@ class PdfScanSplitEngine:
                 return infos
 
         for x, y, rw, rh in rois:
+            if _cancelled():
+                return []
             roi = gray_full[y : y + rh, x : x + rw]
             if roi.size <= 0:
                 continue
@@ -1354,7 +1415,7 @@ class PdfScanSplitEngine:
             processed = 0
             i = 0
             if log and mode == "auto" and ref_des is None:
-                log("自动模式：未选择参考图像或参考图像特征不足，已跳过特征匹配")
+                log("自动模式：未选择参考文件或参考文件特征不足，已跳过特征匹配")
             while i < total:
                 page_bgr_full = PdfScanSplitEngine._render_page_checked(
                     doc,
@@ -1415,7 +1476,7 @@ class PdfScanSplitEngine:
                     PdfScanSplitEngine._log_scan_miss(i, total, mode, stamp_debug, log)
                 if progress:
                     progress(i + 1, total)
-                if marked and mode in ("qrcode", "stamp", "auto") and int(options.qrcode_skip_pages or 0) > 0:
+                if marked and int(options.qrcode_skip_pages or 0) > 0:
                     i += int(options.qrcode_skip_pages or 0) + 1
                 else:
                     i += 1
@@ -1470,7 +1531,10 @@ class PdfScanSplitEngine:
             log=log,
             cancel_check=cancel_check,
         )
-        return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=int(total))
+        segments = PdfScanSplitEngine.build_segments(int(total), markers, options)
+        suspect_segments = PdfScanSplitEngine.analyze_suspect_segments(segments, int(options.max_segment_pages or 0))
+        PdfScanSplitEngine.log_suspect_segments(suspect_segments, log)
+        return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=int(total), suspect_segments=suspect_segments)
 
     @staticmethod
     def probe_page(
@@ -1532,7 +1596,7 @@ class PdfScanSplitEngine:
 
         if (not result["marked"]) and use_qr:
             PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-            PdfScanSplitEngine._detect_qr_for_probe(result, page_bgr_qr, options, detector=detector, cv2=cv2)
+            PdfScanSplitEngine._detect_qr_for_probe(result, page_bgr_qr, options, detector=detector, cv2=cv2, cancel_check=cancel_check)
 
         if (not result["marked"]) and use_stamp:
             PdfScanSplitEngine._raise_if_cancelled(cancel_check)
@@ -1592,6 +1656,45 @@ class PdfScanSplitEngine:
         return segments
 
     @staticmethod
+    def analyze_suspect_segments(segments: list[list[int]], max_pages: int) -> list[dict]:
+        max_pages = int(max_pages or 0)
+        if max_pages <= 0:
+            return []
+        suspects: list[dict] = []
+        for idx, pages in enumerate(segments, start=1):
+            if not pages:
+                continue
+            page_count = len(pages)
+            if page_count <= max_pages:
+                continue
+            suspects.append(
+                {
+                    "index": int(idx),
+                    "start_page": int(pages[0]) + 1,
+                    "end_page": int(pages[-1]) + 1,
+                    "page_count": int(page_count),
+                    "max_pages": int(max_pages),
+                }
+            )
+        return suspects
+
+    @staticmethod
+    def log_suspect_segments(suspect_segments: list[dict], log: Optional[LogCallback]) -> None:
+        if not log or not suspect_segments:
+            return
+        log(f"疑似漏检检查：发现 {len(suspect_segments)} 个超长分段")
+        for item in suspect_segments[:20]:
+            log(
+                f"疑似漏检：第 {int(item.get('index') or 0)} 段 "
+                f"{int(item.get('start_page') or 0)}-{int(item.get('end_page') or 0)} 页，"
+                f"共 {int(item.get('page_count') or 0)} 页，超过单份最大页数 {int(item.get('max_pages') or 0)}"
+            )
+        if len(suspect_segments) > 20:
+            log(f"疑似漏检：还有 {len(suspect_segments) - 20} 个超长分段未展开显示")
+
+
+
+    @staticmethod
     def write_segments(
         pdf_path: str,
         segments: list[list[int]],
@@ -1606,6 +1709,7 @@ class PdfScanSplitEngine:
         os.makedirs(output_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(pdf_path))[0]
         outputs: list[str] = []
+        used_paths: set[str] = set()
 
         with open(pdf_path, "rb") as f:
             reader = PyPDF2.PdfReader(f)
@@ -1621,15 +1725,26 @@ class PdfScanSplitEngine:
                 if PdfScanSplitEngine._is_cancelled(cancel_check):
                     return outputs
                 out_name = f"{prefix}{stem}_scan{idx}.pdf"
-                out_path = os.path.join(output_dir, out_name)
-                with open(out_path, "wb") as out_f:
-                    writer.write(out_f)
+                out_path = make_unique_output_path(output_dir, out_name, used_paths)
+                tmp_name = os.path.basename(out_path)
+                tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
+                try:
+                    with open(tmp_path, "wb") as out_f:
+                        writer.write(out_f)
+                    os.replace(tmp_path, out_path)
+                except Exception:
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    raise
                 outputs.append(out_path)
                 if log:
                     first_page = pages[0] + 1
                     last_page = pages[-1] + 1
                     seg_elapsed_s = time.perf_counter() - seg_started_at
-                    log(f"已生成：{out_name}  ({first_page}-{last_page})  用时 {PdfScanSplitEngine._fmt_seconds(seg_elapsed_s)}")
+                    log(f"已生成：{os.path.basename(out_path)}  ({first_page}-{last_page})  用时 {PdfScanSplitEngine._fmt_seconds(seg_elapsed_s)}")
 
         return outputs
 
@@ -1648,15 +1763,14 @@ class PdfScanSplitEngine:
         total_started_at = time.perf_counter()
         options = options or PdfScanSplitOptions()
         mode = PdfScanSplitEngine._normalize_detection_mode(options.detection_mode)
-        total_pages = PdfScanSplitEngine._get_pdf_page_count(pdf_path)
 
         if not output_dir:
             output_dir = os.path.dirname(pdf_path)
 
-        PdfScanSplitEngine._log_execute_scan_start(mode, total_pages, log)
+        PdfScanSplitEngine._log_execute_scan_start(mode, 0, log)
 
         scan_started_at = time.perf_counter()
-        markers = PdfScanSplitEngine.find_marker_pages(
+        markers, total_pages = PdfScanSplitEngine._scan_markers(
             pdf_path,
             reference_image_path,
             options,
@@ -1670,6 +1784,7 @@ class PdfScanSplitEngine:
             return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=total_pages)
 
         if log:
+            log(f"PDF页数：{total_pages}")
             log(f"识别到标记页：{', '.join(str(p + 1) for p in markers) if markers else '无'}")
             log(f"标记页识别耗时：{PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)}")
             log("开始写入拆分结果…")
@@ -1681,6 +1796,8 @@ class PdfScanSplitEngine:
             return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=total_pages)
         if log:
             log(f"分段结果：{len(segments)} 段，用时 {PdfScanSplitEngine._fmt_seconds(build_elapsed_s)}")
+        suspect_segments = PdfScanSplitEngine.analyze_suspect_segments(segments, int(options.max_segment_pages or 0))
+        PdfScanSplitEngine.log_suspect_segments(suspect_segments, log)
 
         write_started_at = time.perf_counter()
         outputs = PdfScanSplitEngine.write_segments(
@@ -1692,6 +1809,8 @@ class PdfScanSplitEngine:
             cancel_check=cancel_check,
         )
         write_elapsed_s = time.perf_counter() - write_started_at
+        if PdfScanSplitEngine._is_cancelled(cancel_check) and outputs and log:
+            log(f"任务已取消，已保留 {len(outputs)} 个已生成文件")
         total_elapsed_s = time.perf_counter() - total_started_at
         PdfScanSplitEngine._log_execute_summary(
             outputs=outputs,
@@ -1701,4 +1820,4 @@ class PdfScanSplitEngine:
             log=log,
         )
 
-        return PdfScanSplitResult(output_files=outputs, marker_pages=markers, total_pages=total_pages)
+        return PdfScanSplitResult(output_files=outputs, marker_pages=markers, total_pages=total_pages, suspect_segments=suspect_segments)

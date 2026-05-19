@@ -1,5 +1,30 @@
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QRectF
+from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QStyle
+
+
+class EmptyStateIcon(QWidget):
+    def __init__(self, icon: QStyle.StandardPixmap | None = None, parent=None):
+        super().__init__(parent)
+        self._icon = icon
+        self._pixmap = QPixmap()
+        if icon is not None:
+            self._pixmap = self.style().standardIcon(icon).pixmap(28, 28)
+        self.setFixedSize(56, 56)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = QPainterPath()
+        path.addEllipse(QRectF(0.5, 0.5, 55.0, 55.0))
+        painter.fillPath(path, QColor("#f0f0f0"))
+        if not self._pixmap.isNull():
+            x = int((self.width() - self._pixmap.width()) / 2)
+            y = int((self.height() - self._pixmap.height()) / 2)
+            if self._icon == QStyle.StandardPixmap.SP_FileDialogStart:
+                x -= 2
+                y -= 1
+            painter.drawPixmap(x, y, self._pixmap)
 
 
 class EmptyStateWidget(QWidget):
@@ -19,16 +44,8 @@ class EmptyStateWidget(QWidget):
         layout.setSpacing(8)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        icon_label = QLabel()
-        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if icon is not None:
-            pm = self.style().standardIcon(icon).pixmap(QSize(28, 28))
-            icon_label.setPixmap(pm)
-        icon_label.setFixedSize(56, 56)
-        icon_label.setStyleSheet(
-            "background-color: #f0f0f0; border-radius: 28px; padding: 0px;"
-        )
-        layout.addWidget(icon_label)
+        icon_widget = EmptyStateIcon(icon)
+        layout.addWidget(icon_widget, 0, Qt.AlignmentFlag.AlignCenter)
 
         title_label = QLabel(str(title or ""))
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QPoint, QRect, QEvent
-from PyQt6.QtGui import QPixmap
+from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from utils.style_manager import StyleManager
+from core.pdf_scan_split_engine import PdfScanSplitEngine
 
 
 class RoiSelectView(QLabel):
@@ -123,9 +124,9 @@ class RoiSelectDialog(QDialog):
         self.setModal(True)
         self.resize(880, 640)
 
-        pix = QPixmap(image_path)
+        pix = self._load_reference_pixmap(image_path)
         if pix.isNull():
-            raise RuntimeError("无法读取参考图像")
+            raise RuntimeError("无法读取参考文件")
         self._pix = pix
 
         root = QVBoxLayout(self)
@@ -200,6 +201,17 @@ class RoiSelectDialog(QDialog):
 
     def selected_roi(self) -> tuple[int, int, int, int] | None:
         return self.view.selection()
+
+    def _load_reference_pixmap(self, image_path: str) -> QPixmap:
+        if PdfScanSplitEngine._is_pdf_path(image_path):
+            img = PdfScanSplitEngine._render_pdf_reference_bgr(image_path, dpi=180)
+            import cv2
+
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            h, w, _ = rgb.shape
+            qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+            return QPixmap.fromImage(qimg)
+        return QPixmap(image_path)
 
     def _fit(self):
         pix = self._pix

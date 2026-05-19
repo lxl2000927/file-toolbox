@@ -831,6 +831,73 @@ def test_ui_interactions():
         return False
 
 
+
+
+def test_scan_split_segments():
+    print("\nScan split segments test...")
+    from core.pdf_scan_split_engine import PdfScanSplitEngine, PdfScanSplitOptions
+
+    cases = [
+        (
+            "marker_first_include",
+            6,
+            [2],
+            PdfScanSplitOptions(marker_as_first_page=True, exclude_marker_page=False),
+            [[0, 1], [2, 3, 4, 5]],
+        ),
+        (
+            "marker_first_exclude",
+            6,
+            [2],
+            PdfScanSplitOptions(marker_as_first_page=True, exclude_marker_page=True),
+            [[0, 1], [3, 4, 5]],
+        ),
+        (
+            "marker_last_include",
+            6,
+            [2],
+            PdfScanSplitOptions(marker_as_first_page=False, exclude_marker_page=False),
+            [[0, 1, 2], [3, 4, 5]],
+        ),
+        (
+            "marker_last_exclude",
+            6,
+            [2],
+            PdfScanSplitOptions(marker_as_first_page=False, exclude_marker_page=True),
+            [[0, 1], [3, 4, 5]],
+        ),
+        (
+            "first_page_marker_excluded",
+            4,
+            [0, 2],
+            PdfScanSplitOptions(marker_as_first_page=True, exclude_marker_page=True),
+            [[1], [3]],
+        ),
+    ]
+
+    for name, total, markers, options, expected in cases:
+        actual = PdfScanSplitEngine.build_segments(total, markers, options)
+        if actual != expected:
+            print(f"  [FAIL] {name}: expected {expected}, got {actual}")
+            return False
+
+    suspects = PdfScanSplitEngine.analyze_suspect_segments([[0, 1], [2, 3, 4, 5, 6]], 3)
+    expected_suspects = [
+        {
+            "index": 2,
+            "start_page": 3,
+            "end_page": 7,
+            "page_count": 5,
+            "max_pages": 3,
+        }
+    ]
+    if suspects != expected_suspects:
+        print(f"  [FAIL] suspect segments: expected {expected_suspects}, got {suspects}")
+        return False
+
+    print("  [OK] Scan split segments are correct")
+    return True
+
 def test_scan_split_runtime_log():
     print("\n测试扫描拆分运行日志...")
     if not HAVE_PYQT6:
@@ -913,6 +980,7 @@ def main():
         ("UI组件创建", test_ui_creation),
         ("窗口状态持久化", test_window_state_persistence),
         ("UI交互", test_ui_interactions),
+        ("scan_split_segments", test_scan_split_segments),
         ("扫描拆分运行日志", test_scan_split_runtime_log),
     ]
     
