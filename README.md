@@ -23,13 +23,21 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 ## 界面预览
 
-| 批量重命名 | PDF 普通拆分 |
-|---|---|
-| ![批量重命名界面](docs/images/rename.png) | ![PDF 普通拆分界面](docs/images/pdf-split.png) |
+### 批量重命名
 
-| PDF 扫描拆分 | 历史日志与设置 |
-|---|---|
-| ![PDF 扫描拆分界面](docs/images/scan-split.png) | ![历史日志与设置界面](docs/images/settings-logs.png) |
+![批量重命名界面](docs/images/rename.png)
+
+### PDF 普通拆分
+
+![PDF 普通拆分界面](docs/images/pdf-split.png)
+
+### PDF 扫描拆分
+
+![PDF 扫描拆分界面](docs/images/scan-split.png)
+
+### 历史日志与设置
+
+![历史日志与设置界面](docs/images/settings-logs.png)
 
 ## 功能特性
 
