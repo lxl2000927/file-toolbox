@@ -1,5 +1,5 @@
 import os
-import shutil
+import re
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from enum import Enum
@@ -8,9 +8,14 @@ try:
     import PyPDF2
 except Exception:
     PyPDF2 = None
-import re
 
-from utils.path_utils import make_unique_output_path, make_unique_temp_path
+# 模块级预编译正则
+_RE_TITLE_SANITIZE = re.compile(r"[^\w\-_\. ]")
+
+from src.utils.pdf_output import PdfOutputJob, write_pdf_output_jobs
+
+
+CancelCheck = Any
 
 
 class SplitMode(Enum):
@@ -22,18 +27,30 @@ class SplitMode(Enum):
 
 class PdfSplitConfig:
     def __init__(self, config_dict: Dict[str, Any]):
+        if not isinstance(config_dict, dict):
+            config_dict = {}
         raw_mode = config_dict.get("mode", "by_page_count")
         try:
             self.mode = SplitMode(raw_mode)
-        except Exception:
+        except (ValueError, TypeError):
             self.mode = SplitMode.BY_PAGE_COUNT
-        self.page_count = config_dict.get("page_count", 10)
-        self.max_size = config_dict.get("max_size", 10)
-        self.size_unit = config_dict.get("size_unit", "MB")
-        self.page_ranges = config_dict.get("page_ranges", "")
-        self.bookmark_level = config_dict.get("bookmark_level", 1)
-        self.output_dir = config_dict.get("output_dir", "")
-        self.file_prefix = config_dict.get("file_prefix", "")
+        # 数值参数加校验，防止负数或异常类型
+        try:
+            self.page_count = max(1, int(config_dict.get("page_count", 10)))
+        except (TypeError, ValueError):
+            self.page_count = 10
+        try:
+            self.max_size = max(1, float(config_dict.get("max_size", 10)))
+        except (TypeError, ValueError):
+            self.max_size = 10
+        self.size_unit = str(config_dict.get("size_unit", "MB"))
+        self.page_ranges = str(config_dict.get("page_ranges", ""))
+        try:
+            self.bookmark_level = max(1, int(config_dict.get("bookmark_level", 1)))
+        except (TypeError, ValueError):
+            self.bookmark_level = 1
+        self.output_dir = str(config_dict.get("output_dir", "") or "")
+        self.file_prefix = str(config_dict.get("file_prefix", "") or "")
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -60,10 +77,11 @@ class SplitOperationRecord:
         self.total_pages = 0
         self.output_count = 0
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, full: bool = False) -> Dict[str, Any]:
         return {
             "original_path": self.original_path,
-            "output_files": self.output_files[:5],
+            # 对外 API 返回完整列表；内部历史记录若需截断可传 full=False
+            "output_files": self.output_files if full else self.output_files[:50],
             "operation_type": self.operation_type,
             "timestamp": self.timestamp.isoformat(),
             "success": self.success,
@@ -209,7 +227,7 @@ class PdfSplitEngine:
 
     @staticmethod
     def _sanitize_title(title: str) -> str:
-        safe = re.sub(r"[^\w\-_\. ]", "_", str(title or "未命名"))
+        safe = _RE_TITLE_SANITIZE.sub("_", str(title or "未命名"))
         safe = safe.strip() or "未命名"
         return safe[:50]
 
@@ -357,68 +375,25 @@ class PdfSplitEngine:
         output_dir: str,
         outputs: list[PlannedOutput],
         used_paths: Optional[set[str]] = None,
+        cancel_check: Optional[CancelCheck] = None,
     ) -> list[str]:
-        if PyPDF2 is None:
-            raise RuntimeError("缺少依赖：PyPDF2")
         if not outputs:
             return []
 
-        os.makedirs(output_dir, exist_ok=True)
-        used_paths = used_paths or set()
+        jobs: list[PdfOutputJob] = []
+        for planned in outputs:
+            if not planned.page_range or len(planned.page_range) != 2:
+                raise ValueError("输出计划缺少页码范围，无法执行拆分")
+            start, end = planned.page_range
+            jobs.append(PdfOutputJob(planned.filename, range(int(start) - 1, int(end))))
 
-        with open(pdf_path, "rb") as src_f:
-            reader = PyPDF2.PdfReader(src_f)
-            total_pages = len(reader.pages)
-            if total_pages <= 0:
-                raise RuntimeError("PDF文件没有页面")
-
-            if len(outputs) == 1 and outputs[0].page_range and outputs[0].page_range == (1, total_pages):
-                out_path = make_unique_output_path(output_dir, outputs[0].filename, used_paths)
-                tmp_name = os.path.basename(out_path)
-                tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
-                try:
-                    shutil.copy2(pdf_path, tmp_path)
-                    os.replace(tmp_path, out_path)
-                except Exception:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    raise
-                return [out_path]
-
-            output_paths: list[str] = []
-            for planned in outputs:
-                if not planned.page_range or len(planned.page_range) != 2:
-                    raise ValueError("输出计划缺少页码范围，无法执行拆分")
-
-                start, end = planned.page_range
-                start = int(start)
-                end = int(end)
-                start = max(1, min(start, total_pages))
-                end = max(start, min(end, total_pages))
-
-                out_path = make_unique_output_path(output_dir, planned.filename, used_paths)
-                tmp_name = os.path.basename(out_path)
-                tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
-                try:
-                    with open(tmp_path, "wb") as out_f:
-                        writer = PyPDF2.PdfWriter()
-                        for page_num in range(start - 1, end):
-                            writer.add_page(reader.pages[page_num])
-                        writer.write(out_f)
-                    os.replace(tmp_path, out_path)
-                except Exception:
-                    try:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    raise
-                output_paths.append(out_path)
-
-            return output_paths
+        return write_pdf_output_jobs(
+            pdf_path,
+            output_dir=output_dir,
+            jobs=jobs,
+            used_paths=used_paths,
+            cancel_check=cancel_check,
+        )
     
     def _destination_page_1based(self, pdf_reader, item) -> Optional[int]:
         if item is None:
@@ -444,7 +419,8 @@ class PdfSplitEngine:
         current_level: int = 1,
         starts: Optional[list[Tuple[str, int]]] = None,
     ) -> list[Tuple[str, int]]:
-        starts = starts or []
+        if starts is None:
+            starts = []
         if not outline:
             return starts
 
@@ -491,22 +467,45 @@ class PdfSplitEngine:
 
         return bookmarks
     
-    def execute_split(self, pdf_paths: List[str], config_dict: Dict[str, Any]) -> Dict[str, Any]:
+    def execute_split(self, pdf_paths: List[str], config_dict: Dict[str, Any], cancel_check: Optional[CancelCheck] = None) -> Dict[str, Any]:
+        # 输入校验
+        if not isinstance(pdf_paths, (list, tuple)):
+            pdf_paths = [pdf_paths] if pdf_paths else []
+        if not isinstance(config_dict, dict):
+            results = {
+                "total": 0, "successful": 0, "failed": 0,
+                "errors": ["配置参数无效"], "operations": []
+            }
+            return results
+
         results = {
-            "total": len(pdf_paths),
+            "total": 0,
             "successful": 0,
             "failed": 0,
             "errors": [],
             "operations": []
         }
-        
+
         self.operation_records.clear()
         self.set_config(config_dict)
-        
+
+        # 路径去重 + 过滤空值
+        seen: set[str] = set()
+        unique_paths: list[str] = []
+        for p in pdf_paths:
+            if p and isinstance(p, str):
+                norm = os.path.normpath(p)
+                if norm not in seen:
+                    seen.add(norm)
+                    unique_paths.append(norm)
+        pdf_paths = unique_paths
+
         if not pdf_paths:
             results["errors"].append("没有需要处理的PDF文件")
             return results
-        
+
+        results["total"] = len(pdf_paths)
+
         if not self.config:
             results["errors"].append("没有设置拆分配置")
             return results
@@ -520,11 +519,19 @@ class PdfSplitEngine:
                 return results
 
         used_paths: set[str] = set()
+
+        def cancelled() -> bool:
+            try:
+                return bool(cancel_check and cancel_check())
+            except Exception:
+                return False
         
         for pdf_path in pdf_paths:
             record = SplitOperationRecord(pdf_path, [], "split")
-            
+             
             try:
+                if cancelled():
+                    raise RuntimeError("已取消")
                 planned = self.plan_outputs_for_file(pdf_path, config_dict)
                 if not planned.get("valid"):
                     raise RuntimeError(str(planned.get("message") or "无法生成拆分计划"))
@@ -539,6 +546,7 @@ class PdfSplitEngine:
                     output_dir=output_dir,
                     outputs=list(outputs),
                     used_paths=used_paths,
+                    cancel_check=cancel_check,
                 )
                 
                 record.output_files = output_files
@@ -553,7 +561,7 @@ class PdfSplitEngine:
                 results["errors"].append(f"处理文件失败 {os.path.basename(pdf_path)}: {str(e)}")
             
             self.operation_records.append(record)
-            results["operations"].append(record.to_dict())
+            results["operations"].append(record.to_dict(full=True))
         
         self._record_to_history(results)
         
@@ -563,7 +571,7 @@ class PdfSplitEngine:
         if not self.history_manager:
             return
 
-        from utils.history_manager import OperationType
+        from src.utils.history_manager import OperationType
         
         description = f"PDF拆分 {results['successful']}/{results['total']} 个文件"
         
@@ -572,8 +580,8 @@ class PdfSplitEngine:
             "successful_files": results["successful"],
             "failed_files": results["failed"],
             "total_outputs": sum(len(record.get("output_files", [])) for record in results["operations"]),
-            "errors": results["errors"][:5],
-            "operations": results["operations"][:5] if results["operations"] else []
+            "errors": results["errors"][:20],
+            "operations": results["operations"][:20] if results["operations"] else []
         }
         
         success = results["failed"] == 0

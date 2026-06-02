@@ -5,6 +5,21 @@ from datetime import datetime
 from enum import Enum
 import re
 
+# 模块级预编译正则（避免每文件/每调用重新编译）
+_RE_LETTERS = re.compile(r"[A-Za-z]")
+_RE_DIGITS = re.compile(r"[0-9]")
+_RE_CHINESE = re.compile(r"[\u4e00-\u9fff]")
+_RE_SYMBOLS = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
+_RE_WHITESPACE = re.compile(r"\s+")
+_RE_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+_RE_INVOICE_NO = re.compile(r"(发票号码|发票号码：|发票号码:)\s*([0-9]{8})")
+_RE_INVOICE_CODE = re.compile(r"(发票代码|发票代码：|发票代码:)\s*([0-9]{10,12})")
+_RE_INVOICE_DATE = re.compile(r"(开票日期|开票日期：|开票日期:)\s*([0-9]{4}[-年/.][0-9]{1,2}[-月/.][0-9]{1,2})")
+_RE_WHITESPACE_MULTI = re.compile(r"\s+")
+_RE_RANGE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+)\s*)?$")
+_RE_VALIDATE_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
 
 class RenameOperation(Enum):
     INSERT_TEXT = "insert_text"
@@ -101,13 +116,13 @@ class RenameRule:
             custom_chars = self.config.get("custom_chars", "") or ""
 
             if "letters" in targets:
-                name = re.sub(r"[A-Za-z]", "", name)
+                name = _RE_LETTERS.sub("", name)
             if "digits" in targets:
-                name = re.sub(r"[0-9]", "", name)
+                name = _RE_DIGITS.sub("", name)
             if "chinese" in targets:
-                name = re.sub(r"[\u4e00-\u9fff]", "", name)
+                name = _RE_CHINESE.sub("", name)
             if "symbols" in targets:
-                name = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", name)
+                name = _RE_SYMBOLS.sub("", name)
             if custom_chars:
                 pattern = "[" + re.escape(custom_chars) + "]"
                 name = re.sub(pattern, "", name)
@@ -148,8 +163,8 @@ class RenameRule:
         if not value:
             return ""
         value = value.strip()
-        value = re.sub(r"\s+", " ", value)
-        value = re.sub(r'[<>:"/\\|?*\x00-\x1F]', "_", value)
+        value = _RE_WHITESPACE_MULTI.sub(" ", value)
+        value = _RE_INVALID_CHARS.sub("_", value)
         value = value.strip(" .")
         if len(value) > max_len:
             value = value[:max_len].rstrip(" .")
@@ -180,20 +195,20 @@ class RenameRule:
         except Exception:
             return ""
 
-        text = re.sub(r"\s+", " ", text)
+        text = _RE_WHITESPACE_MULTI.sub(" ", text)
         invoice_no = ""
         invoice_code = ""
         date = ""
 
-        m = re.search(r"(发票号码|发票号码：|发票号码:)\s*([0-9]{8})", text)
+        m = _RE_INVOICE_NO.search(text)
         if m:
             invoice_no = m.group(2)
 
-        m = re.search(r"(发票代码|发票代码：|发票代码:)\s*([0-9]{10,12})", text)
+        m = _RE_INVOICE_CODE.search(text)
         if m:
             invoice_code = m.group(2)
 
-        m = re.search(r"(开票日期|开票日期：|开票日期:)\s*([0-9]{4}[-年/.][0-9]{1,2}[-月/.][0-9]{1,2})", text)
+        m = _RE_INVOICE_DATE.search(text)
         if m:
             date = m.group(2)
             date = date.replace("年", "-").replace("月", "-").replace("日", "").replace("/", "-").replace(".", "-")
@@ -265,7 +280,7 @@ class RenameRule:
         if not range_text:
             return name + ext
 
-        m = re.match(r"^\s*(\d+)\s*(?:-\s*(\d+)\s*)?$", range_text)
+        m = _RE_RANGE.match(range_text)
         if not m:
             return name + ext
 
@@ -309,6 +324,38 @@ class FileOperationRecord:
         }
 
 
+def _normalized_abs_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _make_unique_copy_path(target_path: str, used_paths: set[str]) -> str:
+    # TOCTOU 警告（已知债务）：
+    # 当前 engine 为单请求串行模型，不存在并发覆盖问题。
+    # 若未来引入多请求并发，需在 open(candidate, "x") 成功到 shutil.copy2 之间
+    # 加文件锁（例如 portalocker）或原子 rename 代替 copy2。
+    base, ext = os.path.splitext(target_path)
+    candidate = target_path
+    counter = 1
+    while counter <= 10000:
+        norm = _normalized_abs_path(candidate)
+        if norm not in used_paths:
+            # 原子检查：尝试以独占创建模式打开
+            try:
+                with open(candidate, "x"):
+                    pass
+                os.remove(candidate)
+            except FileExistsError:
+                pass
+            except OSError:
+                pass
+            else:
+                used_paths.add(norm)
+                return candidate
+        candidate = f"{base}_副本{counter}{ext}"
+        counter += 1
+    raise RuntimeError(f"无法生成唯一文件名，已尝试 10000 个副本仍然冲突: {target_path}")
+
+
 class RenameEngine:
     def __init__(self, history_manager=None):
         self.history_manager = history_manager
@@ -334,16 +381,24 @@ class RenameEngine:
     
     def batch_generate_filenames(self, filepaths: List[str]) -> List[Tuple[str, str]]:
         results = []
-        
+
         for i, filepath in enumerate(filepaths):
             original_filename = os.path.basename(filepath)
             new_filename = self.generate_new_filename(original_filename, i, filepath)
             results.append((filepath, new_filename))
-        
+
         return results
-    
-    def execute_rename(self, filepaths: List[str], save_method: str = "copy", 
-                      output_dir: Optional[str] = None) -> Dict[str, Any]:
+
+    def execute_rename(self, filepaths: List[str], save_method: str = "copy",
+                          output_dir: Optional[str] = None) -> Dict[str, Any]:
+        # 输入校验：规范化 filepaths 类型
+        if not isinstance(filepaths, (list, tuple)):
+            filepaths = [filepaths] if filepaths else []
+        if not isinstance(save_method, str):
+            save_method = "copy"
+        if output_dir is not None and not isinstance(output_dir, str):
+            output_dir = str(output_dir) if output_dir else None
+
         results = {
             "total": len(filepaths),
             "successful": 0,
@@ -351,17 +406,19 @@ class RenameEngine:
             "errors": [],
             "operations": []
         }
-        
+
         self.operation_records.clear()
-        
+
         if not filepaths:
             results["errors"].append("没有需要处理的文件")
             return results
-        
+
         if not self.rules:
             results["errors"].append("没有设置重命名规则")
             return results
-        
+
+        used_copy_paths: set[str] = set()
+
         for i, filepath in enumerate(filepaths):
             if not os.path.exists(filepath):
                 record = FileOperationRecord(filepath, "", "rename")
@@ -371,7 +428,7 @@ class RenameEngine:
                 results["failed"] += 1
                 results["errors"].append(f"文件不存在: {filepath}")
                 continue
-            
+
             original_filename = os.path.basename(filepath)
             new_filename = self.generate_new_filename(original_filename, i, filepath)
             valid, message = self.validate_filename(new_filename)
@@ -384,9 +441,9 @@ class RenameEngine:
                 results["errors"].append(f"文件名无效 {original_filename} -> {new_filename}: {message}")
                 results["operations"].append(record.to_dict())
                 continue
-            
+
             original_dir = os.path.dirname(filepath)
-            
+
             if output_dir:
                 target_dir = output_dir
                 if not os.path.exists(target_dir):
@@ -402,11 +459,11 @@ class RenameEngine:
                         continue
             else:
                 target_dir = original_dir
-            
+
             new_filepath = os.path.join(target_dir, new_filename)
-            
+
             record = FileOperationRecord(filepath, new_filepath, str(save_method or "rename"))
-            
+
             try:
                 if save_method == "overwrite":
                     if os.path.normcase(os.path.abspath(filepath)) == os.path.normcase(os.path.abspath(new_filepath)):
@@ -423,44 +480,41 @@ class RenameEngine:
                     else:
                         if os.path.exists(new_filepath):
                             raise FileExistsError(f"目标文件已存在，为避免覆盖丢失已停止: {new_filepath}")
+                        if os.path.exists(new_filepath):
+                            raise FileExistsError(f"目标文件已存在: {new_filepath}")
                         os.rename(filepath, new_filepath)
                         record.success = True
                         results["successful"] += 1
-                
+
                 elif save_method == "copy":
-                    if filepath == new_filepath:
-                        base, ext = os.path.splitext(new_filepath)
-                        counter = 1
-                        while os.path.exists(new_filepath):
-                            new_filepath = f"{base}_副本{counter}{ext}"
-                            counter += 1
-                    
+                    new_filepath = _make_unique_copy_path(new_filepath, used_copy_paths)
+
                     shutil.copy2(filepath, new_filepath)
                     record.new_path = new_filepath
                     record.success = True
                     results["successful"] += 1
-                
+
                 else:
                     raise ValueError(f"不支持的保存方式: {save_method}")
-            
+
             except Exception as e:
                 record.success = False
                 record.error_message = str(e)
                 results["failed"] += 1
                 results["errors"].append(f"处理文件失败 {original_filename}: {str(e)}")
-            
+
             self.operation_records.append(record)
             results["operations"].append(record.to_dict())
-        
+
         self._record_to_history(results)
-        
+
         return results
-    
+
     def _record_to_history(self, results: Dict[str, Any]):
         if not self.history_manager:
             return
 
-        from utils.history_manager import OperationType
+        from src.utils.history_manager import OperationType
         
         description = f"批量重命名 {results['successful']}/{results['total']} 个文件"
         
@@ -468,8 +522,8 @@ class RenameEngine:
             "total_files": results["total"],
             "successful_files": results["successful"],
             "failed_files": results["failed"],
-            "errors": results["errors"][:5],
-            "operations": results["operations"][:10] if results["operations"] else []
+            "errors": results["errors"][:20],
+            "operations": results["operations"][:20] if results["operations"] else []
         }
         
         success = results["failed"] == 0
@@ -531,24 +585,17 @@ class RenameEngine:
         return undo_results
     
     def validate_filename(self, filename: str) -> Tuple[bool, str]:
-        if not filename or filename.strip() == "":
+        if not isinstance(filename, str) or not filename.strip():
             return False, "文件名为空"
-        
+
         if len(filename) > 255:
             return False, "文件名过长（超过255个字符）"
-        
-        invalid_chars = ['<', '>', ':', '"', '|', '?', '*', '/', '\\']
-        for char in invalid_chars:
-            if char in filename:
-                return False, f"文件名包含无效字符: {char}"
-        
-        reserved_names = ['CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 
-                         'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 
-                         'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 
-                         'LPT7', 'LPT8', 'LPT9']
-        
+
+        if _RE_VALIDATE_INVALID_CHARS.search(filename):
+            return False, "文件名包含无效字符"
+
         name_without_ext = os.path.splitext(filename)[0].upper()
-        if name_without_ext in reserved_names:
+        if name_without_ext in _RESERVED_NAMES:
             return False, f"文件名是系统保留名称: {name_without_ext}"
         
         if filename.endswith('.') or filename.endswith(' '):

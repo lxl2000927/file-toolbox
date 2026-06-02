@@ -1,0 +1,42 @@
+appId: com.filetoolbox.app
+productName: File Toolbox
+copyright: MIT
+
+directories:
+  output: release
+  buildResources: build
+
+artifactName: ${productName}-${version}-${arch}.${ext}
+
+files:
+  - dist/**/*
+  - "!node_modules"
+
+extraResources:
+  - from: ../engine/dist/
+    to: engine/
+    filter:
+      - "*.exe"
+
+win:
+  signAndEditExecutable: false
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+    - target: zip
+      arch:
+        - x64
+  icon: ../packaging/app.ico
+
+nsis:
+  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+
+portable:
+  artifactName: ${productName}-${version}-${arch}-portable.${ext}

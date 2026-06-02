@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./renderer/src/*"]
+    }
+  },
+  "include": ["main/**/*.ts", "preload/**/*.ts", "renderer/src/**/*.ts", "renderer/src/**/*.vue"],
+  "exclude": ["node_modules", "dist"]
+}

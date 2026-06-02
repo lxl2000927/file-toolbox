@@ -173,3 +173,19 @@ env/
 *.db
 *.sqlite
 output/
+
+# Node / Electron
+electron-app/node_modules/
+electron-app/dist/
+electron-app/out/
+electron-app/release/
+electron-app/release-*/
+electron-app/*.tsbuildinfo
+electron-app/.vite/
+electron-app/.electron-builder-cache/
+
+# Python engine build outputs
+engine/build/
+engine/dist/
+engine/*.spec
+!engine/engine.spec

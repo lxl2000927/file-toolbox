@@ -1,118 +1,191 @@
-# 文件处理工具箱 (File Toolbox)
+# 文件处理工具箱 File Toolbox
 
-一个基于 PyQt6 的桌面应用程序，提供批量文件重命名、PDF普通拆分与扫描拆分功能。
+一个基于 Electron + Vue 3 + TypeScript + Python 引擎的 Windows 桌面文件处理工具，提供批量文件重命名、PDF 普通拆分、PDF 扫描拆分、历史日志与发布诊断能力。
+
+> v2.0.0 起，File Toolbox 已从旧版 PyQt 桌面应用迁移为 Electron 桌面应用，旧 PyQt 入口、旧窗口面板和旧发布脚本已移除。
 
 ## 功能特性
 
-### 1. 批量重命名工具
-- 支持多种重命名规则（插入字符、插入编号、替换、删除/保留、智能识别、自定义等）
-- 实时文件名预览
-- 支持覆盖原文件或另存为副本
-- 操作撤销功能
-- 文件列表支持全选/反选与计数显示
-- 支持文件名自然排序（中英文混排、数字按数值排序）
+### 批量重命名
 
-### 2. PDF拆分工具
-- 按页数拆分（指定每份最大页数）
-- 按文件大小拆分（指定目标文件大小）
-- 按页码范围拆分（指定需要提取的页面范围）
-- 按书签拆分（根据PDF文档的书签结构拆分）
-- 实时进度显示
-- 拆分结果预览（面板内显示，支持复制预览）
+- 支持智能识别、查找替换、插入字符、删除/保留、自定义规则等重命名方式。
+- 支持实时预览新文件名，执行前可检查冲突、空名称和重复名称。
+- 支持覆盖原文件或输出为副本，适合批量整理扫描件、合同、照片和文档。
+- 支持自然排序，处理中英文混排、数字序号等文件名更直观。
 
-### 3. 扫描拆分工具
-- 支持二维码识别 / 印章识别 / 特征匹配（参考图像）三种标记页检测方式
-- 支持框选 ROI 缩小识别范围，提高速度与稳定性
-- 支持命中后跳过 N 页（提升长文档处理速度）
-- 支持 OpenCV 多线程优化与 GPU 加速开关（环境不支持会自动回退）
+### PDF 普通拆分
 
-## 安装
+- 支持按页数、文件大小、页码范围、书签等方式拆分 PDF。
+- 支持指定输出目录，也可默认输出到源文件所在目录。
+- 支持拆分预览、进度反馈和统一输出命名处理。
+- 输出文件会自动处理重名，避免覆盖已有文件或同批次产物冲突。
 
-### 前提条件
+### PDF 扫描拆分
+
+- 支持二维码、印章、特征图像三类标记页识别方式。
+- 支持参考图像或 PDF 参考页，特征匹配可配合 ROI 框选区域提升稳定性。
+- 支持二维码不解码内容，仅识别二维码区域作为拆分标记。
+- 支持命中后跳过指定页数、DPI 兜底重试和阶段耗时统计。
+- 支持扫描日志、命中统计、疑似异常分段提示和历史摘要记录。
+
+### 历史日志与设置
+
+- 设置页提供操作历史日志，支持级别、来源和关键词筛选。
+- 日志级别支持颜色标识，日志来源使用与左侧功能导航一致的图标。
+- 支持自动刷新、手动刷新、清空历史、导出 TXT 和导出 JSON。
+- 支持打开数据目录，便于定位本地历史记录和诊断文件。
+
+### Windows 发布版本
+
+- 安装版：适合长期使用，可选择安装目录并创建桌面快捷方式。
+- 便携单文件版：免安装运行，适合临时使用或随身携带。
+- 压缩版：解压即用，适合需要查看完整应用目录结构的场景。
+
+## 下载与使用
+
+从 GitHub Releases 下载对应版本：
+
+- `File Toolbox-2.0.0-x64-setup.exe`：安装版。
+- `File Toolbox-2.0.0-x64-portable.exe`：便携单文件版。
+- `File Toolbox-2.0.0-x64.zip`：压缩版。
+
+下载后按版本类型运行：
+
+- 安装版：运行安装程序，安装完成后从开始菜单或桌面快捷方式启动。
+- 便携单文件版：直接双击 exe 运行。
+- 压缩版：解压 zip 后运行目录内的 `File Toolbox.exe`。
+
+### 使用提示
+
+- 首次运行未签名 Windows 程序时，系统可能出现 SmartScreen 或杀软提示。
+- 便携单文件版首次启动可能略慢，属于自解压和安全扫描带来的正常现象。
+- 扫描拆分首次使用时会加载 OpenCV、PyMuPDF、NumPy 等依赖，可能有短暂等待。
+- PDF 拆分和扫描拆分建议先用预览或单页测试确认规则，再执行正式处理。
+
+## 开发环境
+
+### 前置要求
+
+- Windows 10/11
 - Python 3.10+
-- pip
+- Node.js 20+
+- npm
 
-### 安装步骤
-1. 克隆仓库
+### 安装 Python 依赖
+
 ```bash
-git clone <repository-url>
-cd file-toolbox
+python -m pip install -r requirements.txt
 ```
 
-2. 创建虚拟环境（可选但推荐）
+### 安装 Electron 依赖
+
 ```bash
-python -m venv venv
-# Windows
-venv\Scripts\activate
-# Linux/Mac
-source venv/bin/activate
+cd electron-app
+npm install
 ```
 
-3. 安装依赖
+### 本地开发运行
+
 ```bash
-pip install -r requirements.txt
+cd electron-app
+npm run dev
 ```
 
-## 使用
+开发模式下，Electron 主进程会通过 Python 解释器启动 `engine/server.py`，并通过 stdio JSON-RPC 与 Python 引擎通信。
 
-运行主程序：
+## 验证命令
+
+发布前建议至少运行以下检查：
+
 ```bash
-python src/main.py
+cd electron-app
+npm run typecheck
+npm run build
+
+cd ..
+python -m compileall engine src
 ```
 
-### 操作提示
-- 支持拖拽文件到列表区域快速添加
-- PDF拆分：不勾选“指定输出目录”时，默认输出到源文件同目录
-- 重命名：建议先勾选“实时预览”确认结果，再点击“开始重命名”
-- 扫描拆分：二维码/印章模式可选“框选特征点(ROI)”提升稳定性；低配电脑可尝试开启多线程优化
+## 打包发布
+
+### 打包 Python 引擎
+
+```bash
+cd engine
+pyinstaller engine.spec --clean --noconfirm
+```
+
+打包后会生成 `engine/dist/engine.exe`，Electron 发布包会将该文件复制到应用资源目录。
+
+### 打包 Windows 三版本
+
+```bash
+cd electron-app
+npm run package
+```
+
+默认输出目录为 `electron-app/release`，会生成：
+
+- 安装版：`File Toolbox-2.0.0-x64-setup.exe`
+- 便携单文件版：`File Toolbox-2.0.0-x64-portable.exe`
+- 压缩版：`File Toolbox-2.0.0-x64.zip`
+
+也可以单独打包指定版本：
+
+```bash
+npm run package:nsis
+npm run package:portable
+npm run package:zip
+```
 
 ## 项目结构
 
+```text
+├── engine/
+│   ├── server.py                    # Python JSON-RPC 服务入口
+│   └── engine.spec                  # PyInstaller 引擎打包配置
+├── src/
+│   ├── core/
+│   │   ├── rename_engine.py         # 批量重命名引擎
+│   │   ├── pdf_split_engine.py      # PDF 普通拆分引擎
+│   │   └── pdf_scan_split_engine.py # PDF 扫描拆分引擎
+│   └── utils/
+│       ├── history_manager.py       # 历史记录管理
+│       ├── path_utils.py            # 路径工具
+│       └── pdf_output.py            # PDF 输出写入工具
+├── electron-app/
+│   ├── main/
+│   │   ├── index.ts                 # Electron 主进程与 IPC
+│   │   └── python-bridge.ts         # Python 引擎桥接
+│   ├── preload/
+│   │   └── index.ts                 # 渲染端安全 API 暴露
+│   ├── renderer/
+│   │   ├── index.html
+│   │   └── src/
+│   │       ├── App.vue              # Vue 应用入口
+│   │       ├── components/          # 导航、状态栏、通用控件和业务面板
+│   │       ├── composables/         # Toast、弹窗、任务状态等组合函数
+│   │       └── styles.css           # 全局主题样式
+│   ├── electron-builder.yml         # Windows 打包配置
+│   └── package.json
+├── requirements.txt
+└── README.md
 ```
-src/
-├── main.py                 # 应用入口
-├── ui/                     # 用户界面组件
-│   ├── main_window.py     # 主窗口
-│   ├── rename_panel.py    # 重命名工具面板
-│   ├── pdf_split_panel.py # PDF拆分工具面板
-│   ├── pdf_scan_split_panel.py # PDF扫描拆分面板
-│   ├── about_panel.py     # 设置 / 日志面板
-│   └── widgets/           # 通用UI组件
-├── core/                   # 核心逻辑
-│   ├── rename_engine.py   # 重命名引擎
-│   ├── pdf_split_engine.py # PDF拆分引擎
-│   └── pdf_scan_split_engine.py # PDF扫描拆分引擎
-└── utils/                  # 工具类
-    ├── file_picker.py     # 文件选择器
-    ├── style_manager.py   # 样式管理器
-    └── history_manager.py # 历史管理器
-```
 
-## 开发
+## 技术架构
 
-### 运行测试
-项目包含集成测试脚本，用于验证核心功能与关键UI交互：
+- Electron 主进程负责窗口管理、系统对话框、路径授权、更新检查和 Python 引擎生命周期。
+- preload 只暴露受控 API，渲染端不能直接访问 Node.js 能力。
+- Vue 3 渲染端负责界面交互、任务状态、日志筛选和用户反馈。
+- Python 引擎通过 stdio JSON-RPC 执行重命名、PDF 拆分、扫描拆分和历史记录读写。
+- 扫描拆分相关重依赖会延迟加载，减少便携版启动阻塞。
 
-```bash
-# 运行集成测试
-python test_integration.py
+## 注意事项
 
-# 或者通过虚拟环境的Python运行
-venv\Scripts\python.exe test_integration.py
-```
-
-当前集成测试覆盖：
-- 模块导入
-- 重命名引擎（预览/执行/删除与保留规则）
-- PDF拆分引擎（配置与页面范围解析）
-- UI组件创建与关键交互（表头全选/计数、自然排序、拆分预览生成、复制预览）
-- 主窗口状态持久化（窗口尺寸位置保存/恢复/重置）
-- 扫描拆分运行日志（成功/失败写入历史）
-
-### 代码风格
-- 遵循PEP 8规范
-- 类型提示：使用Python类型提示提高代码可读性
-- 模块化设计：UI、核心逻辑和工具类分离
+- 当前 Windows 产物未进行代码签名，正式分发时建议配置代码签名证书。
+- 打包前需要先生成 Python 引擎，否则 Electron 发布包无法包含 `engine.exe`。
+- `electron-app/node_modules/`、`electron-app/release*/`、`engine/dist/` 等生成目录不会提交到 Git。
+- v2.0.0 为大版本重构，旧 PyQt 运行方式和旧打包脚本不再保留。
 
 ## 许可证
 
