@@ -1,8 +1,35 @@
 # 文件处理工具箱 File Toolbox
 
-一个基于 Electron + Vue 3 + TypeScript + Python 引擎的 Windows 桌面文件处理工具，提供批量文件重命名、PDF 普通拆分、PDF 扫描拆分、历史日志与发布诊断能力。
+一款面向 Windows 的桌面文件处理工具，专注批量文件重命名、PDF 普通拆分、PDF 扫描拆分与操作历史追踪。
+
+![Version](https://img.shields.io/badge/version-v2.0.0-5b6ee1?style=flat-square)
+![Platform](https://img.shields.io/badge/platform-Windows-2f80ed?style=flat-square)
+![Desktop](https://img.shields.io/badge/desktop-Electron%20%2B%20Vue-42b883?style=flat-square)
+![Engine](https://img.shields.io/badge/engine-Python-3776ab?style=flat-square)
+![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
+
+## File Toolbox 是什么
+
+File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理设计的桌面应用。它把前端交互迁移到 Electron + Vue 3，并保留 Python 引擎负责重命名、PDF 拆分、扫描识别等核心处理逻辑，让界面响应更现代，处理能力也更容易扩展。
+
+- **批量重命名**：适合照片、合同、扫描件、凭证等文件的统一命名与批量整理。
+- **PDF 普通拆分**：按页数、文件大小、页码范围或书签拆分 PDF，支持预览结果。
+- **PDF 扫描拆分**：通过二维码、印章或特征图像识别标记页，适合扫描件批量分册。
+- **历史日志**：记录操作结果、错误提示和来源信息，便于复盘、导出和问题定位。
+
+[下载最新版](https://github.com/lxl2000927/file-toolbox/releases/latest) · [查看发布记录](https://github.com/lxl2000927/file-toolbox/releases) · [提交问题](https://github.com/lxl2000927/file-toolbox/issues)
 
 > v2.0.0 起，File Toolbox 已从旧版 PyQt 桌面应用迁移为 Electron 桌面应用，旧 PyQt 入口、旧窗口面板和旧发布脚本已移除。
+
+## 界面预览
+
+| 批量重命名 | PDF 普通拆分 |
+|---|---|
+| ![批量重命名界面](docs/images/rename.png) | ![PDF 普通拆分界面](docs/images/pdf-split.png) |
+
+| PDF 扫描拆分 | 历史日志与设置 |
+|---|---|
+| ![PDF 扫描拆分界面](docs/images/scan-split.png) | ![历史日志与设置界面](docs/images/settings-logs.png) |
 
 ## 功能特性
 
