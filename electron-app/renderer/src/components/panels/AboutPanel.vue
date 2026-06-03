@@ -109,11 +109,13 @@ function formatLogRecord(record: any) {
   const _status = record?.success === true ? "成功" : record?.success === false ? "失败" : "未知";
   const details = record?.details && typeof record.details === "object" ? record.details : {};
   const detailLogs = Array.isArray(details.log_tail) ? details.log_tail.map((line: unknown) => String(line)).filter(Boolean) : [];
+  const scanOptionsText = formatScanOptions(details.options);
   const perfText = formatPerformanceStats(details.performance_stats);
   const detailText = detailLogs.length ? `\n  详细日志\n${detailLogs.map((line: string) => `    ${line}`).join("\n")}` : "";
   const metaText = formatLogMeta(details);
   const _rawText = `[${record.timestamp}] [${_src}] [_LEVEL_] ${_msg} · ${_status}` +
     metaText +
+    scanOptionsText +
     (record?.error_message ? `\n  错误：${record.error_message}` : "") +
     perfText +
     detailText;
@@ -131,6 +133,47 @@ function formatDuration(seconds: unknown) {
   return `${minutes}m${(value - minutes * 60).toFixed(1)}s`;
 }
 
+function formatScanOptions(options: any) {
+  if (!options || typeof options !== "object") return "";
+  const modeMap: Record<string, string> = {
+    auto: "自动",
+    qrcode: "二维码",
+    stamp: "印章",
+    feature: "特征匹配",
+  };
+  const parts: string[] = [];
+  const mode = String(options.detection_mode || "");
+  if (mode) parts.push(`${modeMap[mode] || mode}模式`);
+  if (Number.isFinite(Number(options.dpi))) parts.push(`DPI ${Number(options.dpi)}`);
+  const roi = Array.isArray(options.reference_roi) ? options.reference_roi.map((item: unknown) => Number(item)) : null;
+  const useRoi = options.use_roi === true || options.qrcode_use_roi === true;
+  if (useRoi && roi && roi.length === 4 && roi.every(Number.isFinite)) {
+    parts.push(`ROI 已启用 [x=${roi[0]}, y=${roi[1]}, w=${roi[2]}, h=${roi[3]}]`);
+  } else if (useRoi) {
+    parts.push("ROI 已启用但未框选区域");
+  } else {
+    parts.push("ROI 未启用");
+  }
+  if (options.qrcode_no_decode === true) parts.push("二维码不解码");
+  const qrText = typeof options.qrcode_text_contains === "string" ? options.qrcode_text_contains.trim() : "";
+  if (qrText) parts.push(`二维码内容包含“${qrText}”`);
+  if (Number(options.qrcode_skip_pages) > 0) parts.push(`命中后跳过 ${Number(options.qrcode_skip_pages)} 页`);
+  if (Number.isFinite(Number(options.qrcode_max_attempts))) parts.push(`二维码最多尝试 ${Number(options.qrcode_max_attempts)}`);
+  const markerMode = options.exclude_marker_page === true
+    ? "不保存标记页"
+    : options.marker_as_first_page === false ? "标记页放上一份末尾" : "标记页放下一份开头";
+  parts.push(markerMode);
+  if (Number(options.max_segment_pages) > 0) parts.push(`每份最多 ${Number(options.max_segment_pages)} 页`);
+  if (Number.isFinite(Number(options.nfeatures))) parts.push(`特征点 ${Number(options.nfeatures)}`);
+  if (Number.isFinite(Number(options.min_matches))) parts.push(`最小匹配 ${Number(options.min_matches)}`);
+  if (Number.isFinite(Number(options.ratio))) parts.push(`比例 ${Number(options.ratio)}`);
+  if (Number.isFinite(Number(options.min_inlier_ratio))) parts.push(`内点比例 ${Number(options.min_inlier_ratio)}`);
+  if (Number.isFinite(Number(options.ransac_reproj_threshold))) parts.push(`RANSAC ${Number(options.ransac_reproj_threshold)}`);
+  if (options.enable_multithread === true) parts.push("OpenCV 多线程");
+  if (options.enable_gpu === true) parts.push("OpenCL 加速");
+  return parts.length ? `\n  配置：${parts.join(" · ")}` : "";
+}
+
 function formatLogMeta(details: any) {
   const parts: string[] = [];
   if (Array.isArray(details.marker_pages)) parts.push(`标记页 ${details.marker_pages.length}`);
@@ -143,7 +186,7 @@ function formatPerformanceStats(stats: any) {
   if (!stats || typeof stats !== "object") return "";
   const lines = [
     `扫描：${formatDuration(stats.scan_seconds)} · ${Number(stats.pages_scanned || 0)} 页 · 命中 ${Number(stats.markers_found || 0)} 页`,
-    `阶段：渲染 ${formatDuration(stats.render_seconds)} · 二维码 ${formatDuration(stats.qr_seconds)} · 印章 ${formatDuration(stats.stamp_seconds)} · 特征 ${formatDuration(stats.feature_seconds)}`,
+    `阶段：渲染 ${formatDuration(stats.render_seconds)} · 二维码 ${formatDuration(stats.qr_seconds)} · 印章 ${formatDuration(stats.stamp_seconds)} · 特征 ${formatDuration(stats.feature_seconds)} · 其他 ${formatDuration(stats.other_seconds)}`,
     `辅助：DPI兜底 ${formatDuration(stats.dpi_fallback_seconds)}（${Number(stats.dpi_fallback_hits || 0)}/${Number(stats.dpi_fallback_attempts || 0)}） · 分段 ${formatDuration(stats.build_seconds)} · 写入 ${formatDuration(stats.write_seconds)}`,
   ];
   if (Number(stats.roi_clip_pages || 0) || Number(stats.roi_clip_fallback_pages || 0)) {
@@ -421,7 +464,7 @@ async function openDataDir() {
           <div>
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.0.0</span>
+              <span class="version-pill">v2.1.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
             </div>
           </div>
@@ -458,7 +501,7 @@ async function openDataDir() {
         <div v-else-if="updateResult?.ok" class="release-panel current-version">
           <div class="release-topline">
             <span class="release-badge current">当前已是最新版本</span>
-            <span class="release-versions">v{{ updateResult.current || '2.0.0' }}</span>
+            <span class="release-versions">v{{ updateResult.current || '2.1.0' }}</span>
           </div>
           <p>无需更新。后续版本仍可在这里查看 Release 信息和下载入口。</p>
         </div>
@@ -475,7 +518,7 @@ async function openDataDir() {
           <div class="about-hero-info">
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.0.0</span>
+              <span class="version-pill">v2.1.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
               <span class="version-pill version-pill-sub">Python Engine</span>
             </div>

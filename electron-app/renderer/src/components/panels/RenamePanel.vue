@@ -46,6 +46,11 @@ const sortMode = ref<"name" | "size">("name");
 const sortMenuOpen = ref(false);
 const sortMenuStyle = ref<Record<string, string>>({});
 const dragOver = ref(false);
+const draggingFile = ref<string | null>(null);
+const dragTargetFile = ref<string | null>(null);
+let rowDragPointerId: number | null = null;
+let rowDragColumnX: number | null = null;
+let rowDragLastMoveAt = 0;
 const fileSizes = ref<Map<string, number>>(new Map());
 
 const activeRules = computed({
@@ -178,6 +183,97 @@ function setSort(mode: "name" | "size", dir: "asc" | "desc") {
   sortMenuOpen.value = false;
 }
 
+function beginRowDrag(path: string, e: PointerEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (sortDir.value) {
+    files.value = [...sortedFiles.value];
+    sortDir.value = null;
+  }
+  draggingFile.value = path;
+  dragTargetFile.value = null;
+  rowDragPointerId = e.pointerId;
+  const opsCell = (e.currentTarget as HTMLElement).closest("td.col-ops");
+  const rect = opsCell?.getBoundingClientRect();
+  rowDragColumnX = rect ? rect.left + rect.width / 2 : e.clientX;
+  document.body.style.cursor = "grabbing";
+  document.body.style.userSelect = "none";
+  window.addEventListener("pointermove", onRowDragMove);
+  window.addEventListener("pointerup", endRowDrag);
+  window.addEventListener("pointercancel", cancelRowDrag);
+}
+
+function onFileAreaDragOver(e: DragEvent) {
+  if (draggingFile.value) {
+    e.preventDefault();
+    dragOver.value = false;
+    return;
+  }
+  e.preventDefault();
+  dragOver.value = true;
+}
+
+function onRowDragMove(e: PointerEvent) {
+  if (!draggingFile.value || (rowDragPointerId !== null && e.pointerId !== rowDragPointerId)) return;
+  const now = performance.now();
+  if (now - rowDragLastMoveAt < 18) return;
+  const element = document.elementFromPoint(rowDragColumnX ?? e.clientX, e.clientY) as HTMLElement | null;
+  const opsCell = element?.closest("td.col-ops");
+  const row = opsCell?.closest<HTMLTableRowElement>("tr[data-file-path]");
+  const targetPath = row?.dataset.filePath || "";
+  if (!row || !targetPath || targetPath === draggingFile.value) {
+    dragTargetFile.value = null;
+    return;
+  }
+  dragTargetFile.value = targetPath;
+  const sourceIndex = files.value.indexOf(draggingFile.value);
+  const targetIndex = files.value.indexOf(targetPath);
+  if (sourceIndex < 0 || targetIndex < 0) return;
+  const shouldInsertAfter = sourceIndex < targetIndex;
+  if (moveFileNearTarget(draggingFile.value, targetPath, shouldInsertAfter)) rowDragLastMoveAt = now;
+}
+
+function moveFileNearTarget(sourcePath: string, targetPath: string, insertAfter: boolean) {
+  const next = [...files.value];
+  const sourceIndex = next.indexOf(sourcePath);
+  if (sourceIndex < 0) return false;
+  next.splice(sourceIndex, 1);
+  const targetIndex = next.indexOf(targetPath);
+  if (targetIndex < 0) return false;
+  const insertIndex = targetIndex + (insertAfter ? 1 : 0);
+  next.splice(insertIndex, 0, sourcePath);
+  const changed = next.some((file, index) => file !== files.value[index]);
+  if (changed) files.value = next;
+  return changed;
+}
+
+function cleanupRowDrag() {
+  window.removeEventListener("pointermove", onRowDragMove);
+  window.removeEventListener("pointerup", endRowDrag);
+  window.removeEventListener("pointercancel", cancelRowDrag);
+  rowDragPointerId = null;
+  rowDragColumnX = null;
+  rowDragLastMoveAt = 0;
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+}
+
+function finishRowDrag() {
+  cleanupRowDrag();
+  draggingFile.value = null;
+  dragTargetFile.value = null;
+}
+
+function cancelRowDrag() {
+  finishRowDrag();
+}
+
+function endRowDrag(e: PointerEvent) {
+  if (rowDragPointerId !== null && e.pointerId !== rowDragPointerId) return;
+  finishRowDrag();
+  summary.value = null;
+}
+
 function openSortMenu(e: MouseEvent) {
   e.stopPropagation();
   const btn = e.currentTarget as HTMLElement;
@@ -201,15 +297,11 @@ onBeforeUnmount(() => {
     previewTimer = null;
   }
   document.removeEventListener("click", closeSortMenu);
+  cleanupRowDrag();
 });
 
 onMounted(() => {
   document.addEventListener("click", closeSortMenu);
-});
-
-const sortArrowChar = computed(() => {
-  if (!sortDir.value) return "⇅";
-  return sortDir.value === "asc" ? "▲" : "▼";
 });
 
 let previewTimer: number | null = null;
@@ -279,23 +371,34 @@ async function addFiles() {
 
 function appendFiles(paths: string[]) {
   const set = new Set(files.value);
-  for (const p of paths) set.add(p);
+  const selectedSet = new Set(selected.value);
+  const addedPaths: string[] = [];
+  for (const p of paths) {
+    if (!set.has(p)) addedPaths.push(p);
+    set.add(p);
+  }
   const prevCount = files.value.length;
   files.value = Array.from(set);
   const addedCount = files.value.length - prevCount;
   if (addedCount > 0) toast.success(`已添加 ${addedCount} 个文件`);
-  // 默认全选
-  selected.value = new Set(files.value);
+  for (const p of addedPaths) selectedSet.add(p);
+  selected.value = new Set(files.value.filter((p) => selectedSet.has(p)));
   summary.value = null;
-  // 收集文件大小
+  updateFileSizes(addedPaths);
+}
+
+function updateFileSizes(paths: string[], replace = false) {
+  if (replace) fileSizes.value = new Map();
+  const targetPaths = Array.from(new Set(paths)).filter(Boolean);
+  if (!targetPaths.length) return;
   if (window.electronAPI?.statPaths) {
-    window.electronAPI.statPaths(paths).then((stats) => {
+    window.electronAPI.statPaths(targetPaths).then((stats) => {
       for (const s of stats) {
         if (s.isFile && s.size >= 0) {
           fileSizes.value.set(s.path, s.size);
-          fileSizes.value = new Map(fileSizes.value);
         }
       }
+      fileSizes.value = new Map(fileSizes.value);
     });
   }
 }
@@ -304,6 +407,7 @@ function clearFiles() {
   files.value = [];
   previews.value = [];
   selected.value = new Set();
+  fileSizes.value = new Map();
   summary.value = null;
   lastOperations.value = [];
 }
@@ -313,6 +417,9 @@ function removeFile(path: string) {
   files.value = files.value.filter((p) => p !== path);
   selected.value.delete(path);
   selected.value = new Set(selected.value);
+  fileSizes.value.delete(path);
+  fileSizes.value = new Map(fileSizes.value);
+  summary.value = null;
 }
 
 function toggleAll(checked: boolean) {
@@ -376,6 +483,7 @@ async function execute() {
       if (next.length) {
         files.value = next;
         selected.value = new Set(next);
+        updateFileSizes(next, true);
       }
     }
   } catch (e: any) {
@@ -423,6 +531,10 @@ async function pickOutputDir() {
 
 async function onDrop(e: DragEvent) {
   e.preventDefault();
+  if (draggingFile.value) {
+    dragOver.value = false;
+    return;
+  }
   dragOver.value = false;
   const dt = e.dataTransfer;
   if (!dt) return;
@@ -484,11 +596,12 @@ function startColResize(e: MouseEvent) {
           <span class="flex-1" />
           <button class="btn btn-secondary btn-pill" :disabled="!files.length" @click="invertSelection">反选</button>
         </div>
-        <div class="table-wrap drop-area" :class="{ dragging: dragOver }" @dragover.prevent="dragOver = true" @dragleave="dragOver = false" @drop="onDrop($event)">
+        <div class="table-wrap drop-area" :class="{ dragging: dragOver }" @dragover="onFileAreaDragOver" @dragleave="dragOver = false" @drop="onDrop($event)">
           <table
             v-if="files.length"
             ref="renameTableRef"
             class="data-table rename-table"
+            :class="{ 'row-sorting': draggingFile }"
             :style="{ '--col-check-width': colCheckWidth + 'px' }"
           >
             <colgroup>
@@ -518,7 +631,10 @@ function startColResize(e: MouseEvent) {
                       aria-label="打开排序选项"
                       @click="openSortMenu"
                     >
-                      <span class="sort-arrow">{{ sortArrowChar }}</span>
+                      <span class="sort-indicator" :class="{ unsorted: !sortDir, asc: sortDir === 'asc', desc: sortDir === 'desc' }">
+                        <span class="sort-triangle sort-triangle-up"></span>
+                        <span class="sort-triangle sort-triangle-down"></span>
+                      </span>
                     </button>
                   </div>
                   <span
@@ -533,8 +649,17 @@ function startColResize(e: MouseEvent) {
                 <th class="col-ops"></th>
               </tr>
             </thead>
-            <tbody>
-              <tr v-for="f in sortedFiles" :key="f" :class="{ 'diff-row': previewMap.get(f) && previewMap.get(f) !== fileBasename(f) }">
+            <TransitionGroup tag="tbody" name="rename-row">
+              <tr
+                v-for="f in sortedFiles"
+                :key="f"
+                :data-file-path="f"
+                :class="{
+                  'diff-row': previewMap.get(f) && previewMap.get(f) !== fileBasename(f),
+                  'row-dragging': draggingFile === f,
+                  'row-drop-target': dragTargetFile === f,
+                }"
+              >
                 <td class="col-check">
                   <label class="checkbox">
                     <input
@@ -550,10 +675,21 @@ function startColResize(e: MouseEvent) {
                   <span v-else class="text-muted">—</span>
                 </td>
                 <td class="col-ops">
-                  <button class="btn btn-icon btn-icon-danger" title="移除" aria-label="从列表移除文件" @click="removeFile(f)">✕</button>
+                  <div class="row-actions">
+                    <button
+                      class="row-drag-handle"
+                      type="button"
+                      title="拖动调整顺序"
+                      aria-label="拖动调整文件顺序"
+                      @pointerdown="beginRowDrag(f, $event)"
+                    >
+                      <span class="drag-handle-icon" aria-hidden="true"></span>
+                    </button>
+                    <button class="row-remove-btn" type="button" title="移除" aria-label="从列表移除文件" @click="removeFile(f)">✕</button>
+                  </div>
                 </td>
               </tr>
-            </tbody>
+            </TransitionGroup>
           </table>
           <div v-else class="empty-state empty-drop-state">
             <div class="empty-icon">📂</div>
@@ -640,7 +776,7 @@ function startColResize(e: MouseEvent) {
 .rename-table {
   --col-check-min-width: 190px;
   --col-name-min-width: 220px;
-  --col-ops-width: 52px;
+  --col-ops-width: 70px;
   font-size: var(--font-md);
   table-layout: fixed;
   width: 100%;
@@ -674,8 +810,8 @@ function startColResize(e: MouseEvent) {
   width: var(--col-ops-width);
   min-width: var(--col-ops-width);
   max-width: var(--col-ops-width);
-  padding-left: 6px;
-  padding-right: 6px;
+  padding-left: 8px;
+  padding-right: 12px;
   text-align: center;
 }
 .rename-table th.col-check span { font-weight: 700; color: var(--color-gray-800); }
@@ -688,30 +824,157 @@ function startColResize(e: MouseEvent) {
 
 /* 文件行悬浮微浮 */
 .rename-table tbody tr {
-  transition: background-color var(--transition-fast);
+  position: relative;
+  transition: background-color var(--transition-fast), opacity 120ms ease, transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1), filter 140ms ease, box-shadow 140ms ease;
+}
+.rename-row-move {
+  transition: transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.rename-table.row-sorting {
+  cursor: grabbing;
+}
+.rename-table.row-sorting tbody tr:not(.row-dragging) {
+  opacity: 0.72;
+  filter: saturate(0.86);
+}
+.rename-table.row-sorting tbody tr:hover {
+  background: transparent;
 }
 .rename-table tbody tr:hover {
   background: rgba(37, 99, 235, 0.055);
 }
-.sort-btn {
-  font-weight: 700;
-  color: var(--color-gray-800);
-  font-size: var(--font-md);
-  padding: 0 2px;
-  line-height: 1;
-  background: none;
-  border: none;
-  cursor: pointer;
-  vertical-align: middle;
-  position: relative;
-  flex: 0 0 auto;
+.rename-table tbody tr.row-dragging {
+  opacity: 1;
+  filter: none;
+  background: rgba(255, 255, 255, 0.96);
+  transform: translateY(-2px) scale(1.012);
+  z-index: 4;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18), 0 0 0 1px rgba(37, 99, 235, 0.16);
 }
-.sort-btn:hover .sort-arrow { color: var(--color-primary-dark); }
-.sort-arrow { font-size: 10px; transition: color var(--transition-fast); }
+.rename-table tbody tr.row-drop-target {
+  background: rgba(37, 99, 235, 0.035);
+}
+.rename-table.row-sorting tbody tr.row-drop-target:not(.row-dragging) {
+  opacity: 0.86;
+}
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  opacity: 0;
+  transform: translateX(2px);
+  width: 100%;
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+.rename-table tbody tr:hover .row-actions,
+.rename-table tbody tr.row-dragging .row-actions,
+.rename-table tbody tr.row-drop-target .row-actions {
+  opacity: 1;
+  transform: translateX(0);
+}
+.row-drag-handle,
+.row-remove-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-gray-600);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+.row-drag-handle {
+  cursor: grab;
+}
+.row-drag-handle:active {
+  cursor: grabbing;
+}
+.rename-table.row-sorting .row-drag-handle {
+  cursor: grabbing;
+}
+.drag-handle-icon {
+  width: 12px;
+  height: 12px;
+  display: block;
+  background-image: linear-gradient(currentColor, currentColor), linear-gradient(currentColor, currentColor), linear-gradient(currentColor, currentColor);
+  background-size: 12px 1px, 12px 1px, 12px 1px;
+  background-position: center 3px, center 6px, center 9px;
+  background-repeat: no-repeat;
+}
+.row-drag-handle:hover {
+  color: var(--color-primary);
+  background: rgba(37, 99, 235, 0.08);
+  border-color: rgba(37, 99, 235, 0.18);
+}
+.row-remove-btn:hover {
+  color: var(--color-danger);
+  background: rgba(239, 68, 68, 0.08);
+  border-color: rgba(239, 68, 68, 0.18);
+}
+.sort-btn {
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color var(--transition-fast), border-color var(--transition-fast);
+}
+.sort-btn:hover {
+  background: var(--color-hover);
+  border-color: var(--color-border);
+}
+.sort-indicator {
+  width: 8px;
+  height: 12px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+.sort-triangle {
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  transition: border-color var(--transition-fast), opacity var(--transition-fast);
+}
+.sort-triangle-up {
+  border-bottom: 5px solid var(--color-gray-600);
+}
+.sort-triangle-down {
+  border-top: 5px solid var(--color-gray-600);
+}
+.sort-indicator.asc .sort-triangle-up {
+  border-bottom-color: var(--color-primary);
+}
+.sort-indicator.asc .sort-triangle-down {
+  opacity: 0.25;
+}
+.sort-indicator.desc .sort-triangle-up {
+  opacity: 0.25;
+}
+.sort-indicator.desc .sort-triangle-down {
+  border-top-color: var(--color-primary);
+}
+.sort-indicator.unsorted .sort-triangle {
+  opacity: 0.78;
+}
 .header-sort-cell {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   max-width: 100%;
   min-width: 0;
 }
@@ -724,7 +987,6 @@ function startColResize(e: MouseEvent) {
   font-weight: 700;
   color: var(--color-gray-800);
   font-size: var(--font-md);
-  margin-right: 4px;
   padding: 0;
   border: 0;
   background: none;

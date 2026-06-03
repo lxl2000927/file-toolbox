@@ -1,6 +1,6 @@
 {
   "name": "file-toolbox-electron",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "File Toolbox - Electron + Python 桌面应用",
   "main": "dist/main/index.js",
   "scripts": {

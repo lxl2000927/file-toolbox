@@ -412,6 +412,10 @@ def _build_scan_options(raw: dict) -> "PdfScanSplitOptions":
         raw["reference_roi"] = tuple(int(x) for x in roi)
     else:
         raw["reference_roi"] = None
+    if "use_roi" not in raw and "qrcode_use_roi" in raw:
+        raw["use_roi"] = raw.get("qrcode_use_roi")
+    if "qrcode_use_roi" not in raw and "use_roi" in raw:
+        raw["qrcode_use_roi"] = raw.get("use_roi")
     allowed = {f for f in PdfScanSplitOptions.__dataclass_fields__.keys()}
     cleaned = {k: v for k, v in raw.items() if k in allowed}
     return PdfScanSplitOptions(**cleaned)
@@ -626,7 +630,7 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
             "task_type": "scan_probe",
             "elapsed_ms": elapsed_ms,
             "cancelled": cancelled,
-            "result": result,
+            "result": serialized,
             **({"error": "已取消"} if cancelled else {}),
         })
     except Exception as exc:

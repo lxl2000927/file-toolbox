@@ -87,6 +87,7 @@ export type ScanSplitOptions = {
   qrcode_text_contains?: string;
   qrcode_no_decode?: boolean;
   qrcode_skip_pages?: number;
+  use_roi?: boolean;
   qrcode_use_roi?: boolean;
   qrcode_max_attempts?: number;
   max_segment_pages?: number;

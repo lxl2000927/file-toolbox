@@ -38,9 +38,9 @@ const roiDialogOpen = ref(false);
 const roiDrawMode = ref(false);
 const previewZoom = ref(1.0);
 
-const opts = ref<Required<Omit<ScanSplitOptions, "reference_roi">> & { reference_roi: [number, number, number, number] | null }>({
+const opts = ref<Required<Omit<ScanSplitOptions, "reference_roi" | "use_roi">> & { reference_roi: [number, number, number, number] | null }>({
   detection_mode: "auto",
-  dpi: 180,
+  dpi: 220,
   qrcode_text_contains: "",
   qrcode_no_decode: false,
   qrcode_use_roi: false,
@@ -1004,6 +1004,12 @@ const roiStatusText = computed(() => {
   if (opts.value.reference_roi) return `已框选 x=${opts.value.reference_roi[0]}，y=${opts.value.reference_roi[1]}，w=${opts.value.reference_roi[2]}，h=${opts.value.reference_roi[3]}`;
   return "已启用 ROI，但未框选有效区域，执行前会要求先框选或取消 ROI";
 });
+const roiOptionTitle = computed(() => {
+  if (opts.value.detection_mode === "qrcode") return "只在框选区域内找二维码；适合二维码位置固定的文件";
+  if (opts.value.detection_mode === "stamp") return "只在框选区域内找印章；适合盖章位置固定的文件";
+  if (opts.value.detection_mode === "feature") return "只使用框选区域的参考特征进行匹配；适合固定版式的局部标记";
+  return "优先在框选区域内识别二维码、印章和参考特征；适合标记位置固定的文件";
+});
 const dpiHintText = computed(() => {
   if (opts.value.detection_mode === "qrcode") return "二维码清晰用 180-200；模糊可调高";
   if (opts.value.detection_mode === "stamp" || opts.value.detection_mode === "auto") return "印章建议 220；越高越慢";
@@ -1036,6 +1042,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
     ransac_reproj_threshold: opts.value.ransac_reproj_threshold,
     qrcode_no_decode: noDecode,
     qrcode_text_contains: noDecode || !isQrMode.value ? "" : opts.value.qrcode_text_contains,
+    use_roi: roiReady,
     qrcode_use_roi: roiReady,
     reference_roi: referenceRoi,
     qrcode_skip_pages: nonNegativeInt(opts.value.qrcode_skip_pages),
@@ -1180,8 +1187,8 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
             <div class="row mt-2 wrap">
               <template v-if="isQrMode">
                 <label class="checkbox" title="只判断有没有二维码，不读取二维码文字；速度更快，但内容筛选不会生效"><input type="checkbox" v-model="opts.qrcode_no_decode" />不解码内容</label>
-                <label class="checkbox" title="只在框选区域内找二维码；适合二维码位置固定的文件"><input type="checkbox" v-model="opts.qrcode_use_roi" :disabled="!isRoiSupported" />框选区域(ROI)</label>
               </template>
+              <label class="checkbox" :title="roiOptionTitle"><input type="checkbox" v-model="opts.qrcode_use_roi" :disabled="!isRoiSupported" />框选区域(ROI)</label>
               <label class="checkbox" title="找到标记页后，后面几页先不检查；适合连续多页都有标记的文件"><input type="checkbox" v-model="skipPagesEnabled" />命中后跳过</label>
               <input class="input input-num input-num-compact" type="number" min="1" max="50" :disabled="!skipPagesEnabled" :value="opts.qrcode_skip_pages" @input="onSkipPagesInput" title="命中标记页后跳过的页数" />
               <span class="text-muted">页</span>
@@ -1409,6 +1416,8 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   justify-content: flex-end;
   gap: 6px;
   flex-shrink: 0;
+  padding-top: 2px;
+  overflow: visible;
 }
 .zoom-label {
   min-width: 44px;
@@ -1448,6 +1457,9 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   gap: 8px;
   min-width: 0;
   flex-shrink: 0;
+  min-height: 34px;
+  padding-top: 2px;
+  overflow: visible;
 }
 .keypoint-info {
   font-size: var(--font-sm);

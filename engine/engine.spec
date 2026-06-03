@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+from pathlib import Path
 
 
-project_root = r'D:\file-toolbox'
+project_root = str(Path(SPECPATH).resolve().parent)
 hiddenimports = [
     'src.core.rename_engine',
     'src.core.pdf_split_engine',
@@ -15,13 +16,16 @@ hiddenimports = [
     'fitz',
     'numpy',
     'cv2',
+    'zxingcpp',
 ]
 hiddenimports += collect_submodules('cv2')
 hiddenimports += collect_submodules('fitz')
+hiddenimports += collect_submodules('zxingcpp')
 
 binaries = []
 binaries += collect_dynamic_libs('cv2')
 binaries += collect_dynamic_libs('fitz')
+binaries += collect_dynamic_libs('zxingcpp')
 
 a = Analysis(
     ['server.py'],
