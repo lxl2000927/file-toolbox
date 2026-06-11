@@ -107,6 +107,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   checkUpdate: () => ipcRenderer.invoke("app:checkUpdate"),
   openExternal: (url: string) => ipcRenderer.invoke("app:openExternal", url),
   openDataDir: () => ipcRenderer.invoke("app:openDataDir"),
+  restartEngine: () => ipcRenderer.invoke("engine:restart"),
+  saveFile: (options: { content: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) =>
+    ipcRenderer.invoke("dialog:saveFile", options),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getPathsForFiles: async (files: File[]) => {
     const paths = files.map((file) => webUtils.getPathForFile(file)).filter(Boolean);

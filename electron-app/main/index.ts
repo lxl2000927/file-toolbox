@@ -21,6 +21,7 @@ const MIN_WINDOW_HEIGHT = 720;
 const DEV_RENDERER_URL = "http://localhost:5173";
 const MAX_REFERENCE_IMAGE_FILE_SIZE = 15 * 1024 * 1024;  // 原始参考图片文件大小上限（≈15 MiB）
 const MAX_UPDATE_RESPONSE_SIZE = 1024 * 1024;
+const MAX_SAVE_FILE_CONTENT_SIZE = 20 * 1024 * 1024;
 const authorizedPaths = new Set<string>();
 const ENGINE_METHODS = new Set([
   "ping",
@@ -211,8 +212,8 @@ function createWindow() {
     if (!isAllowedAppUrl(url)) event.preventDefault();
   });
 
-  (mainWindow.webContents as any).on("will-frame-navigate", (event: Electron.Event, url: string) => {
-    if (!isAllowedAppUrl(url)) event.preventDefault();
+  mainWindow.webContents.on("will-frame-navigate", (event) => {
+    if (!isAllowedAppUrl(event.url)) event.preventDefault();
   });
 
   mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription) => {
@@ -352,11 +353,18 @@ function setupIPC() {
 
 }
 
-function attachBridgeNotifications() {
-  if (!bridge) return;
-  bridge.addNotificationHandler((method, params) => {
+function attachBridgeNotifications(targetBridge: PythonBridge) {
+  targetBridge.addNotificationHandler((method, params) => {
+    if (targetBridge !== bridge) return;
     if (!mainWindow || mainWindow.isDestroyed()) return;
     mainWindow.webContents.send("engine:notification", { method, params });
+  });
+  targetBridge.addExitHandler((err) => {
+    if (targetBridge !== bridge) return;
+    if (engineStatus !== "ready") return;
+    engineStatus = "error";
+    engineError = err.message;
+    mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus, error: engineError } });
   });
 }
 
@@ -364,14 +372,20 @@ async function startEngine() {
   engineStatus = "starting";
   engineError = "";
   mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus } });
-  bridge = new PythonBridge();
+  bridge?.shutdown();
+  const nextBridge = new PythonBridge();
+  bridge = nextBridge;
   const enginePath = isDev
     ? join(PROJECT_ROOT, "engine", "server.py")
     : join(process.resourcesPath, "engine", "engine.exe");
   const pythonExe = findPython();
-  await bridge.start(enginePath, isDev, pythonExe);
+  await nextBridge.start(enginePath, isDev, pythonExe);
+  if (bridge !== nextBridge) {
+    nextBridge.shutdown();
+    return;
+  }
   engineStatus = "ready";
-  attachBridgeNotifications();
+  attachBridgeNotifications(nextBridge);
   mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus } });
 }
 
@@ -483,6 +497,39 @@ ipcMain.handle("app:openDataDir", async (event) => {
   const failure = await shell.openPath(dataDir);
   if (failure) throw new Error(failure);
   return dataDir;
+});
+
+ipcMain.handle("dialog:saveFile", async (event, options: {
+  content: string;
+  defaultName?: string;
+  filters?: { name: string; extensions: string[] }[];
+}) => {
+  if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
+  if (!mainWindow) throw new Error("Window not available");
+  const content = String(options?.content ?? "");
+  if (Buffer.byteLength(content, "utf-8") > MAX_SAVE_FILE_CONTENT_SIZE) {
+    throw new Error("导出内容过大，请缩小筛选范围后重试");
+  }
+  const result = await dialog.showSaveDialog(mainWindow, {
+    defaultPath: options.defaultName || "export.txt",
+    filters: options.filters || [{ name: "所有文件", extensions: ["*"] }],
+  });
+  if (result.canceled || !result.filePath) return { saved: false };
+  await fsp.writeFile(result.filePath, content, "utf-8");
+  return { saved: true, path: result.filePath };
+});
+
+ipcMain.handle("engine:restart", async (event) => {
+  if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
+  // Stop current engine process then restart
+  try { bridge?.shutdown(); } catch { /* ignore */ }
+  engineStatus = "starting";
+  engineError = "";
+  mainWindow?.webContents.send("engine:notification", {
+    method: "engine.status",
+    params: { status: "starting", error: "" },
+  });
+  await startEngine();
 });
 
 app.whenReady().then(async () => {

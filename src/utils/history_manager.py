@@ -1,5 +1,6 @@
 import json
 import os
+import atexit
 import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -71,14 +72,31 @@ class HistoryManager:
             max_history_size = 100
 
         self.max_history_size = max_history_size
-        self.storage_path = storage_path
+        self._storage_path = storage_path
         self.history: List[OperationRecord] = []
         self._lock = threading.Lock()
         self.session_id = str(uuid.uuid4())[:8]
         self.last_error: Optional[str] = None
 
+        # 异步写入：后台线程每 5 秒批量刷盘，避免同步 I/O 阻塞调用方
+        self._dirty = threading.Event()
+        self._writer_stop = threading.Event()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+        atexit.register(self._flush_exit)
+
         if storage_path and os.path.exists(storage_path):
             self._load_from_file()
+
+    @property
+    def storage_path(self) -> Optional[str]:
+        with self._lock:
+            return self._storage_path
+
+    @storage_path.setter
+    def storage_path(self, value: Optional[str]) -> None:
+        with self._lock:
+            self._storage_path = value
 
     @staticmethod
     def infer_source(operation_type) -> str:
@@ -126,6 +144,17 @@ class HistoryManager:
         record_id = str(uuid.uuid4())[:8]
         timestamp = datetime.now().isoformat()
         details = details if isinstance(details, dict) else {}
+        # Cap single record details at 64 KB to prevent unbounded history growth
+        _MAX_DETAILS_BYTES = 64 * 1024
+        try:
+            import json as _json_mod
+            if len(_json_mod.dumps(details, ensure_ascii=False)) > _MAX_DETAILS_BYTES:
+                for _k in ("operations", "errors"):
+                    if _k in details and isinstance(details[_k], list):
+                        details = {**details, _k: details[_k][:10],
+                                   _k + "_truncated": True}
+        except Exception:
+            pass
         normalized_source = source or self.infer_source(operation_type)
         normalized_level = level or self.infer_level(success, error_message, details, description)
         normalized_message = message or description
@@ -148,10 +177,7 @@ class HistoryManager:
             self.history.insert(0, record)
             if len(self.history) > self.max_history_size:
                 self.history = self.history[:self.max_history_size]
-            try:
-                self._save_to_file_unlocked(list(self.history))
-            except Exception as e:
-                self.last_error = str(e)
+            self._dirty.set()
 
         return record_id
 
@@ -178,33 +204,32 @@ class HistoryManager:
     def clear_history(self):
         with self._lock:
             self.history.clear()
-            try:
-                self._save_to_file_unlocked(list(self.history))
-            except Exception as e:
-                self.last_error = str(e)
+            self._dirty.set()
 
     def _save_to_file(self, snapshot: Optional[list[OperationRecord]] = None) -> bool:
-        if not self.storage_path:
+        storage_path = self.storage_path
+        if not storage_path:
             return False
 
         try:
             self.last_error = None
-            parent = os.path.dirname(self.storage_path)
+            parent = os.path.dirname(storage_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
             if snapshot is None:
                 with self._lock:
                     snapshot = list(self.history)
-            return self._save_to_file_unlocked(snapshot or [])
+            return self._save_to_file_unlocked(snapshot or [], storage_path)
         except Exception as e:
             self.last_error = str(e)
             return False
 
-    def _save_to_file_unlocked(self, snapshot: list[OperationRecord]) -> bool:
-        if not self.storage_path:
+    def _save_to_file_unlocked(self, snapshot: list[OperationRecord], storage_path: Optional[str] = None) -> bool:
+        storage_path = storage_path or self.storage_path
+        if not storage_path:
             return False
         data = [record.to_dict() for record in snapshot]
-        parent = os.path.dirname(self.storage_path) or "."
+        parent = os.path.dirname(storage_path) or "."
         try:
             # 使用唯一临时文件名避免并发覆盖
             fd, tmp_path = tempfile.mkstemp(dir=parent, suffix=".tmp", prefix="hist_")
@@ -213,7 +238,7 @@ class HistoryManager:
                     json.dump(data, f, ensure_ascii=False, indent=2)
                     f.flush()
                     os.fsync(f.fileno())
-                os.replace(tmp_path, self.storage_path)
+                os.replace(tmp_path, storage_path)
                 return True
             except Exception:
                 try:
@@ -226,15 +251,16 @@ class HistoryManager:
             return False
 
     def _load_from_file(self):
-        if not self.storage_path or not os.path.exists(self.storage_path):
+        storage_path = self.storage_path
+        if not storage_path or not os.path.exists(storage_path):
             return
 
         try:
-            file_size = os.path.getsize(self.storage_path)
+            file_size = os.path.getsize(storage_path)
             if file_size > 10 * 1024 * 1024:
                 self.last_error = f"历史记录文件过大 ({file_size} bytes)，跳过加载"
                 return
-            with open(self.storage_path, 'r', encoding='utf-8') as f:
+            with open(storage_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             records: list[OperationRecord] = []
             skipped = 0
@@ -255,15 +281,48 @@ class HistoryManager:
         except json.JSONDecodeError:
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                bad_path = f"{self.storage_path}.corrupt.{ts}"
-                os.replace(self.storage_path, bad_path)
+                bad_path = f"{storage_path}.corrupt.{ts}"
+                os.replace(storage_path, bad_path)
                 self.last_error = f"历史记录文件损坏，已备份至 {bad_path}"
             except Exception:
-                self.last_error = f"历史记录文件损坏，且无法备份: {self.storage_path}"
+                self.last_error = f"历史记录文件损坏，且无法备份: {storage_path}"
             return
         except Exception as e:
             self.last_error = f"加载历史记录失败: {e}"
             return
+
+    def _writer_loop(self) -> None:
+        while not self._writer_stop.is_set():
+            try:
+                if self._dirty.wait(5):
+                    self._dirty.clear()
+                    self._flush_to_disk()
+            except Exception as e:
+                self.last_error = f"历史记录后台写入线程异常: {e}"
+                try:
+                    self._dirty.set()
+                except Exception:
+                    pass
+
+    def _flush_to_disk(self) -> None:
+        storage_path = self.storage_path
+        if not storage_path:
+            return
+        with self._lock:
+            snapshot = list(self.history)
+        try:
+            self._save_to_file_unlocked(snapshot, storage_path)
+        except Exception as e:
+            self.last_error = str(e)
+
+    def _flush_exit(self) -> None:
+        writer_stop = getattr(self, "_writer_stop", None)
+        writer_thread = getattr(self, "_writer_thread", None)
+        if writer_stop is not None:
+            writer_stop.set()
+        if writer_thread is not None and writer_thread.is_alive():
+            writer_thread.join(timeout=5)  # 等 _writer_loop 自然退出，避免双写
+        self._flush_to_disk()             # 补刷一次，确保退出前数据落盘
 
     def get_statistics(self) -> Dict[str, Any]:
         with self._lock:

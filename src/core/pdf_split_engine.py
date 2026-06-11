@@ -314,12 +314,14 @@ class PdfSplitEngine:
                             "output_dir": output_dir,
                             "outputs": [],
                         }
+                    size_warning = ""
                     if file_size_mb <= max_size_mb:
                         outputs.append(PlannedOutput(f"{prefix}{base}", (1, total_pages)))
                     else:
                         avg_page_size_mb = file_size_mb / total_pages
                         pages_per_part = max(1, int(max_size_mb / avg_page_size_mb)) if avg_page_size_mb > 0 else 1
                         num_chunks = (total_pages + pages_per_part - 1) // pages_per_part
+                        size_warning = "按大小拆分基于平均页大小估算，图像密集页面可能导致输出大小存在偏差"
                         for i in range(num_chunks):
                             start = i * pages_per_part + 1
                             end = min((i + 1) * pages_per_part, total_pages)
@@ -352,9 +354,12 @@ class PdfSplitEngine:
                         "outputs": [],
                     }
 
+                message = "OK"
+                if config.mode == SplitMode.BY_FILE_SIZE and size_warning:
+                    message = size_warning
                 return {
                     "valid": True,
-                    "message": "OK",
+                    "message": message,
                     "page_count": total_pages,
                     "output_dir": output_dir,
                     "outputs": outputs,
@@ -561,7 +566,11 @@ class PdfSplitEngine:
                 results["errors"].append(f"处理文件失败 {os.path.basename(pdf_path)}: {str(e)}")
             
             self.operation_records.append(record)
-            results["operations"].append(record.to_dict(full=True))
+            _op = record.to_dict(full=True)
+            if len(_op.get("output_files", [])) > 100:
+                _op["output_files"] = _op["output_files"][:100]
+                _op["output_files_truncated"] = True
+            results["operations"].append(_op)
         
         self._record_to_history(results)
         

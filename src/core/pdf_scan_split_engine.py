@@ -485,11 +485,18 @@ class PdfScanSplitEngine:
 
     @staticmethod
     def _prepare_page_images_from_roi_clip(page_bgr_roi, *, use_qr: bool, use_stamp: bool, use_feature: bool):
-        page_bgr_qr = page_bgr_roi if use_qr else page_bgr_roi
-        page_bgr_stamp = page_bgr_roi if use_stamp else page_bgr_roi
-        page_bgr_feature = page_bgr_roi if use_feature else page_bgr_roi
-        return page_bgr_qr, page_bgr_stamp, page_bgr_feature
-
+        """Return per-detector input images from the ROI crop.
+        Callers must ensure page_bgr_roi is not None before calling.
+        """
+        if page_bgr_roi is None:
+            raise ValueError(
+                "_prepare_page_images_from_roi_clip: page_bgr_roi must not be None"
+            )
+        return (
+            page_bgr_roi if use_qr else None,
+            page_bgr_roi if use_stamp else None,
+            page_bgr_roi if use_feature else None,
+        )
     @staticmethod
     def _new_probe_result(page_index: int, total: int, mode: str, options: PdfScanSplitOptions) -> dict:
         return {

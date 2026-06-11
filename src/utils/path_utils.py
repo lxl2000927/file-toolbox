@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
+
+
+_RE_INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
+_RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
 
 
 def _safe_output_name(filename: str, default: str, *, require_pdf: bool) -> str:
@@ -11,16 +16,24 @@ def _safe_output_name(filename: str, default: str, *, require_pdf: bool) -> str:
         raise ValueError("输出文件名不能是绝对路径")
     if "/" in name or "\\" in name:
         raise ValueError("输出文件名不能包含路径分隔符")
-    if name in (".", ".."):
-        raise ValueError("输出文件名不能是相对目录")
+    traversal_markers = {".", ".."}
+    if name in traversal_markers or any(part in traversal_markers for part in re.split(r"[\\/]+", name)):
+        raise ValueError("输出文件名不能包含相对目录")
+    name = _RE_INVALID_FILENAME_CHARS.sub("_", name).strip(" .") or default
     if require_pdf and not name.lower().endswith(".pdf"):
         name = f"{name}.pdf"
+    stem, ext = os.path.splitext(name)
+    if stem.upper() in _RESERVED_NAMES:
+        stem = f"_{stem}"
+    name = f"{stem}{ext}".strip(" .") or default
     return name
 
 
 def _ensure_inside_output_dir(output_dir: str, candidate: str) -> None:
     root = os.path.abspath(output_dir or ".")
     target = os.path.abspath(candidate)
+    if os.path.basename(root) in (".", ".."):
+        raise ValueError("输出目录不能是相对目录")
     try:
         common = os.path.commonpath([root, target])
     except ValueError:

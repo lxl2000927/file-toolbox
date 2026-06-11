@@ -143,12 +143,12 @@ export interface EngineAPI {
       pdfPaths: string[],
       config: PdfSplitConfig,
       taskId?: string,
-    ) => Promise<{ task_id: string }>;
+    ) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
   };
   scanSplit: {
     previewReference: (referenceImagePath: string, opts?: { nfeatures?: number; roi?: [number, number, number, number] | null }) => Promise<{ ok: boolean; data_url?: string; width?: number; height?: number; error?: string; keypoints_total?: number; keypoints_in_roi?: number }>;
-    probePage: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageIndex: number; taskId?: string }) => Promise<{ task_id: string }>;
-    scanOnly: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageLimit: number; taskId?: string }) => Promise<{ task_id: string }>;
+    probePage: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageIndex: number; taskId?: string }) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
+    scanOnly: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageLimit: number; taskId?: string }) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
     executeAsync: (params: {
       pdfPath: string;
       referenceImagePath: string;
@@ -156,7 +156,7 @@ export interface EngineAPI {
       prefix?: string;
       options: ScanSplitOptions;
       taskId?: string;
-    }) => Promise<{ task_id: string }>;
+    }) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
   };
   cancelTask: (taskId: string) => Promise<{ cancelled: boolean; task_id: string }>;
   history: {
@@ -194,6 +194,8 @@ export interface ElectronAPI {
   checkUpdate: () => Promise<UpdateCheckResult>;
   openExternal: (url: string) => Promise<void>;
   openDataDir: () => Promise<string>;
+  restartEngine: () => Promise<void>;
+  saveFile: (options: { content: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ saved: boolean; path?: string }>;
   getPathForFile: (file: File) => string;
   getPathsForFiles: (files: File[]) => Promise<string[]>;
 }

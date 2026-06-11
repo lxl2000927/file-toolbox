@@ -473,15 +473,21 @@ class RenameEngine:
                             results["successful"] += 1
                         else:
                             temp_filepath = f"{new_filepath}.rename_tmp_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-                            os.rename(filepath, temp_filepath)
-                            os.rename(temp_filepath, new_filepath)
+                            try:
+                                os.rename(filepath, temp_filepath)
+                                os.rename(temp_filepath, new_filepath)
+                            except Exception:
+                                if os.path.exists(temp_filepath) and not os.path.exists(filepath):
+                                    try:
+                                        os.rename(temp_filepath, filepath)
+                                    except Exception:
+                                        pass
+                                raise
                             record.success = True
                             results["successful"] += 1
                     else:
                         if os.path.exists(new_filepath):
                             raise FileExistsError(f"目标文件已存在，为避免覆盖丢失已停止: {new_filepath}")
-                        if os.path.exists(new_filepath):
-                            raise FileExistsError(f"目标文件已存在: {new_filepath}")
                         os.rename(filepath, new_filepath)
                         record.success = True
                         results["successful"] += 1

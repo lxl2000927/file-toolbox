@@ -86,6 +86,9 @@ const logLevelFilter = ref<LogLevelFilter>("all");
 const logSourceFilter = ref<LogSourceFilter>("all");
 const logSearch = ref("");
 let logAutoRefreshTimer: number | null = null;
+const LOG_PAGE_SIZE = 50;
+const logVisibleCount = ref(LOG_PAGE_SIZE);
+let logIo: IntersectionObserver | null = null;
 
 const logLevelOptions: { label: string; value: LogLevelFilter; tone?: Exclude<LogLevelFilter, "all"> }[] = [
   { label: "级别：全部", value: "all" },
@@ -198,10 +201,14 @@ function formatPerformanceStats(stats: any) {
   return `\n  耗时统计\n${lines.map((line) => `    ${line}`).join("\n")}`;
 }
 
-function normalizeLogLevel(value: unknown, fallbackText: string, record?: any): Exclude<LogLevelFilter, "all"> {
+// 日志级别统一由后端 HistoryManager.infer_level() 推断，前端仅在缺失时做兜底映射
+function normalizeLogLevel(value: unknown, _fallbackText: string, record?: any): Exclude<LogLevelFilter, "all"> {
   const level = String(value || "").toLowerCase();
   if (["error", "warning", "success", "info", "debug"].includes(level)) return level as Exclude<LogLevelFilter, "all">;
-  return classifyLogLevel(fallbackText, record || {});
+  // 兜底：后端未提供 level 时按 success 字段推断
+  if (record?.success === false) return "error";
+  if (record?.success === true) return "success";
+  return "info";
 }
 
 function normalizeLogSource(operationType: string): LogSourceFilter {
@@ -210,16 +217,6 @@ function normalizeLogSource(operationType: string): LogSourceFilter {
   if (type.includes("pdf_split")) return "pdf_split";
   if (type.includes("scan_split")) return "scan_split";
   return "system";
-}
-
-function classifyLogLevel(line: string, record: any): Exclude<LogLevelFilter, "all"> {
-  if (record?.success === false) return "error";
-  if (record?.success === true) return "success";
-  if (/失败|错误|异常|超时|不可用|不存在|未生成/.test(line)) return "error";
-  if (/未匹配|未命中|漏检|忽略|降级|重试|警告|未框选/.test(line)) return "warning";
-  if (/候选|面积|圆度|内点|比例|样本|匹配\s*\d+|解码/.test(line)) return "debug";
-  if (/完成|命中|生成|成功|识别到/.test(line)) return "success";
-  return "info";
 }
 
 const logItems = computed(() => logRaw.value.map((record) => {
@@ -245,12 +242,35 @@ const filteredLogItems = computed(() => {
 const filteredLogLines = computed(() => filteredLogItems.value.map((item) => item.text));
 const filteredLogRaw = computed(() => filteredLogItems.value.map((item) => item.record));
 
+// 虚拟滚动：仅渲染可见范围内的日志条目
+const visibleLogItems = computed(() => filteredLogItems.value.slice(0, logVisibleCount.value));
+const hasMoreLogs = computed(() => logVisibleCount.value < filteredLogItems.value.length);
+
+function setupLogSentinel(el: unknown) {
+  logIo?.disconnect();
+  if (!(el instanceof Element)) return;
+  logIo = new IntersectionObserver((entries) => {
+    if (entries[0]?.isIntersecting) {
+      logVisibleCount.value = Math.min(logVisibleCount.value + LOG_PAGE_SIZE, filteredLogItems.value.length);
+    }
+  }, { root: (el as HTMLElement).parentElement, rootMargin: "120px" });
+  logIo.observe(el);
+}
+
+function resetLogVisibleCount() {
+  logVisibleCount.value = LOG_PAGE_SIZE;
+}
+
+watch(logSearch, () => resetLogVisibleCount());
+watch(logLevelFilter, () => resetLogVisibleCount());
+watch(logSourceFilter, () => resetLogVisibleCount());
+
 onMounted(() => {
   refreshLogs();
   startLogAutoRefresh();
 });
 
-onBeforeUnmount(() => stopLogAutoRefresh());
+onBeforeUnmount(() => { stopLogAutoRefresh(); logIo?.disconnect(); });
 
 watch(activeSettingsTab, (tab) => {
   if (tab === "logs") {
@@ -306,25 +326,21 @@ async function clearLogs() {
 async function exportLogsTxt() {
   if (!filteredLogLines.value.length) return;
   const text = filteredLogLines.value.join("\n");
-  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`;
-  a.click();
-  URL.revokeObjectURL(url);
+  await window.electronAPI?.saveFile({
+    content: text,
+    defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`,
+    filters: [{ name: "文本文件", extensions: ["txt"] }],
+  });
 }
 
 async function exportLogsJson() {
   if (!filteredLogRaw.value.length) return;
   const text = JSON.stringify(filteredLogRaw.value, null, 2);
-  const blob = new Blob([text], { type: "application/json;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`;
-  a.click();
-  URL.revokeObjectURL(url);
+  await window.electronAPI?.saveFile({
+    content: text,
+    defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`,
+    filters: [{ name: "JSON 文件", extensions: ["json"] }],
+  });
 }
 
 const MAX_RETRY = 3;
@@ -449,11 +465,18 @@ async function openDataDir() {
           </div>
           <div v-else class="log-record-list selectable">
             <pre
-              v-for="(item, index) in filteredLogItems"
+              v-for="(item, index) in visibleLogItems"
               :key="`${item.record?.timestamp || index}-${index}`"
               class="log-text log-record"
               :class="`log-record-${item.level}`"
             >{{ item.text }}</pre>
+            <div
+              v-if="hasMoreLogs"
+              :ref="setupLogSentinel"
+              class="log-sentinel"
+            >
+              加载更多…
+            </div>
           </div>
         </div>
       </div>
@@ -464,7 +487,7 @@ async function openDataDir() {
           <div>
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.1.0</span>
+              <span class="version-pill">v2.2.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
             </div>
           </div>
@@ -501,7 +524,7 @@ async function openDataDir() {
         <div v-else-if="updateResult?.ok" class="release-panel current-version">
           <div class="release-topline">
             <span class="release-badge current">当前已是最新版本</span>
-            <span class="release-versions">v{{ updateResult.current || '2.1.0' }}</span>
+            <span class="release-versions">v{{ updateResult.current || '2.2.0' }}</span>
           </div>
           <p>无需更新。后续版本仍可在这里查看 Release 信息和下载入口。</p>
         </div>
@@ -518,7 +541,7 @@ async function openDataDir() {
           <div class="about-hero-info">
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.1.0</span>
+              <span class="version-pill">v2.2.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
               <span class="version-pill version-pill-sub">Python Engine</span>
             </div>
@@ -991,6 +1014,12 @@ async function openDataDir() {
   flex-direction: column;
   gap: 8px;
 }
+.log-sentinel {
+  text-align: center;
+  padding: 8px;
+  font-size: var(--font-sm);
+  color: var(--color-gray-400);
+}
 .log-text {
   margin: 0;
   font-family: ui-monospace, SFMono-Regular, "JetBrains Mono", Consolas, monospace;
@@ -1006,6 +1035,8 @@ async function openDataDir() {
   border-left-width: 4px;
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.48);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 80px;
 }
 .log-record-success {
   border-left-color: var(--color-success);

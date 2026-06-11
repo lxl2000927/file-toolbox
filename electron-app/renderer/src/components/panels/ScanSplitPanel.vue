@@ -126,7 +126,7 @@ const roiDialogStyle = computed(() => {
   };
 });
 
-const { state: taskState, logs, start: startTask, cancel: cancelTask, reset: resetTask } = useEngineTask({
+const { state: taskState, logs, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
   onComplete: (payload) => {
     submitting.value = false;
     if (payload.ok) {
@@ -802,7 +802,7 @@ async function execute() {
   await nextTick();
   startTask(taskId);
   try {
-    await window.engine.scanSplit.executeAsync({
+    const res = await window.engine.scanSplit.executeAsync({
       pdfPath: pdfPath.value,
       referenceImagePath: referenceImage.value,
       outputDir: outputDir.value,
@@ -810,6 +810,7 @@ async function execute() {
       options: buildScanOptions(),
       taskId,
     });
+    if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
     error.value = e?.message || "提交失败";
     submitting.value = false;
@@ -836,13 +837,14 @@ async function runProbePage() {
   await nextTick();
   startTask(taskId);
   try {
-    await window.engine.scanSplit.probePage({
+    const res = await window.engine.scanSplit.probePage({
       pdfPath: pdfPath.value,
       referenceImagePath: referenceImage.value,
       options: buildScanOptions({ max_segment_pages: 0 }),
       pageIndex: Math.max(0, probePageIndex.value - 1),
       taskId,
     });
+    if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
     error.value = e?.message || "提交失败";
     submitting.value = false;
@@ -869,13 +871,14 @@ async function runScanOnly() {
   await nextTick();
   startTask(taskId);
   try {
-    await window.engine.scanSplit.scanOnly({
+    const res = await window.engine.scanSplit.scanOnly({
       pdfPath: pdfPath.value,
       referenceImagePath: referenceImage.value,
       options: buildScanOptions(),
       pageLimit: quickScanPageLimit.value,
       taskId,
     });
+    if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
     error.value = e?.message || "提交失败";
     submitting.value = false;

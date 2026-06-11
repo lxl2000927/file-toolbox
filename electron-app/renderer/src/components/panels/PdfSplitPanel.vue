@@ -54,7 +54,7 @@ const sizeUnitOptions = [
 
 const fileBasename = (p: string) => p.split(/[\\/]/).pop() || p;
 
-const { state: taskState, start: startTask, cancel: cancelTask, reset: resetTask } = useEngineTask({
+const { state: taskState, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
   onComplete: (payload) => {
     if (payload.ok) {
       summary.value = payload.result as ExecuteSummary;
@@ -311,7 +311,8 @@ async function executeSplit() {
   }
   try {
     startTask(taskId);
-    await window.engine.pdfSplit.executeAsync(paths, normalizedConfig(), taskId);
+    const res = await window.engine.pdfSplit.executeAsync(paths, normalizedConfig(), taskId);
+    if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
     error.value = e?.message || "提交任务失败";
     resetTask();

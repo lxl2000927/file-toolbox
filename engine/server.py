@@ -14,6 +14,7 @@ import math
 import threading
 import traceback
 import time
+from collections import deque
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Callable, Dict
 
@@ -110,7 +111,11 @@ _CANCEL_FLAGS: Dict[str, threading.Event] = {}
 _CANCEL_LOCK = threading.Lock()
 _UNDO_RECORDS: Dict[str, list[dict]] = {}
 _UNDO_LOCK = threading.Lock()
+_MAX_UNDO_RECORDS = 50  # cap to prevent unbounded memory growth
 _MAX_ACTIVE_TASKS = 3
+_MAX_QUEUED_TASKS = 50
+_TASK_SEMAPHORE = threading.Semaphore(_MAX_ACTIVE_TASKS)
+_TASK_QUEUE: deque[tuple[str, Any, dict, threading.Event]] = deque()
 
 
 def _new_task_id(prefix: str) -> str:
@@ -124,28 +129,109 @@ def _task_id_from_params(params: dict, prefix: str) -> str:
     return _new_task_id(prefix)
 
 
-def _reserve_task(task_id: str) -> threading.Event:
+def _reserve_task(task_id: str, method: str, params: dict, runner: Any) -> tuple[threading.Event, bool, int]:
+    with _CANCEL_LOCK:
+        if task_id in _CANCEL_FLAGS:
+            raise RuntimeError(f"任务ID已存在: {task_id}")
+
+    acquired = _TASK_SEMAPHORE.acquire(blocking=False)
+    if acquired:
+        flag = threading.Event()
+        with _CANCEL_LOCK:
+            if task_id in _CANCEL_FLAGS:
+                _TASK_SEMAPHORE.release()
+                raise RuntimeError(f"任务ID已存在: {task_id}")
+            _CANCEL_FLAGS[task_id] = flag
+        return (flag, False, 0)
+
     flag = threading.Event()
     with _CANCEL_LOCK:
         if task_id in _CANCEL_FLAGS:
             raise RuntimeError(f"任务ID已存在: {task_id}")
-        if len(_CANCEL_FLAGS) >= _MAX_ACTIVE_TASKS:
-            raise RuntimeError(f"同时运行任务过多，请等待当前任务完成后重试（最多 {_MAX_ACTIVE_TASKS} 个）")
+        if len(_TASK_QUEUE) >= _MAX_QUEUED_TASKS:
+            raise RuntimeError(f"等待队列已满（最多{_MAX_QUEUED_TASKS}个），请稍后再试")
         _CANCEL_FLAGS[task_id] = flag
-    return flag
+        _TASK_QUEUE.append((task_id, runner, params, flag))
+        position = len(_TASK_QUEUE)
+    return (flag, True, position)
 
 
-def _release_task(task_id: str) -> None:
+def _release_task(task_id: str, *, reserved: bool = True) -> None:
     with _CANCEL_LOCK:
         _CANCEL_FLAGS.pop(task_id, None)
+    if reserved:
+        _TASK_SEMAPHORE.release()
+    _try_start_queued()
+
+
+def _try_start_queued() -> None:
+    while True:
+        with _CANCEL_LOCK:
+            if not _TASK_QUEUE:
+                return
+            task_id, runner, params, flag = _TASK_QUEUE.popleft()
+
+        acquired = _TASK_SEMAPHORE.acquire(blocking=False)
+        if not acquired:
+            with _CANCEL_LOCK:
+                _TASK_QUEUE.appendleft((task_id, runner, params, flag))
+            return
+
+        with _CANCEL_LOCK:
+            if flag.is_set() or task_id not in _CANCEL_FLAGS:
+                _TASK_SEMAPHORE.release()
+                # flag.is_set(): _cancel_task already sent task.complete, skip.
+                # task_id not in _CANCEL_FLAGS: race window -- _cancel_task cleaned
+                # the flag after popleft but before we re-acquired _CANCEL_LOCK, so
+                # the frontend never received a task.complete; send it now to prevent
+                # the frontend from hanging indefinitely.
+                if not flag.is_set() and task_id not in _CANCEL_FLAGS:
+                    send_notification("task.complete", {
+                        "task_id": task_id, "ok": False,
+                        "cancelled": True, "error": "Task cancelled",
+                    })
+                continue
+
+        try:
+            thread = threading.Thread(target=runner, args=(task_id, params, flag), daemon=True)
+            thread.start()
+            send_notification("task.queued", {"task_id": task_id, "queued": False, "position": 0})
+            return
+        except Exception as exc:
+            with _CANCEL_LOCK:
+                _CANCEL_FLAGS.pop(task_id, None)
+            _TASK_SEMAPHORE.release()
+            send_notification("task.complete", {
+                "task_id": task_id,
+                "ok": False,
+                "cancelled": False,
+                "error": f"无法启动后台线程: {exc}",
+            })
+            continue
 
 
 def _cancel_task(task_id: str) -> bool:
+    removed_queued = False
     with _CANCEL_LOCK:
         flag = _CANCEL_FLAGS.get(task_id)
+        if flag is not None:
+            for index, (queued_id, _runner, _params, _flag) in enumerate(_TASK_QUEUE):
+                if queued_id == task_id:
+                    del _TASK_QUEUE[index]
+                    _CANCEL_FLAGS.pop(task_id, None)
+                    removed_queued = True
+                    break
     if flag is None:
         return False
     flag.set()
+    if removed_queued:
+        send_notification("task.complete", {
+            "task_id": task_id,
+            "ok": False,
+            "cancelled": True,
+            "error": "已取消",
+        })
+        _try_start_queued()
     return True
 
 
@@ -218,6 +304,9 @@ def handle_rename_execute(params: dict) -> dict:
         undo_token = os.urandom(16).hex()
         with _UNDO_LOCK:
             _UNDO_RECORDS[undo_token] = operations
+            # evict oldest entries when cap is exceeded
+            while len(_UNDO_RECORDS) > _MAX_UNDO_RECORDS:
+                _UNDO_RECORDS.pop(next(iter(_UNDO_RECORDS)), None)
         result["undo_token"] = undo_token
     return result
 
@@ -390,7 +479,9 @@ def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Even
 
 def handle_pdf_split_execute_async(params: dict) -> dict:
     task_id = _task_id_from_params(params, "pdf_split")
-    cancel_flag = _reserve_task(task_id)
+    cancel_flag, queued, position = _reserve_task(task_id, "pdf_split.execute_async", params, _run_pdf_split_async)
+    if queued:
+        return {"task_id": task_id, "queued": True, "position": position}
     try:
         thread = threading.Thread(target=_run_pdf_split_async, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
@@ -475,8 +566,7 @@ def _format_probe_log_lines(result: dict, options=None) -> list[str]:
 
 def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
-    log_tail: list[str] = []
-    max_history_log_lines = 200
+    log_tail: deque[str] = deque(maxlen=200)
     try:
         _ensure_pdf_scan_engine()
         if PdfScanSplitEngine is None:
@@ -493,7 +583,6 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
         def log(msg: str) -> None:
             message = str(msg)
             log_tail.append(message)
-            del log_tail[:-max_history_log_lines]
             send_notification("task.log", {"task_id": task_id, "message": message})
 
         def cancel_check() -> bool:
@@ -578,7 +667,9 @@ def _record_scan_history(params: dict, result: dict, success: bool, error: str |
 
 def handle_scan_split_execute_async(params: dict) -> dict:
     task_id = _task_id_from_params(params, "scan_split")
-    cancel_flag = _reserve_task(task_id)
+    cancel_flag, queued, position = _reserve_task(task_id, "scan_split.execute_async", params, _run_scan_split_async)
+    if queued:
+        return {"task_id": task_id, "queued": True, "position": position}
     try:
         thread = threading.Thread(target=_run_scan_split_async, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
@@ -590,7 +681,7 @@ def handle_scan_split_execute_async(params: dict) -> dict:
 
 def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
-    log_tail: list[str] = []
+    log_tail: deque[str] = deque(maxlen=200)
     try:
         _ensure_pdf_scan_engine()
         if PdfScanSplitEngine is None:
@@ -602,7 +693,6 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
         def task_log(msg: str) -> None:
             message = str(msg)
             log_tail.append(message)
-            del log_tail[:-200]
             send_notification("task.log", {"task_id": task_id, "message": message})
 
         send_notification("task.progress", {"task_id": task_id, "phase": "testing", "current": 0, "total": 1})
@@ -651,7 +741,9 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
 
 def handle_scan_probe_page(params: dict) -> dict:
     task_id = _task_id_from_params(params, "probe")
-    cancel_flag = _reserve_task(task_id)
+    cancel_flag, queued, position = _reserve_task(task_id, "scan_split.probe_page", params, _run_probe_page)
+    if queued:
+        return {"task_id": task_id, "queued": True, "position": position}
     try:
         thread = threading.Thread(target=_run_probe_page, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
@@ -663,7 +755,7 @@ def handle_scan_probe_page(params: dict) -> dict:
 
 def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
-    log_tail: list[str] = []
+    log_tail: deque[str] = deque(maxlen=200)
     try:
         _ensure_pdf_scan_engine()
         if PdfScanSplitEngine is None:
@@ -683,7 +775,6 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
         def log(msg: str) -> None:
             message = str(msg)
             log_tail.append(message)
-            del log_tail[:-200]
             send_notification("task.log", {"task_id": task_id, "message": message})
 
         result = PdfScanSplitEngine.scan_only(
@@ -730,9 +821,15 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
 
 def handle_scan_only(params: dict) -> dict:
     task_id = _task_id_from_params(params, "scan_only")
-    cancel_flag = _reserve_task(task_id)
-    thread = threading.Thread(target=_run_scan_only, args=(task_id, params, cancel_flag), daemon=True)
-    thread.start()
+    cancel_flag, queued, position = _reserve_task(task_id, "scan_split.scan_only", params, _run_scan_only)
+    if queued:
+        return {"task_id": task_id, "queued": True, "position": position}
+    try:
+        thread = threading.Thread(target=_run_scan_only, args=(task_id, params, cancel_flag), daemon=True)
+        thread.start()
+    except Exception as exc:
+        _release_task(task_id)
+        raise RuntimeError(f"无法启动后台线程: {exc}") from exc
     return {"task_id": task_id}
 
 
@@ -748,7 +845,11 @@ def handle_scan_preview_reference(params: dict) -> dict:
     try:
         import cv2
         bgr = PdfScanSplitEngine._read_reference_bgr(path)
-        nfeatures = int(params.get("nfeatures", 1200) or 1200)
+        try:
+            nfeatures = int(params.get("nfeatures", 1200) or 1200)
+        except Exception:
+            nfeatures = 1200
+        nfeatures = max(100, min(10000, nfeatures))
         roi = params.get("roi")
 
         orb = cv2.ORB_create(nfeatures=nfeatures)
@@ -758,7 +859,15 @@ def handle_scan_preview_reference(params: dict) -> dict:
 
         keypoints_in_roi = 0
         if roi and len(roi) == 4:
-            rx, ry, rw, rh = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
+            height, width = bgr.shape[:2]
+            try:
+                rx, ry, rw, rh = int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])
+            except Exception:
+                rx, ry, rw, rh = 0, 0, 0, 0
+            rx = max(0, min(width, rx))
+            ry = max(0, min(height, ry))
+            rw = max(0, min(width - rx, rw))
+            rh = max(0, min(height - ry, rh))
             cv2.rectangle(vis, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
             keypoints_in_roi = sum(
                 1 for kp in kps
@@ -792,7 +901,11 @@ def handle_task_cancel(params: dict) -> dict:
 def handle_history_get(params: dict) -> dict:
     if _HISTORY_MANAGER is None:
         return {"records": [], "session_id": ""}
-    count = int(params.get("count", 50) or 50)
+    try:
+        count = int(params.get("count", 50) or 50)
+    except Exception:
+        count = 50
+    count = max(0, min(500, count))
     operation_type = params.get("operation_type")
     session_id = params.get("session_id")
     if session_id is None and params.get("current_session", True):

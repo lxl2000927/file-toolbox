@@ -27,6 +27,17 @@ const panelComponent = computed(() => panelMap[activePanel.value]);
 
 let unsubReady: (() => void) | null = null;
 
+async function retryEngine() {
+  engineStatus.value = "connecting";
+  try {
+    await window.electronAPI?.restartEngine();
+  } catch {
+    // ignore restart errors; probeEngine will surface the real status
+  }  // Wait for engine process to start before probing
+  await new Promise<void>((resolve) => setTimeout(resolve, 1500));
+  await probeEngine();
+}
+
 async function probeEngine() {
   if (!window.engine) {
     engineStatus.value = "error";
@@ -104,7 +115,7 @@ function onNavigate(key: string) {
         </KeepAlive>
       </Transition>
     </main>
-    <StatusBar :engine-status="engineStatus" @retry="probeEngine" />
+    <StatusBar :engine-status="engineStatus" @retry="retryEngine" />
     <AppDialogHost />
     <ToastHost />
   </div>

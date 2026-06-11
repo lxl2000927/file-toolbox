@@ -9,6 +9,7 @@ type JsonRpcResponse = {
 };
 
 type NotificationHandler = (method: string, params: any) => void;
+type ExitHandler = (err: Error) => void;
 
 export class PythonBridge {
   private process: ChildProcess | null = null;
@@ -22,6 +23,7 @@ export class PythonBridge {
   private readyRejecter: ((err: Error) => void) | null = null;
   private _starting = false;
   private _startTimer: ReturnType<typeof setTimeout> | null = null;
+  private exitHandlers = new Set<ExitHandler>();
 
   private rejectPending(err: Error): void {
     this.pending.forEach(({ reject }) => reject(err));
@@ -30,6 +32,16 @@ export class PythonBridge {
 
   private clearProcess(): void {
     this.process = null;
+  }
+
+  private notifyExit(err: Error): void {
+    this.exitHandlers.forEach((handler) => {
+      try {
+        handler(err);
+      } catch (handlerErr) {
+        console.error("[python-bridge] exit handler error", handlerErr);
+      }
+    });
   }
 
   async start(
@@ -71,6 +83,7 @@ export class PythonBridge {
         }
         this.clearProcess();
         this.rejectPending(err);
+        this.notifyExit(err);
       });
 
       this.process.on("exit", (code) => {
@@ -86,6 +99,7 @@ export class PythonBridge {
         }
         this.clearProcess();
         this.rejectPending(err);
+        this.notifyExit(err);
       });
 
       this._startTimer = setTimeout(() => {
@@ -146,6 +160,11 @@ export class PythonBridge {
   addNotificationHandler(handler: NotificationHandler): () => void {
     this.notificationHandlers.add(handler);
     return () => this.notificationHandlers.delete(handler);
+  }
+
+  addExitHandler(handler: ExitHandler): () => void {
+    this.exitHandlers.add(handler);
+    return () => this.exitHandlers.delete(handler);
   }
 
   shutdown(): void {
