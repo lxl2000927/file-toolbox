@@ -526,7 +526,9 @@ async function openDataDir() {
             <span class="release-badge current">当前已是最新版本</span>
             <span class="release-versions">v{{ updateResult.current || '2.2.0' }}</span>
           </div>
-          <p>无需更新。后续版本仍可在这里查看 Release 信息和下载入口。</p>
+          <p>无需更新。当前版本的更新日志如下。</p>
+          <div v-if="updateResult.body" class="release-body selectable" v-html="releaseBodyHtml" />
+          <p v-else class="settings-hint">该版本暂未提供更新说明。</p>
         </div>
 
         <div v-else-if="!updateMsg" class="update-empty-card">
