@@ -413,11 +413,13 @@ ipcMain.handle("app:checkUpdate", async (event) => {
           resolve({ ok: false, error: `GitHub 响应类型异常: ${contentType}` });
           return;
         }
-        let raw = "";
+        const chunks: Buffer[] = [];
+        let receivedBytes = 0;
         let tooLarge = false;
         res.on("data", (chunk: Buffer) => {
-          raw += chunk.toString();
-          if (raw.length > MAX_UPDATE_RESPONSE_SIZE && !tooLarge) {
+          chunks.push(chunk);
+          receivedBytes += chunk.length;
+          if (receivedBytes > MAX_UPDATE_RESPONSE_SIZE && !tooLarge) {
             tooLarge = true;
             req.destroy(new Error("响应过大"));
           }
@@ -428,6 +430,7 @@ ipcMain.handle("app:checkUpdate", async (event) => {
             return;
           }
           try {
+            const raw = Buffer.concat(chunks, receivedBytes).toString("utf8");
             const data = JSON.parse(raw);
             const release = Array.isArray(data) ? data[0] : data;
             const currentVersion = app.getVersion();
