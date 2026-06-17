@@ -8,6 +8,7 @@ from dataclasses import dataclass, asdict, fields
 from enum import Enum
 from collections import deque
 import threading
+import uuid  # Imp5: moved to top level
 
 
 class OperationType(Enum):
@@ -133,8 +134,6 @@ class HistoryManager:
                    level: Optional[str] = None,
                    source: Optional[str] = None,
                    message: Optional[str] = None) -> str:
-        import uuid
-
         if isinstance(operation_type, str):
             try:
                 operation_type = OperationType(operation_type)

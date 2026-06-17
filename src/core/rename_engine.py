@@ -110,7 +110,10 @@ class RenameRule:
             name = name[count:]
         elif delete_type == "删除后N个字符":
             count = self.config.get("count", 1)
-            name = name[:-count] if count < len(name) else ""
+            if count <= 0:
+                pass  # Bug fix: count=0 causes name[:-0]="" in Python
+            else:
+                name = name[:-count] if count < len(name) else ""
         elif delete_type == "delete_patterns":
             targets = self.config.get("targets", []) or []
             custom_chars = self.config.get("custom_chars", "") or ""
@@ -138,7 +141,7 @@ class RenameRule:
             if case_sensitive:
                 name = name.replace(find, replace)
             else:
-                name = re.sub(re.escape(find), replace, name, flags=re.IGNORECASE)
+                name = re.sub(re.escape(find), lambda m: replace, name, flags=re.IGNORECASE)
         
         return name + ext
     
@@ -212,6 +215,8 @@ class RenameRule:
         if m:
             date = m.group(2)
             date = date.replace("年", "-").replace("月", "-").replace("日", "").replace("/", "-").replace(".", "-")
+            _dp=date.split("-")
+            if len(_dp)==3: date=f"{_dp[0]}-{_dp[1].zfill(2)}-{_dp[2].zfill(2)}"
 
         parts = []
         if date:
@@ -241,7 +246,7 @@ class RenameRule:
                         try:
                             with open(filepath, "rb") as f:
                                 data = f.read(4096)
-                            text = data.decode("utf-8", errors="ignore").strip()
+                            text = data.decode("utf-8-sig", errors="ignore").strip()
                             if text:
                                 recognized = text.splitlines()[0].strip()
                         except Exception:

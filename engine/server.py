@@ -180,12 +180,20 @@ def _try_start_queued() -> None:
         with _CANCEL_LOCK:
             if flag.is_set() or task_id not in _CANCEL_FLAGS:
                 _TASK_SEMAPHORE.release()
-                # flag.is_set(): _cancel_task already sent task.complete, skip.
-                # task_id not in _CANCEL_FLAGS: race window -- _cancel_task cleaned
-                # the flag after popleft but before we re-acquired _CANCEL_LOCK, so
-                # the frontend never received a task.complete; send it now to prevent
-                # the frontend from hanging indefinitely.
-                if not flag.is_set() and task_id not in _CANCEL_FLAGS:
+                # [Bug1 Fix] Race condition: flag set by _cancel_task AFTER popleft but BEFORE
+                # we re-acquired _CANCEL_LOCK. In this window _cancel_task found
+                # removed_queued=False, set the flag, but did NOT clean _CANCEL_FLAGS
+                # or send task.complete -> frontend hangs + memory leak.
+                if flag.is_set() and task_id in _CANCEL_FLAGS:
+                    _CANCEL_FLAGS.pop(task_id, None)
+                    send_notification("task.complete", {
+                        "task_id": task_id,
+                        "ok": False,
+                        "cancelled": True,
+                        "error": "已取消",
+                    })
+                elif not flag.is_set() and task_id not in _CANCEL_FLAGS:
+                    # Edge case fallback: send notification to prevent frontend hang
                     send_notification("task.complete", {
                         "task_id": task_id, "ok": False,
                         "cancelled": True, "error": "Task cancelled",
@@ -429,6 +437,9 @@ def handle_pdf_split_preview_many(params: dict) -> dict:
 
 
 def handle_pdf_split_execute(params: dict) -> dict:
+    # [Bug10 Warning] This runs SYNCHRONOUSLY in the RPC main loop.
+    # Large files (many pages) can block ALL other requests (including cancel!) for
+    # tens of seconds. Prefer pdf_split.execute_async for anything non-trivial.
     engine = _make_pdf_split_engine()
     pdf_paths = params.get("pdf_paths", []) if isinstance(params.get("pdf_paths"), (list, tuple)) else []
     return engine.execute_split(pdf_paths, params.get("config", {}))
@@ -965,9 +976,14 @@ ROUTES: Dict[str, Callable] = {
 def main() -> None:
     # 重定向 stderr → null，避免异步线程写入导致管道阻塞
     try:
-        sys.stderr = open(os.devnull, "w")
+        _log_dir = os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+            "FileToolbox", "logs"
+        )
+        os.makedirs(_log_dir, exist_ok=True)
+        sys.stderr = open(os.path.join(_log_dir, "engine.log"), "a", encoding="utf-8", buffering=1)
     except Exception:
-        pass
+        pass  # Imp1: last-resort fallback only if log dir creation fails
 
     send({"jsonrpc": "2.0", "method": "ready", "params": {}})
 

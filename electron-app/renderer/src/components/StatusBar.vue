@@ -21,7 +21,6 @@ const statusText: Record<string, string> = {
       重试
     </button>
     <span class="spacer" />
-    <span class="version-text">v2.0.0 · Electron + Python</span>
   </footer>
 </template>
 
@@ -60,7 +59,6 @@ const statusText: Record<string, string> = {
 }
 .status-text { color: var(--color-gray-700); }
 .spacer { flex: 1; }
-.version-text { color: var(--color-gray-500); font-size: var(--font-xs); }
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }

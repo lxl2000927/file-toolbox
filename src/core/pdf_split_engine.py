@@ -499,10 +499,10 @@ class PdfSplitEngine:
         unique_paths: list[str] = []
         for p in pdf_paths:
             if p and isinstance(p, str):
-                norm = os.path.normpath(p)
+                norm = os.path.normcase(os.path.normpath(p))  # Bug4 Fix: normcase for Windows case-insensitive dedup
                 if norm not in seen:
                     seen.add(norm)
-                    unique_paths.append(norm)
+                    unique_paths.append(p)  # Bug4 Fix: append original path, not normcase'd norm
         pdf_paths = unique_paths
 
         if not pdf_paths:

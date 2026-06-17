@@ -487,7 +487,7 @@ async function openDataDir() {
           <div>
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.2.0</span>
+              <span class="version-pill">v2.3.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
             </div>
           </div>
@@ -524,7 +524,7 @@ async function openDataDir() {
         <div v-else-if="updateResult?.ok" class="release-panel current-version">
           <div class="release-topline">
             <span class="release-badge current">当前已是最新版本</span>
-            <span class="release-versions">v{{ updateResult.current || '2.2.0' }}</span>
+            <span class="release-versions">v{{ updateResult.current || '2.3.0' }}</span>
           </div>
           <p>无需更新。当前版本的更新日志如下。</p>
           <div v-if="updateResult.body" class="release-body selectable" v-html="releaseBodyHtml" />
@@ -543,7 +543,7 @@ async function openDataDir() {
           <div class="about-hero-info">
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.2.0</span>
+              <span class="version-pill">v2.3.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
               <span class="version-pill version-pill-sub">Python Engine</span>
             </div>

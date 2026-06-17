@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Literal
@@ -112,6 +113,7 @@ class _DetectionContext:
 class PdfScanSplitEngine:
     _zxingcpp = None
     _zxingcpp_checked = False
+    _zxingcpp_import_lock = threading.Lock()
 
     @staticmethod
     def _configure_acceleration(options: PdfScanSplitOptions, *, cv2=None, log: Optional[LogCallback] = None):
@@ -314,15 +316,18 @@ class PdfScanSplitEngine:
 
     @classmethod
     def _load_zxingcpp(cls):
-        if cls._zxingcpp_checked:
+        if cls._zxingcpp_checked:  # fast path, no lock
             return cls._zxingcpp
-        cls._zxingcpp_checked = True
-        try:
-            import zxingcpp  # type: ignore
-            cls._zxingcpp = zxingcpp
-        except Exception:
-            cls._zxingcpp = None
-        return cls._zxingcpp
+        with cls._zxingcpp_import_lock:  # Bug9 Fix: double-checked locking
+            if cls._zxingcpp_checked:
+                return cls._zxingcpp
+            try:
+                import zxingcpp  # type: ignore
+                cls._zxingcpp = zxingcpp
+            except Exception:
+                cls._zxingcpp = None
+            cls._zxingcpp_checked = True
+            return cls._zxingcpp
 
     @staticmethod
     def _is_feature_match(good_count: int, inliers: int, inlier_ratio: float, options: PdfScanSplitOptions) -> bool:

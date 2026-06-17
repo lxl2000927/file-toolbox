@@ -30,10 +30,12 @@ def _safe_output_name(filename: str, default: str, *, require_pdf: bool) -> str:
 
 
 def _ensure_inside_output_dir(output_dir: str, candidate: str) -> None:
-    root = os.path.abspath(output_dir or ".")
-    target = os.path.abspath(candidate)
-    if os.path.basename(root) in (".", ".."):
+    # Bug5 Fix: check raw input BEFORE abspath() - after abspath() basename can never be "." or ".."
+    _raw = (output_dir or "").strip()
+    if _raw in (".", ".."):
         raise ValueError("输出目录不能是相对目录")
+    root = os.path.abspath(_raw or ".")
+    target = os.path.abspath(candidate)
     try:
         common = os.path.commonpath([root, target])
     except ValueError:
@@ -69,7 +71,9 @@ def make_unique_output_path(output_dir: str, filename: str, used_paths: set[str]
 def make_unique_temp_path(output_dir: str, filename: str, used_paths: set[str]) -> str:
     filename = _safe_output_name(filename, "output.pdf", require_pdf=False)
     if len(filename) > 240:
-        filename = filename[:240]
+        # Bug8 Fix: preserve file extension when truncating
+        _base, _ext = os.path.splitext(filename)
+        filename = _base[:240 - len(_ext)] + _ext
     candidate = os.path.join(output_dir, f"{filename}.tmp")
     _ensure_inside_output_dir(output_dir, candidate)
     norm = os.path.normcase(os.path.abspath(candidate))
