@@ -1,12 +1,15 @@
 {
   "name": "file-toolbox-electron",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "File Toolbox - Electron + Python 桌面应用",
   "main": "dist/main/index.js",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
   "scripts": {
     "dev:renderer": "vite --config vite.renderer.config.ts",
-    "dev:main": "vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && electron .",
-    "dev": "vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && concurrently \"vite --config vite.renderer.config.ts\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:main": "vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && electron . --user-data-dir=.dev-user-data",
+    "dev": "vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts && concurrently \"vite --config vite.renderer.config.ts\" \"wait-on http://localhost:5173 && electron . --user-data-dir=.dev-user-data\"",
     "build:renderer": "vite build --config vite.renderer.config.ts",
     "build:main": "vite build --config vite.main.config.ts && vite build --config vite.preload.config.ts",
     "build": "npm run build:renderer && npm run build:main",
@@ -22,6 +25,7 @@
     "concurrently": "^10.0.3",
     "electron": "^42.3.3",
     "electron-builder": "^26.15.2",
+    "esbuild": "^0.28.1",
     "typescript": "^5.7.0",
     "vite": "^8.0.16",
     "vue-tsc": "^2.0.0",

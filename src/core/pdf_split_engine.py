@@ -5,9 +5,9 @@ from datetime import datetime
 from enum import Enum
 from dataclasses import dataclass
 try:
-    import PyPDF2
-except Exception:
-    PyPDF2 = None
+    import pypdf
+except ImportError:
+    pypdf = None
 
 # 模块级预编译正则
 _RE_TITLE_SANITIZE = re.compile(r"[^\w\-_\. ]")
@@ -173,12 +173,12 @@ class PdfSplitEngine:
         if not filepath.lower().endswith('.pdf'):
             return False, "文件不是PDF格式", None
 
-        if PyPDF2 is None:
-            return False, "缺少依赖：PyPDF2", None
+        if pypdf is None:
+            return False, "缺少依赖：pypdf", None
         
         try:
             with open(filepath, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+                pdf_reader = pypdf.PdfReader(file)
                 page_count = len(pdf_reader.pages)
                 
                 if page_count == 0:
@@ -220,9 +220,12 @@ class PdfSplitEngine:
                 except ValueError:
                     continue
         
+        # [Bug #28] 输入非空但解析后 ranges 为空（如 "abc"、"1-3-5"）时返回空列表，
+        # 让上层 plan_outputs_for_file 检测到空 ranges 后返回 valid=False 提示用户，
+        # 而不是静默回退到 [(1, total_pages)] 把整个 PDF 作为一个输出。
         if not ranges:
-            ranges = [(1, total_pages)]
-        
+            return []
+
         return ranges
 
     @staticmethod
@@ -238,10 +241,10 @@ class PdfSplitEngine:
         stem = os.path.splitext(base)[0]
         output_dir = config.output_dir or os.path.dirname(pdf_path)
 
-        if PyPDF2 is None:
+        if pypdf is None:
             return {
                 "valid": False,
-                "message": "缺少依赖：PyPDF2",
+                "message": "缺少依赖：pypdf",
                 "page_count": None,
                 "output_dir": output_dir,
                 "outputs": [],
@@ -267,7 +270,7 @@ class PdfSplitEngine:
 
         try:
             with open(pdf_path, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = pypdf.PdfReader(f)
                 total_pages = int(len(reader.pages))
                 if total_pages <= 0:
                     return {
@@ -279,6 +282,7 @@ class PdfSplitEngine:
                     }
 
                 outputs: list[PlannedOutput] = []
+                size_warning = ""  # [Bug#8 Fix] 预定义，避免仅 BY_FILE_SIZE 分支赋值导致作用域脆弱
 
                 if config.mode == SplitMode.BY_PAGE_COUNT:
                     per = max(1, int(config.page_count or 1))
@@ -293,6 +297,16 @@ class PdfSplitEngine:
 
                 elif config.mode == SplitMode.BY_PAGE_RANGE:
                     ranges = self.parse_page_ranges(str(config.page_ranges or ""), total_pages)
+                    # [Bug #28] 输入非空但解析失败时 parse_page_ranges 返回空列表，
+                    # 此时应返回 valid=False 提示用户检查格式，而不是静默生成空 outputs。
+                    if not ranges:
+                        return {
+                            "valid": False,
+                            "message": "页码范围无法解析，请检查输入格式（如 1-5,8,10-12）",
+                            "page_count": total_pages,
+                            "output_dir": output_dir,
+                            "outputs": [],
+                        }
                     for i, (start, end) in enumerate(ranges):
                         outputs.append(PlannedOutput(f"{prefix}{stem}_range{i + 1}.pdf", (start, end)))
 
@@ -314,7 +328,6 @@ class PdfSplitEngine:
                             "output_dir": output_dir,
                             "outputs": [],
                         }
-                    size_warning = ""
                     if file_size_mb <= max_size_mb:
                         outputs.append(PlannedOutput(f"{prefix}{base}", (1, total_pages)))
                     else:
@@ -398,6 +411,7 @@ class PdfSplitEngine:
             jobs=jobs,
             used_paths=used_paths,
             cancel_check=cancel_check,
+            cleanup_outputs_on_cancel=False,
         )
     
     def _destination_page_1based(self, pdf_reader, item) -> Optional[int]:
@@ -488,7 +502,8 @@ class PdfSplitEngine:
             "successful": 0,
             "failed": 0,
             "errors": [],
-            "operations": []
+            "operations": [],
+            "output_files": []
         }
 
         self.operation_records.clear()
@@ -556,6 +571,9 @@ class PdfSplitEngine:
                 
                 record.output_files = output_files
                 record.output_count = len(output_files)
+                results["output_files"].extend(output_files)
+                if cancelled() and output_files:
+                    raise RuntimeError("已取消")
                 record.success = True
                 results["successful"] += 1
             

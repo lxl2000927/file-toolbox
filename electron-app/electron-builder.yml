@@ -19,7 +19,7 @@ extraResources:
       - "*.exe"
 
 win:
-  signAndEditExecutable: false
+  signAndEditExecutable: false  # TODO: 配置代码签名证书后改为 true
   target:
     - target: nsis
       arch:

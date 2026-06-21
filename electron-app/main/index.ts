@@ -1,11 +1,36 @@
-import { app, BrowserWindow, ipcMain, dialog, session } from "electron";
+import { app, BrowserWindow, ipcMain, dialog, session, shell } from "electron";
 import { join, resolve, extname } from "path";
 import { existsSync, promises as fsp } from "fs";
 import https from "https";
+import { randomBytes } from "crypto";
+import { execFileSync } from "child_process";
 import { PythonBridge } from "./python-bridge";
 
+// 进程级未捕获异常处理，避免崩溃时无日志
+process.on("unhandledRejection", (reason) => {
+  console.error("[main] Unhandled Rejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[main] Uncaught Exception:", err);
+});
+
+// 单实例锁：第二个实例启动时聚焦已有窗口
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length > 0) {
+      const win = windows[0];
+      if (win.isMinimized()) win.restore();
+      win.focus();
+    }
+  });
+}
+
 const GITHUB_REPO = "LXL2000927/file-toolbox";
-const GITHUB_API = `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=1`;
+const GITHUB_API = `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=20`;
 const GITHUB_RELEASES = `https://github.com/${GITHUB_REPO}/releases`;
 
 let mainWindow: BrowserWindow | null = null;
@@ -20,27 +45,23 @@ const MIN_WINDOW_WIDTH = 1120;
 const MIN_WINDOW_HEIGHT = 720;
 const DEV_RENDERER_URL = "http://localhost:5173";
 const MAX_REFERENCE_IMAGE_FILE_SIZE = 15 * 1024 * 1024;  // 原始参考图片文件大小上限（≈15 MiB）
+const MAX_INPUT_PDF_FILE_SIZE = 200 * 1024 * 1024;
+const MAX_GENERIC_INPUT_FILE_SIZE = 500 * 1024 * 1024;
+const authorizedPaths = new Set<string>();
+const ENGINE_AUTH_TOKEN = randomBytes(32).toString("hex");
+const ENGINE_METHODS = new Set(["ping", "rename.preview", "rename.execute", "rename.undo", "pdf_split.validate", "pdf_split.preview", "pdf_split.preview_many", "pdf_split.execute_async", "scan_split.execute_async", "scan_split.preview_reference", "scan_split.probe_page", "scan_split.scan_only", "task.cancel", "history.get", "history.clear"]);
 const MAX_UPDATE_RESPONSE_SIZE = 1024 * 1024;
 const MAX_SAVE_FILE_CONTENT_SIZE = 20 * 1024 * 1024;
-const authorizedPaths = new Set<string>();
-const ENGINE_METHODS = new Set([
-  "ping",
-  "rename.preview",
-  "rename.execute",
-  "rename.undo",
-  "pdf_split.validate",
-  "pdf_split.preview",
-  "pdf_split.preview_many",
-  "pdf_split.execute",
-  "pdf_split.execute_async",
-  "scan_split.execute_async",
-  "scan_split.preview_reference",
-  "scan_split.probe_page",
-  "scan_split.scan_only",
-  "task.cancel",
-  "history.get",
-  "history.clear",
-]);
+
+function isAllowedAppUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (isDev) return url.origin === new URL(DEV_RENDERER_URL).origin;
+    return url.protocol === "file:";
+  } catch {
+    return false;
+  }
+}
 
 function isMainSender(event: Electron.IpcMainInvokeEvent): boolean {
   return Boolean(mainWindow && event.sender === mainWindow.webContents && !mainWindow.isDestroyed());
@@ -51,80 +72,65 @@ async function canonicalPath(pathValue: string): Promise<string> {
 }
 
 async function authorizePath(pathValue: string): Promise<void> {
-  try {
-    authorizedPaths.add(await canonicalPath(pathValue));
-  } catch {
-    authorizedPaths.add(resolve(pathValue));
-  }
+  try { authorizedPaths.add(await canonicalPath(pathValue)); } catch { authorizedPaths.add(resolve(pathValue)); }
 }
 
 async function isAuthorizedPath(pathValue: string): Promise<boolean> {
   try {
     const actual = await canonicalPath(pathValue);
     for (const root of authorizedPaths) {
-      const relative = actual.toLowerCase().startsWith(root.toLowerCase())
-        ? actual.slice(root.length)
-        : "";
+      const relative = actual.toLowerCase().startsWith(root.toLowerCase()) ? actual.slice(root.length) : "";
       if (actual === root || relative.startsWith("\\") || relative.startsWith("/")) return true;
     }
   } catch {
+    // realpath 失败（例如路径尚未创建），退化为 resolve 后比对
+    const fallback = resolve(pathValue);
+    for (const root of authorizedPaths) {
+      const relative = fallback.toLowerCase().startsWith(root.toLowerCase()) ? fallback.slice(root.length) : "";
+      if (fallback === root || relative.startsWith("\\") || relative.startsWith("/")) return true;
+    }
     return false;
   }
   return false;
 }
 
-async function collectParamPaths(value: any): Promise<string[]> {
-  const paths: string[] = [];
-
-  // 显式枚举已知路径字段名（API 契约，非隐式正则约定）
-  // 新增路径参数时必须同时更新此列表，以确保路径授权检查覆盖
-  const KNOWN_PATH_KEYS = new Set([
-    "path", "file", "files", "dir", "directory",
-    "pdf_path", "pdf_path_from", "pdf_path_to",
-    "reference_image", "reference_image_path",
-    "input_path", "input_file", "input_files",
-    "output_dir", "output_directory",
-    "filepath", "filepath_from", "filepath_to",
-  ]);
-  const KNOWN_PATH_SUFFIXES = ["_path", "_paths", "_file", "_files", "_dir"];
-
-  const visit = (item: any, key = "") => {
-    if (typeof item === "string") {
-      const lower = key.toLowerCase();
-      // 显式匹配：key 本身在已知列表中，或以已知后缀结尾
-      if (KNOWN_PATH_KEYS.has(lower) || KNOWN_PATH_SUFFIXES.some((s) => lower.endsWith(s))) {
-        if (item) paths.push(item);
-      }
-      return;
-    }
-    if (Array.isArray(item)) {
-      for (const child of item) visit(child, key);
-      return;
-    }
-    if (item && typeof item === "object") {
-      for (const [childKey, child] of Object.entries(item)) visit(child, childKey);
-    }
-  };
-  visit(value);
-  return paths;
+async function validateInputFile(pathValue: string, allowedExts: Set<string>, maxSize: number): Promise<void> {
+  const stat = await fsp.stat(pathValue);
+  if (!stat.isFile()) throw new Error(`Invalid file: ${pathValue}`);
+  if (stat.size > maxSize) throw new Error(`File too large: ${pathValue}`);
+  const ext = extname(pathValue).slice(1).toLowerCase();
+  if (allowedExts.size && !allowedExts.has(ext)) throw new Error(`Unsupported file type: ${pathValue}`);
 }
 
 async function validateEngineParamPaths(method: string, params: any): Promise<void> {
-  if (method === "history.get" || method === "history.clear" || method === "task.cancel" || method === "ping" || method === "rename.undo") return;
-  const paths = await collectParamPaths(params);
-  for (const pathValue of paths) {
-    if (!(await isAuthorizedPath(pathValue))) throw new Error(`未授权的文件路径: ${pathValue}`);
+  if (["history.get", "history.clear", "task.cancel", "ping", "rename.undo"].includes(method)) return;
+  const paths: string[] = [];
+  const pathKeys = new Set(["path", "file", "files", "dir", "directory", "pdf_path", "pdf_path_from", "pdf_path_to", "reference_image", "reference_image_path", "input_path", "input_file", "input_files", "output_dir", "output_directory", "filepath", "filepath_from", "filepath_to"]);
+  const visit = (item: any, key = "") => {
+    if (typeof item === "string") {
+      if (!item.trim()) return;
+      const lower = key.toLowerCase();
+      if (pathKeys.has(lower) || ["_path", "_paths", "_file", "_files", "_dir"].some((suffix) => lower.endsWith(suffix))) paths.push(item);
+      return;
+    }
+    if (Array.isArray(item)) for (const child of item) visit(child, key);
+    else if (item && typeof item === "object") for (const [childKey, child] of Object.entries(item)) visit(child, childKey);
+  };
+  visit(params);
+  for (const pathValue of paths) if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
+  if (method.startsWith("pdf_split.")) {
+    const pdfPaths = [params?.pdf_path, params?.pdf_path_from, params?.pdf_path_to, ...(Array.isArray(params?.pdf_paths) ? params.pdf_paths : [])].filter(Boolean);
+    for (const pathValue of pdfPaths) await validateInputFile(String(pathValue), new Set(["pdf"]), MAX_INPUT_PDF_FILE_SIZE);
   }
-}
-
-function isAllowedAppUrl(rawUrl: string): boolean {
-  try {
-    const url = new URL(rawUrl);
-    if (isDev) return url.origin === new URL(DEV_RENDERER_URL).origin;
-    return url.protocol === "file:";
-  } catch {
-    return false;
+  if (method.startsWith("scan_split.")) {
+    const imageExts = new Set(["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif"]);
+    for (const pathValue of [params?.pdf_path, params?.input_path, params?.reference_image, params?.reference_image_path].filter(Boolean)) {
+      const ext = extname(String(pathValue)).slice(1).toLowerCase();
+      const isImage = imageExts.has(ext);
+      await validateInputFile(String(pathValue), isImage ? imageExts : new Set(["pdf"]), isImage ? MAX_REFERENCE_IMAGE_FILE_SIZE : MAX_INPUT_PDF_FILE_SIZE);
+    }
   }
+  if (method.startsWith("rename.")) for (const pathValue of (Array.isArray(params?.files) ? params.files : [])) await validateInputFile(String(pathValue), new Set(), MAX_GENERIC_INPUT_FILE_SIZE);
 }
 
 function validateExternalUrl(rawUrl: string): string {
@@ -160,6 +166,26 @@ function normalizeVersionTag(tagName: unknown): string | null {
   return latest;
 }
 
+function getReleaseVersion(release: any): string | null {
+  if (!release || release.draft || release.prerelease) return null;
+  return normalizeVersionTag(release.tag_name);
+}
+
+function newestStableRelease(data: unknown): any | null {
+  const releases = Array.isArray(data) ? data : [data];
+  let selected: any | null = null;
+  let selectedVersion: string | null = null;
+  for (const release of releases) {
+    const version = getReleaseVersion(release);
+    if (!version) continue;
+    if (!selected || !selectedVersion || compareVersions(version, selectedVersion)) {
+      selected = release;
+      selectedVersion = version;
+    }
+  }
+  return selected;
+}
+
 function findPython(): string {
   if (!isDev) return "python";
   const candidates = [
@@ -167,13 +193,23 @@ function findPython(): string {
     join(PROJECT_ROOT, "venv", "Scripts", "python.exe"),
   ];
   for (const c of candidates) {
-    if (existsSync(c)) {
+    if (existsSync(c) && canRunPython(c)) {
       console.log(`[main] 检测到 venv: ${c}`);
       return c;
     }
   }
   console.log("[main] 未找到 venv，使用系统 python");
   return "python";
+}
+
+function canRunPython(exePath: string): boolean {
+  try {
+    execFileSync(exePath, ["--version"], { stdio: "ignore", timeout: 3000 });
+    return true;
+  } catch {
+    console.warn(`[main] 跳过不可用 Python: ${exePath}`);
+    return false;
+  }
 }
 
 function createWindow() {
@@ -201,7 +237,7 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     try {
       const safeUrl = validateExternalUrl(url);
-      import("electron").then(({ shell }) => shell.openExternal(safeUrl));
+      shell.openExternal(safeUrl);
     } catch {
       // Deny by default.
     }
@@ -240,8 +276,8 @@ function setupIPC() {
   ipcReady = true;
 
   ipcMain.handle("engine:call", async (event, method: string, params: any) => {
-    if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
-    if (!ENGINE_METHODS.has(String(method || ""))) throw new Error("引擎方法不在允许列表中");
+    if (!isMainSender(event)) throw new Error("Invalid IPC sender");
+    if (!ENGINE_METHODS.has(String(method || ""))) throw new Error("Engine method is not allowed");
     if (!bridge || engineStatus !== "ready") {
       throw new Error(engineStatus === "error" ? `Python 引擎启动失败：${engineError || "未知错误"}` : "Python 引擎启动中，请稍候");
     }
@@ -250,7 +286,7 @@ function setupIPC() {
   });
 
   ipcMain.handle("engine:status", async (event) => {
-    if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
+    if (!isMainSender(event)) throw new Error("Invalid IPC sender");
     return { status: engineStatus, error: engineError };
   });
 
@@ -287,7 +323,7 @@ function setupIPC() {
     if (!isMainSender(event)) return "";
     if (!mainWindow) return "";
     const result = await dialog.showOpenDialog(mainWindow, {
-      properties: ["openDirectory", "createDirectory"],
+      properties: ["openDirectory"],
       title: options?.title,
     });
     if (result.canceled || !result.filePaths[0]) return "";
@@ -379,13 +415,14 @@ async function startEngine() {
     ? join(PROJECT_ROOT, "engine", "server.py")
     : join(process.resourcesPath, "engine", "engine.exe");
   const pythonExe = findPython();
-  await nextBridge.start(enginePath, isDev, pythonExe);
+  // 先注册 exit handler，再启动引擎，避免 ready 后瞬间崩溃的状态不一致
+  attachBridgeNotifications(nextBridge);
+  await nextBridge.start(enginePath, isDev, pythonExe, ENGINE_AUTH_TOKEN);
   if (bridge !== nextBridge) {
     nextBridge.shutdown();
     return;
   }
   engineStatus = "ready";
-  attachBridgeNotifications(nextBridge);
   mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus } });
 }
 
@@ -432,9 +469,9 @@ ipcMain.handle("app:checkUpdate", async (event) => {
           try {
             const raw = Buffer.concat(chunks, receivedBytes).toString("utf8");
             const data = JSON.parse(raw);
-            const release = Array.isArray(data) ? data[0] : data;
+            const release = newestStableRelease(data);
             const currentVersion = app.getVersion();
-            if (!release?.tag_name) {
+            if (!release) {
               resolve({ ok: true, hasUpdate: false, current: currentVersion, latest: null });
               return;
             }
@@ -444,6 +481,15 @@ ipcMain.handle("app:checkUpdate", async (event) => {
               return;
             }
             const hasUpdate = compareVersions(latest, currentVersion);
+            if (!hasUpdate) {
+              resolve({
+                ok: true,
+                hasUpdate: false,
+                current: currentVersion,
+                latest,
+              });
+              return;
+            }
             const releaseUrl = safeReleaseUrl(release.html_url);
             resolve({
               ok: true,
@@ -483,7 +529,6 @@ function compareVersions(a: string, b: string): boolean {
 
 ipcMain.handle("app:openExternal", async (event, url: string) => {
   if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
-  const { shell } = await import("electron");
   return shell.openExternal(validateExternalUrl(url));
 });
 
@@ -496,7 +541,6 @@ ipcMain.handle("app:openDataDir", async (event) => {
   } catch {
     // ignore creation errors; openPath will surface a readable message
   }
-  const { shell } = await import("electron");
   const failure = await shell.openPath(dataDir);
   if (failure) throw new Error(failure);
   return dataDir;
@@ -535,23 +579,22 @@ ipcMain.handle("engine:restart", async (event) => {
   await startEngine();
 });
 
-app.whenReady().then(async () => {
-  session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
-    callback(false);
+if (gotLock) {
+  app.whenReady().then(async () => {
+    session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => {
+      callback(false);
+    });
+    session.defaultSession.setPermissionCheckHandler(() => false);
+    setupIPC();
+    createWindow();
+    startEngine().catch((e) => {
+      engineStatus = "error";
+      engineError = e instanceof Error ? e.message : String(e);
+      console.error("引擎启动失败:", e);
+      mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus, error: engineError } });
+    });
   });
-  session.defaultSession.setPermissionCheckHandler(() => false);
-  setupIPC();
-  createWindow();
-  startEngine().catch((e) => {
-    engineStatus = "error";
-    engineError = e instanceof Error ? e.message : String(e);
-    console.error("引擎启动失败:", e);
-    mainWindow?.webContents.send("engine:notification", { method: "engine.status", params: { status: engineStatus, error: engineError } });
-  });
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow();
-  });
-});
+}
 
 app.on("window-all-closed", () => {
   bridge?.shutdown();

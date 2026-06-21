@@ -214,7 +214,7 @@ onBeforeUnmount(() => {
   display: inline-flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-2_5);
   padding: 6px 10px;
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius);
@@ -363,19 +363,19 @@ onBeforeUnmount(() => {
   --select-tone-bg: var(--color-danger-bg);
 }
 .tone-warning {
-  --select-tone-color: #f59e0b;
-  --select-tone-bg: #fef3c7;
+  --select-tone-color: var(--color-warning);
+  --select-tone-bg: var(--color-warning-bg);
 }
 .tone-success {
   --select-tone-color: var(--color-success);
   --select-tone-bg: var(--color-success-bg);
 }
 .tone-info {
-  --select-tone-color: #2563eb;
-  --select-tone-bg: #dbeafe;
+  --select-tone-color: var(--color-primary-700);
+  --select-tone-bg: var(--color-primary-light);
 }
 .tone-debug {
-  --select-tone-color: #7c3aed;
+  --select-tone-color: var(--color-purple);
   --select-tone-bg: #ede9fe;
 }
 .app-select-option-label {

@@ -36,8 +36,8 @@ contextBridge.exposeInMainWorld("engine", {
       ipcRenderer.invoke("engine:call", "pdf_split.preview", { pdf_path: pdfPath, config }),
     previewMany: (pdfPaths: string[], config: any) =>
       ipcRenderer.invoke("engine:call", "pdf_split.preview_many", { pdf_paths: pdfPaths, config }),
-    execute: (pdfPaths: string[], config: any) =>
-      ipcRenderer.invoke("engine:call", "pdf_split.execute", { pdf_paths: pdfPaths, config }),
+    // [Bug #32] pdf_split.execute 同步路由已下线（server.py ROUTES 已移除），
+    // 仅保留 executeAsync 走后台线程 + 取消令牌。
     executeAsync: (pdfPaths: string[], config: any, taskId?: string) =>
       ipcRenderer.invoke("engine:call", "pdf_split.execute_async", {
         pdf_paths: pdfPaths,
@@ -112,7 +112,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("dialog:saveFile", options),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   getPathsForFiles: async (files: File[]) => {
-    const paths = files.map((file) => webUtils.getPathForFile(file)).filter(Boolean);
-    return ipcRenderer.invoke("fs:authorizePaths", paths);
+    const paths = Array.from(files, (file) => webUtils.getPathForFile(file));
+    const validPaths = paths.filter((path): path is string => Boolean(path));
+    const authorizedPaths: string[] = await ipcRenderer.invoke("fs:authorizePaths", validPaths);
+    const authorizedSet = new Set(authorizedPaths);
+    return paths.map((path) => (path && authorizedSet.has(path) ? path : ""));
   },
 });

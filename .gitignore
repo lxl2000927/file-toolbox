@@ -183,6 +183,7 @@ electron-app/release-*/
 electron-app/*.tsbuildinfo
 electron-app/.vite/
 electron-app/.electron-builder-cache/
+electron-app/.dev-user-data/
 
 # Python engine build outputs
 engine/build/

@@ -8,6 +8,7 @@ import CustomTab from "./rename/CustomTab.vue";
 import type { FileOperation, RenameRule, RenamePreviewItem, ExecuteSummary } from "../../env";
 import { useAppDialog } from "../../composables/useAppDialog";
 import { useToast } from "../../composables/useToast";
+import { formatEngineError } from "../../utils";
 import AppIcon from "../common/AppIcon.vue";
 
 type TabKey = "insert" | "replace" | "delete" | "smart" | "custom";
@@ -48,9 +49,11 @@ const sortMenuStyle = ref<Record<string, string>>({});
 const dragOver = ref(false);
 const draggingFile = ref<string | null>(null);
 const dragTargetFile = ref<string | null>(null);
-let rowDragPointerId: number | null = null;
-let rowDragColumnX: number | null = null;
-let rowDragLastMoveAt = 0;
+// #12 拖拽插入位置指示线：before / after / null
+const dragTargetPos = ref<"before" | "after" | null>(null);
+const rowDragPointerId = ref<number | null>(null);
+const rowDragColumnX = ref<number | null>(null);
+const rowDragLastMoveAt = ref(0);
 const fileSizes = ref<Map<string, number>>(new Map());
 
 const activeRules = computed({
@@ -155,6 +158,9 @@ const currentRules = computed(() => {
     ...customTabRules.value,
   ];
   // 所有规则类型统一去重：每种 type 只保留最后出现的那条（由 Tab 优先级决定）
+  // 注意：insert_number 类型在 InsertTab 和 CustomTab 都可能被添加，
+  // 两者都会管理编号规则，后修改者生效（覆盖前者）。
+  // 若需独立控制，可在 UI 上对 CustomTab 的 insert_number 添加做禁用提示。
   const result: RenameRule[] = [];
   for (const rule of source) {
     if (!isEffectiveRule(rule)) continue;
@@ -192,10 +198,10 @@ function beginRowDrag(path: string, e: PointerEvent) {
   }
   draggingFile.value = path;
   dragTargetFile.value = null;
-  rowDragPointerId = e.pointerId;
+  rowDragPointerId.value = e.pointerId;
   const opsCell = (e.currentTarget as HTMLElement).closest("td.col-ops");
   const rect = opsCell?.getBoundingClientRect();
-  rowDragColumnX = rect ? rect.left + rect.width / 2 : e.clientX;
+  rowDragColumnX.value = rect ? rect.left + rect.width / 2 : e.clientX;
   document.body.style.cursor = "grabbing";
   document.body.style.userSelect = "none";
   window.addEventListener("pointermove", onRowDragMove);
@@ -214,23 +220,29 @@ function onFileAreaDragOver(e: DragEvent) {
 }
 
 function onRowDragMove(e: PointerEvent) {
-  if (!draggingFile.value || (rowDragPointerId !== null && e.pointerId !== rowDragPointerId)) return;
+  if (!draggingFile.value || (rowDragPointerId.value !== null && e.pointerId !== rowDragPointerId.value)) return;
   const now = performance.now();
-  if (now - rowDragLastMoveAt < 18) return;
-  const element = document.elementFromPoint(rowDragColumnX ?? e.clientX, e.clientY) as HTMLElement | null;
+  if (now - rowDragLastMoveAt.value < 18) return;
+  const element = document.elementFromPoint(rowDragColumnX.value ?? e.clientX, e.clientY) as HTMLElement | null;
   const opsCell = element?.closest("td.col-ops");
   const row = opsCell?.closest<HTMLTableRowElement>("tr[data-file-path]");
   const targetPath = row?.dataset.filePath || "";
   if (!row || !targetPath || targetPath === draggingFile.value) {
     dragTargetFile.value = null;
+    dragTargetPos.value = null;
     return;
   }
   dragTargetFile.value = targetPath;
+  // #12 根据指针 Y 与目标行中点判断插入位置（before / after）
+  const rowRect = row.getBoundingClientRect();
+  const midY = rowRect.top + rowRect.height / 2;
+  const insertAfter = e.clientY >= midY;
+  dragTargetPos.value = insertAfter ? "after" : "before";
   const sourceIndex = files.value.indexOf(draggingFile.value);
   const targetIndex = files.value.indexOf(targetPath);
   if (sourceIndex < 0 || targetIndex < 0) return;
-  const shouldInsertAfter = sourceIndex < targetIndex;
-  if (moveFileNearTarget(draggingFile.value, targetPath, shouldInsertAfter)) rowDragLastMoveAt = now;
+  // 实时重排：让用户直观看到拖拽效果；指示线由 dragTargetPos 驱动
+  if (moveFileNearTarget(draggingFile.value, targetPath, insertAfter)) rowDragLastMoveAt.value = now;
 }
 
 function moveFileNearTarget(sourcePath: string, targetPath: string, insertAfter: boolean) {
@@ -251,9 +263,9 @@ function cleanupRowDrag() {
   window.removeEventListener("pointermove", onRowDragMove);
   window.removeEventListener("pointerup", endRowDrag);
   window.removeEventListener("pointercancel", cancelRowDrag);
-  rowDragPointerId = null;
-  rowDragColumnX = null;
-  rowDragLastMoveAt = 0;
+  rowDragPointerId.value = null;
+  rowDragColumnX.value = null;
+  rowDragLastMoveAt.value = 0;
   document.body.style.cursor = "";
   document.body.style.userSelect = "";
 }
@@ -262,6 +274,7 @@ function finishRowDrag() {
   cleanupRowDrag();
   draggingFile.value = null;
   dragTargetFile.value = null;
+  dragTargetPos.value = null;
 }
 
 function cancelRowDrag() {
@@ -269,7 +282,7 @@ function cancelRowDrag() {
 }
 
 function endRowDrag(e: PointerEvent) {
-  if (rowDragPointerId !== null && e.pointerId !== rowDragPointerId) return;
+  if (rowDragPointerId.value !== null && e.pointerId !== rowDragPointerId.value) return;
   finishRowDrag();
   summary.value = null;
 }
@@ -292,20 +305,23 @@ function closeSortMenu() {
 }
 
 onBeforeUnmount(() => {
-  if (previewTimer !== null) {
-    clearTimeout(previewTimer);
-    previewTimer = null;
+  if (previewTimer.value !== null) {
+    clearTimeout(previewTimer.value);
+    previewTimer.value = null;
   }
   document.removeEventListener("click", closeSortMenu);
   cleanupRowDrag();
+  // 防御性移除列宽拖拽监听器，避免组件销毁时残留
+  document.removeEventListener("mousemove", onColMove);
+  document.removeEventListener("mouseup", onColUp);
 });
 
 onMounted(() => {
   document.addEventListener("click", closeSortMenu);
 });
 
-let previewTimer: number | null = null;
-let previewToken = 0;
+const previewTimer = ref<number | null>(null);
+const previewToken = ref(0);
 
 watch(
   [files, insertTabRules, replaceTabRules, deleteTabRules, smartTabRules, customTabRules, selected, activeTab, sortDir, sortMode],
@@ -316,25 +332,25 @@ watch(
 );
 
 function schedulePreview() {
-  if (previewTimer) window.clearTimeout(previewTimer);
-  previewTimer = window.setTimeout(() => doPreview(), 220);
+  if (previewTimer.value !== null) window.clearTimeout(previewTimer.value);
+  previewTimer.value = window.setTimeout(() => doPreview(), 220);
 }
 
 async function doPreview() {
   if (executing.value || !bridgeFiles.value.length || !window.engine || !bridgeRules.value.length) {
-    previewToken++;
+    previewToken.value++;
     previews.value = [];
     return;
   }
-  const token = ++previewToken;
+  const token = ++previewToken.value;
   const filesSnapshot = bridgeFiles.value;
   const rulesSnapshot = bridgeRules.value;
   try {
     error.value = "";
     const result = await window.engine.rename.preview(filesSnapshot, rulesSnapshot);
-    if (token === previewToken) previews.value = result;
+    if (token === previewToken.value) previews.value = result;
   } catch (e: any) {
-    if (token === previewToken) error.value = e?.message || "预览失败";
+    if (token === previewToken.value) error.value = formatEngineError(e);
   }
 }
 
@@ -374,9 +390,20 @@ function appendFiles(paths: string[]) {
   const selectedSet = new Set(selected.value);
   const addedPaths: string[] = [];
   for (const p of paths) {
+    if (!p) continue;
     if (!set.has(p)) addedPaths.push(p);
-    set.add(p);
   }
+  const MAX_FILES = 5000;
+  if (addedPaths.length + files.value.length > MAX_FILES) {
+    const allowed = Math.max(0, MAX_FILES - files.value.length);
+    if (allowed <= 0) {
+      toast.info(`文件数量已达上限 ${MAX_FILES}，无法继续添加`);
+      return;
+    }
+    addedPaths.splice(allowed);
+    toast.info(`文件数量超过上限 ${MAX_FILES}，仅添加前 ${allowed} 个`);
+  }
+  for (const p of addedPaths) set.add(p);
   const prevCount = files.value.length;
   files.value = Array.from(set);
   const addedCount = files.value.length - prevCount;
@@ -474,20 +501,34 @@ async function execute() {
     summary.value = result;
     if (result.failed === 0) toast.success(`重命名完成：成功 ${result.successful} 个文件`);
     else toast.error(`重命名：成功 ${result.successful}，失败 ${result.failed}`);
-    lastOperations.value = effectiveSaveMethod() === "overwrite" ? result.operations || [] : [];
-    undoToken.value = effectiveSaveMethod() === "overwrite" ? result.undo_token || "" : "";
-    if (effectiveSaveMethod() === "overwrite" && result.failed === 0) {
-      const next = (result.operations || [])
-        .map((o) => o.new_path)
-        .filter((p: string) => p);
-      if (next.length) {
-        files.value = next;
-        selected.value = new Set(next);
-        updateFileSizes(next, true);
+    // #20 copy 与 overwrite 都生成 undo_token，都支持撤销，不再按 saveMethod 丢弃
+    lastOperations.value = result.operations || [];
+    undoToken.value = result.undo_token || "";
+    // #21 overwrite 模式下部分成功也要按 operations 更新列表，避免显示已被 rename 走的原路径
+    if (effectiveSaveMethod() === "overwrite" && result.operations) {
+      const opMap = new Map<string, string>();
+      const reverseMap = new Map<string, string>();
+      for (const op of result.operations) {
+        if (op.success && op.original_path && op.new_path) {
+          opMap.set(op.original_path, op.new_path);
+          reverseMap.set(op.new_path, op.original_path);
+        }
+      }
+      if (opMap.size) {
+        files.value = files.value.map((p) => opMap.get(p) || p);
+        // 同步 selected：把旧路径上的选中状态迁移到新路径
+        const newSelected = new Set<string>();
+        for (const p of files.value) {
+          const oldP = reverseMap.get(p) || p;
+          if (selected.value.has(oldP)) newSelected.add(p);
+        }
+        selected.value = newSelected;
+        // 刷新 fileSizes：路径已变更
+        updateFileSizes(files.value, true);
       }
     }
   } catch (e: any) {
-    error.value = e?.message || "执行失败";
+    error.value = formatEngineError(e);
   } finally {
     executing.value = false;
   }
@@ -505,12 +546,16 @@ async function undo() {
   if (!confirmed) return;
   try {
     const r = await window.engine.rename.undo(undoToken.value);
+    // #25 只对 restored 中的 from→to 做映射，failed 的 path 保留当前路径
     if (r?.restored?.length) {
-      const map = new Map<string, string>();
-      for (const it of r.restored) map.set(it.from, it.to);
-      files.value = files.value.map((p) => map.get(p) || p);
+      const restoreMap = new Map<string, string>();
+      for (const item of r.restored) {
+        restoreMap.set(item.from, item.to);
+      }
+      files.value = files.value.map((p) => restoreMap.get(p) || p);
       selected.value = new Set(files.value);
     }
+    // failed 的文件保持当前路径不变
     lastOperations.value = [];
     undoToken.value = "";
     summary.value = null;
@@ -518,7 +563,7 @@ async function undo() {
     else error.value = "";
     await doPreview();
   } catch (e: any) {
-    error.value = e?.message || "撤销失败";
+    error.value = formatEngineError(e);
   }
 }
 
@@ -553,25 +598,30 @@ const colOpsWidth = 52;
 function startColResize(e: MouseEvent) {
   e.preventDefault();
   isResizingCol.value = true;
-  const startX = e.clientX;
-  const startW = colCheckWidth.value;
-  const table = renameTableRef.value;
-  function onMove(ev: MouseEvent) {
-    const delta = ev.clientX - startX;
-    const tableWidth = table?.clientWidth || 0;
-    const maxW = tableWidth
-      ? tableWidth - colNameMinWidth - colOpsWidth
-      : startW;
-    const newW = Math.max(colCheckMinWidth, Math.min(startW + delta, Math.max(colCheckMinWidth, maxW)));
-    colCheckWidth.value = newW;
-  }
-  function onUp() {
-    isResizingCol.value = false;
-    document.removeEventListener("mousemove", onMove);
-    document.removeEventListener("mouseup", onUp);
-  }
-  document.addEventListener("mousemove", onMove);
-  document.addEventListener("mouseup", onUp);
+  colResizeStartX = e.clientX;
+  colResizeStartW = colCheckWidth.value;
+  colResizeTable = renameTableRef.value;
+  document.addEventListener("mousemove", onColMove);
+  document.addEventListener("mouseup", onColUp);
+}
+
+// 列宽拖拽处理器提升为组件级命名函数，便于 onBeforeUnmount 防御性移除
+let colResizeStartX = 0;
+let colResizeStartW = 0;
+let colResizeTable: HTMLTableElement | null = null;
+function onColMove(ev: MouseEvent) {
+  const delta = ev.clientX - colResizeStartX;
+  const tableWidth = colResizeTable?.clientWidth || 0;
+  const maxW = tableWidth
+    ? tableWidth - colNameMinWidth - colOpsWidth
+    : colResizeStartW;
+  const newW = Math.max(colCheckMinWidth, Math.min(colResizeStartW + delta, Math.max(colCheckMinWidth, maxW)));
+  colCheckWidth.value = newW;
+}
+function onColUp() {
+  isResizingCol.value = false;
+  document.removeEventListener("mousemove", onColMove);
+  document.removeEventListener("mouseup", onColUp);
 }
 </script>
 
@@ -611,7 +661,7 @@ function startColResize(e: MouseEvent) {
             </colgroup>
             <thead>
               <tr>
-                <th class="col-check">
+                <th class="col-check" scope="col">
                   <div class="header-sort-cell">
                     <label class="checkbox header-checkbox" @click.stop>
                     <input
@@ -643,13 +693,14 @@ function startColResize(e: MouseEvent) {
                     @mousedown="startColResize"
                   ></span>
                 </th>
-                <th class="col-name">
+                <th class="col-name" scope="col">
                   新文件名
                 </th>
-                <th class="col-ops"></th>
+                <th class="col-ops" scope="col"></th>
               </tr>
             </thead>
-            <TransitionGroup tag="tbody" name="rename-row">
+            <!-- TODO: 引入虚拟滚动（vue-virtual-scroller）支持大量文件 -->
+            <tbody>
               <tr
                 v-for="f in sortedFiles"
                 :key="f"
@@ -658,6 +709,8 @@ function startColResize(e: MouseEvent) {
                   'diff-row': previewMap.get(f) && previewMap.get(f) !== fileBasename(f),
                   'row-dragging': draggingFile === f,
                   'row-drop-target': dragTargetFile === f,
+                  'row-drop-target-before': dragTargetFile === f && dragTargetPos === 'before',
+                  'row-drop-target-after': dragTargetFile === f && dragTargetPos === 'after',
                 }"
               >
                 <td class="col-check">
@@ -689,7 +742,7 @@ function startColResize(e: MouseEvent) {
                   </div>
                 </td>
               </tr>
-            </TransitionGroup>
+            </tbody>
           </table>
           <div v-else class="empty-state empty-drop-state">
             <div class="empty-icon">📂</div>
@@ -701,7 +754,10 @@ function startColResize(e: MouseEvent) {
 
       <!-- 右：Tab 规则面板 -->
       <section class="rules-section">
-        <div class="tab-bar segmented-control">
+        <div
+          class="tab-bar segmented-control segmented-animated"
+          :style="{ '--active-index': Math.max(0, tabs.findIndex((t) => t.key === activeTab)), '--segment-count': tabs.length }"
+        >
           <button
             v-for="t in tabs"
             :key="t.key"
@@ -730,7 +786,13 @@ function startColResize(e: MouseEvent) {
             <span class="flex-1" />
             <div class="action-controls">
               <button class="btn btn-outline" :disabled="!canUndo" @click="undo">撤销</button>
-              <button class="btn btn-primary btn-action" :disabled="!canRun" @click="execute">
+              <button
+                class="btn btn-primary btn-action"
+                :disabled="!canRun"
+                :aria-busy="executing"
+                @click="execute"
+              >
+                <span v-if="executing" class="btn-spinner" aria-hidden="true" />
                 {{ executing ? "执行中…" : "开始重命名" }}
               </button>
             </div>
@@ -856,6 +918,44 @@ function startColResize(e: MouseEvent) {
 }
 .rename-table.row-sorting tbody tr.row-drop-target:not(.row-dragging) {
   opacity: 0.86;
+}
+/* #12 拖拽插入位置指示线 */
+.rename-table tbody tr.row-drop-target-before::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-primary);
+  z-index: 10;
+  pointer-events: none;
+}
+.rename-table tbody tr.row-drop-target-after::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--color-primary);
+  z-index: 10;
+  pointer-events: none;
+}
+/* #11 执行按钮 spinner */
+.btn-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: rename-spin 0.6s linear infinite;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+@keyframes rename-spin {
+  to { transform: rotate(360deg); }
 }
 .row-actions {
   display: inline-flex;

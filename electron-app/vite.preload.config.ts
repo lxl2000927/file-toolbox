@@ -17,7 +17,7 @@ export default defineConfig({
         ...builtinModules.map((m) => `node:${m}`),
       ],
     },
-    minify: false,
+    minify: "esbuild",
     sourcemap: false,
   },
 });

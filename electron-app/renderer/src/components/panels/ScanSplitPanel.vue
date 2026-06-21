@@ -3,7 +3,8 @@ import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue"
 import type { ScanDetectionMode, ScanSplitOptions } from "../../env";
 import { useEngineTask, generateTaskId } from "../../composables/useEngineTask";
 import { useAppDialog } from "../../composables/useAppDialog";
-import { positiveInt } from "../../utils";
+import { useToast } from "../../composables/useToast";
+import { positiveInt, formatEngineError } from "../../utils";
 import AppSelect from "../common/AppSelect.vue";
 import AppIcon from "../common/AppIcon.vue";
 
@@ -12,6 +13,7 @@ type TuneResult = { title: string; lines: string[] };
 
 const pdfPath = ref("");
 const dialog = useAppDialog();
+const toast = useToast();
 const referenceImage = ref("");
 const outputDir = ref("");
 const prefix = ref("");
@@ -126,7 +128,7 @@ const roiDialogStyle = computed(() => {
   };
 });
 
-const { state: taskState, logs, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
+const { state: taskState, logs, busy: taskBusy, cancellable: taskCancellable, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
   onComplete: (payload) => {
     submitting.value = false;
     if (payload.ok) {
@@ -159,7 +161,11 @@ const { state: taskState, logs, start: startTask, markQueued, cancel: cancelTask
         result.value = normalizeScanSplitResult(payload.result);
         tuneResult.value = null;
       }
-      error.value = payload.error || "执行失败";
+      error.value = formatEngineError(payload);
+      // #27 取消时已生成的文件不删除，提示用户保留了多少个
+      if (payload.cancelled && (payload.result?.output_files?.length ?? 0) > 0) {
+        toast.info(`已取消，但保留了 ${payload.result.output_files.length} 个已生成的文件`);
+      }
       dialog.alert({ title: payload.cancelled ? "扫描任务已取消" : "扫描任务失败", message: error.value, kind: payload.cancelled ? "info" : "danger" });
     }
   },
@@ -357,7 +363,7 @@ async function loadReferencePreview() {
 
     previewError.value = "引擎未就绪，请稍后重试。";
   } catch (e: any) {
-    if (token === referencePreviewToken) previewError.value = e?.message || "无法预览参考文件";
+    if (token === referencePreviewToken) previewError.value = formatEngineError(e);
   } finally {
     if (token === referencePreviewToken) previewLoading.value = false;
   }
@@ -784,7 +790,7 @@ function validateRoiSelection() {
 }
 
 async function execute() {
-  if (submitting.value || taskState.value.running) {
+  if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
   }
@@ -812,14 +818,14 @@ async function execute() {
     });
     if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
-    error.value = e?.message || "提交失败";
+    error.value = formatEngineError(e);
     submitting.value = false;
     resetTask();
   }
 }
 
 async function runProbePage() {
-  if (submitting.value || taskState.value.running) {
+  if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
   }
@@ -846,14 +852,14 @@ async function runProbePage() {
     });
     if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
-    error.value = e?.message || "提交失败";
+    error.value = formatEngineError(e);
     submitting.value = false;
     resetTask();
   }
 }
 
 async function runScanOnly() {
-  if (submitting.value || taskState.value.running) {
+  if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
   }
@@ -880,7 +886,7 @@ async function runScanOnly() {
     });
     if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
-    error.value = e?.message || "提交失败";
+    error.value = formatEngineError(e);
     submitting.value = false;
     resetTask();
   }
@@ -969,7 +975,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  if (taskState.value.running) cancelTask();
+  if (taskCancellable.value) cancelTask();
   pdfPageCountToken++;
   referencePreviewToken++;
 });
@@ -994,7 +1000,7 @@ const isFeatureMode = computed(() => opts.value.detection_mode === "feature" || 
 const isRoiSupported = computed(() => ["qrcode", "stamp", "auto", "feature"].includes(opts.value.detection_mode));
 const qrcodeTextDisabled = computed(() => !isQrMode.value || opts.value.qrcode_no_decode);
 const needsReference = computed(() => opts.value.detection_mode === "feature");
-const canRun = computed(() => !!pdfPath.value && !taskState.value.running && !submitting.value);
+const canRun = computed(() => !!pdfPath.value && !taskBusy.value && !submitting.value);
 const detectionModeHintText = computed(() => {
   if (opts.value.detection_mode === "qrcode") return "适合用二维码作为分隔标记；可按二维码文字内容筛选。";
   if (opts.value.detection_mode === "stamp") return "适合用红章、盖章页作为分隔标记；不会使用二维码内容筛选。";
@@ -1116,11 +1122,11 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
 
         <fieldset class="group log-group glass-card section-card">
           <div class="log-group-inner">
-          <div v-if="taskState.running" class="progress" :class="{ indeterminate: !taskState.total }">
+          <div v-if="taskBusy" class="progress" :class="{ indeterminate: !taskState.total }">
             <div class="progress-bar" :style="{ width: taskState.total ? (taskState.current / taskState.total * 100) + '%' : undefined }" />
           </div>
-          <div v-if="taskState.running" class="progress-line">
-            {{ taskState.phase || "扫描中" }} · {{ taskState.current }}/{{ taskState.total }}
+          <div v-if="taskBusy" class="progress-line">
+            {{ taskState.phase || (taskState.queued ? "排队中" : "扫描中") }} · {{ taskState.current }}/{{ taskState.total }}
           </div>
           <div v-if="error" class="error-line">{{ error }}</div>
           <div v-else-if="tuneResult" class="summary-line ok">
@@ -1180,56 +1186,71 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
         <!-- ② 识别与参数 -->
         <fieldset class="group glass-card section-card params-group">
           <div class="params-scroll">
-            <div class="row wrap">
-              <label class="label-inline">识别方式：</label>
-              <AppSelect class="detection-select" v-model="opts.detection_mode" :options="detectionSelectOptions" min-width="260px" />
-              <input v-if="isQrMode" class="input flex-1 qr-text-input" v-model="opts.qrcode_text_contains" placeholder="二维码内容包含（可选）" :disabled="qrcodeTextDisabled" />
-              <div class="hint-line params-hint">{{ detectionModeHintText }}</div>
-            </div>
+            <!-- #7 分三段折叠：基础选项（默认展开） / 二维码选项（默认折叠） / 高级特征参数（默认折叠） -->
+            <details class="advanced-group params-section" open>
+              <summary>
+                <span>基础选项</span>
+                <span class="advanced-summary">{{ advancedSummaryText }}</span>
+              </summary>
+              <div class="row wrap mt-2">
+                <label class="label-inline">识别方式：</label>
+                <AppSelect class="detection-select" v-model="opts.detection_mode" :options="detectionSelectOptions" min-width="260px" />
+                <div class="hint-line params-hint">{{ detectionModeHintText }}</div>
+              </div>
 
-            <div class="row mt-2 wrap">
-              <template v-if="isQrMode">
-                <label class="checkbox" title="只判断有没有二维码，不读取二维码文字；速度更快，但内容筛选不会生效"><input type="checkbox" v-model="opts.qrcode_no_decode" />不解码内容</label>
-              </template>
-              <label class="checkbox" :title="roiOptionTitle"><input type="checkbox" v-model="opts.qrcode_use_roi" :disabled="!isRoiSupported" />框选区域(ROI)</label>
-              <label class="checkbox" title="找到标记页后，后面几页先不检查；适合连续多页都有标记的文件"><input type="checkbox" v-model="skipPagesEnabled" />命中后跳过</label>
-              <input class="input input-num input-num-compact" type="number" min="1" max="50" :disabled="!skipPagesEnabled" :value="opts.qrcode_skip_pages" @input="onSkipPagesInput" title="命中标记页后跳过的页数" />
-              <span class="text-muted">页</span>
-              <span v-if="isQrMode" class="params-sep">|</span>
-              <label v-if="isQrMode" class="label-inline" title="每页最多尝试检测的二维码数量">最多尝试：</label>
-              <input v-if="isQrMode" ref="maxAttemptsInputRef" class="input input-num" type="number" min="12" max="500" :value="opts.qrcode_max_attempts" @input="onMaxAttemptsInput" @blur="onMaxAttemptsBlur" title="每页最多尝试检测的二维码数量（有效范围 12-500）" />
-            </div>
+              <div class="row mt-2 wrap">
+                <label class="label-inline">扫描分辨率：</label>
+                <span class="label-inline">DPI</span>
+                <input ref="dpiInputRef" class="input input-num" type="number" min="72" max="300" @input="onDpiInput" @blur="onDpiBlur" title="页面渲染分辨率，值越高细节越清晰但速度越慢（有效范围 72-300）" />
+                <span class="hint-line compact-hint">{{ dpiHintText }}</span>
+              </div>
 
-            <div v-if="opts.qrcode_use_roi" class="hint-line params-hint" :class="opts.reference_roi ? '' : 'warn'">{{ roiStatusText }}</div>
+              <div class="row mt-2 wrap">
+                <label class="checkbox" title="找到标记页后，后面几页先不检查；适合连续多页都有标记的文件"><input type="checkbox" v-model="skipPagesEnabled" />命中后跳过</label>
+                <input class="input input-num input-num-compact" type="number" min="1" max="50" :disabled="!skipPagesEnabled" :value="opts.qrcode_skip_pages" @input="onSkipPagesInput" title="命中标记页后跳过的页数" />
+                <span class="text-muted">页</span>
+              </div>
 
-            <div class="row mt-2 wrap">
-              <label class="label-inline">扫描分辨率：</label>
-              <span class="label-inline">DPI</span>
-              <input ref="dpiInputRef" class="input input-num" type="number" min="72" max="300" @input="onDpiInput" @blur="onDpiBlur" title="页面渲染分辨率，值越高细节越清晰但速度越慢（有效范围 72-300）" />
-              <span class="hint-line compact-hint">{{ dpiHintText }}</span>
-            </div>
+              <div class="params-divider mt-3"><span>输出行为</span></div>
+              <div class="row wrap">
+                <label class="label-inline">标记页：</label>
+                <label class="checkbox" title="标记页会放到下一份 PDF 的第一页"><input type="radio" value="first" v-model="markerPageMode" />放到下一份开头</label>
+                <label class="checkbox" title="标记页会放到上一份 PDF 的最后一页"><input type="radio" value="previous" v-model="markerPageMode" />放到上一份末尾</label>
+                <label class="checkbox" title="标记页只用来分隔，不写入输出 PDF"><input type="radio" value="exclude" v-model="markerPageMode" />不保存标记页</label>
+              </div>
+              <div class="row mt-2 wrap">
+                <label class="checkbox" title="限制每份输出 PDF 的最大页数，用来发现可能漏掉的标记页"><input type="checkbox" v-model="useMaxSegment" />每份最多</label>
+                <input class="input input-num input-num-compact" type="number" min="1" max="10000" :disabled="!useMaxSegment" :value="opts.max_segment_pages" @input="opts.max_segment_pages = Math.min(10000, Math.max(1, positiveInt(Number(($event.target as HTMLInputElement).value))))" title="单份PDF允许的最大页数，包含标记页" />
+                <span class="text-muted">页</span>
+                <span class="params-sep">|</span>
+                <label class="checkbox" title="启用 OpenCV 内部多线程；提速取决于图像处理负载"><input type="checkbox" v-model="opts.enable_multithread" />OpenCV 多线程</label>
+                <label class="checkbox" title="尝试启用 OpenCV OpenCL 优化；仅部分环境和大图场景可能提速，不可用时自动回退 CPU"><input type="checkbox" v-model="opts.enable_gpu" />OpenCL 加速</label>
+              </div>
+            </details>
 
-            <div class="params-divider mt-3"><span>输出行为</span></div>
-            <div class="row wrap">
-              <label class="label-inline">标记页：</label>
-              <label class="checkbox" title="标记页会放到下一份 PDF 的第一页"><input type="radio" value="first" v-model="markerPageMode" />放到下一份开头</label>
-              <label class="checkbox" title="标记页会放到上一份 PDF 的最后一页"><input type="radio" value="previous" v-model="markerPageMode" />放到上一份末尾</label>
-              <label class="checkbox" title="标记页只用来分隔，不写入输出 PDF"><input type="radio" value="exclude" v-model="markerPageMode" />不保存标记页</label>
-            </div>
-            <div class="row mt-2 wrap">
-              <label class="checkbox" title="限制每份输出 PDF 的最大页数，用来发现可能漏掉的标记页"><input type="checkbox" v-model="useMaxSegment" />每份最多</label>
-              <input class="input input-num input-num-compact" type="number" min="1" max="10000" :disabled="!useMaxSegment" :value="opts.max_segment_pages" @input="opts.max_segment_pages = Math.min(10000, Math.max(1, positiveInt(Number(($event.target as HTMLInputElement).value))))" title="单份PDF允许的最大页数，包含标记页" />
-              <span class="text-muted">页</span>
-              <span class="params-sep">|</span>
-              <label class="checkbox" title="启用 OpenCV 内部多线程；提速取决于图像处理负载"><input type="checkbox" v-model="opts.enable_multithread" />OpenCV 多线程</label>
-              <label class="checkbox" title="尝试启用 OpenCV OpenCL 优化；仅部分环境和大图场景可能提速，不可用时自动回退 CPU"><input type="checkbox" v-model="opts.enable_gpu" />OpenCL 加速</label>
-            </div>
-
-            <div class="params-divider mt-3"><span>高级识别参数</span></div>
+            <details class="advanced-group params-section mt-2">
+              <summary>
+                <span>二维码选项</span>
+                <span class="advanced-summary">{{ isQrMode ? '已启用' : '当前模式不使用二维码' }}</span>
+              </summary>
+              <div class="row wrap mt-2">
+                <input v-if="isQrMode" class="input flex-1 qr-text-input" v-model="opts.qrcode_text_contains" placeholder="二维码内容包含（可选）" :disabled="qrcodeTextDisabled" />
+              </div>
+              <div class="row mt-2 wrap">
+                <template v-if="isQrMode">
+                  <label class="checkbox" title="只判断有没有二维码，不读取二维码文字；速度更快，但内容筛选不会生效"><input type="checkbox" v-model="opts.qrcode_no_decode" />不解码内容</label>
+                </template>
+                <label class="checkbox" :title="roiOptionTitle"><input type="checkbox" v-model="opts.qrcode_use_roi" :disabled="!isRoiSupported" />框选区域(ROI)</label>
+                <span v-if="isQrMode" class="params-sep">|</span>
+                <label v-if="isQrMode" class="label-inline" title="每页最多尝试检测的二维码数量">最多尝试：</label>
+                <input v-if="isQrMode" ref="maxAttemptsInputRef" class="input input-num" type="number" min="12" max="500" :value="opts.qrcode_max_attempts" @input="onMaxAttemptsInput" @blur="onMaxAttemptsBlur" title="每页最多尝试检测的二维码数量（有效范围 12-500）" />
+              </div>
+              <div v-if="opts.qrcode_use_roi" class="hint-line params-hint" :class="opts.reference_roi ? '' : 'warn'">{{ roiStatusText }}</div>
+            </details>
 
           <details class="advanced-group mt-2" :open="advancedOpen" @toggle="advancedOpen = ($event.target as HTMLDetailsElement).open">
             <summary>
-              <span>特征点参数</span>
+              <span>高级特征参数</span>
               <span class="advanced-summary">{{ advancedSummaryText }}</span>
             </summary>
             <p class="advanced-hint">默认参数适合多数扫描件。仅在误检、漏检或速度不理想时调整这些阈值。</p>
@@ -1264,8 +1285,16 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
         </fieldset>
 
         <div class="row scan-actions action-footer">
-          <button class="btn btn-primary btn-lg flex-1" :disabled="!canRun" @click="execute">开始扫描拆分</button>
-          <button class="btn btn-secondary btn-lg" :disabled="!taskState.running" @click="cancelTask">停止</button>
+          <button
+            class="btn btn-primary btn-lg flex-1"
+            :disabled="!canRun"
+            :aria-busy="taskBusy"
+            @click="execute"
+          >
+            <span v-if="taskBusy" class="btn-spinner" aria-hidden="true" />
+            {{ taskBusy ? (taskState.queued ? "排队中…" : "执行中…") : "开始扫描拆分" }}
+          </button>
+          <button class="btn btn-secondary btn-lg" :disabled="!taskCancellable" @click="cancelTask">停止</button>
         </div>
 
       </section>
@@ -1472,7 +1501,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
 .roi-box {
   position: absolute;
   border: 2px solid var(--color-primary);
-  background: rgba(35, 115, 245, 0.16);
+  background: rgba(35, 99, 245, 0.16);
   box-shadow: 0 0 0 9999px rgba(17, 24, 39, 0.12);
   pointer-events: none;
 }
@@ -1607,6 +1636,21 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   min-width: 100px;
   flex-shrink: 0;
 }
+/* #11 执行按钮 spinner */
+.btn-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: scanspin 0.6s linear infinite;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+@keyframes scanspin {
+  to { transform: rotate(360deg); }
+}
 
 .row {
   display: flex;
@@ -1715,6 +1759,8 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   min-width: 0;
   overflow: hidden;
 }
+/* #7 参数区分段折叠容器：默认 details/summary 样式已由 .advanced-group 提供，
+   这里仅补充间距，让折叠组之间有空隙 */
 .advanced-group summary {
   display: flex;
   align-items: center;

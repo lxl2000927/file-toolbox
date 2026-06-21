@@ -134,7 +134,7 @@ import { positiveInt } from "../../../utils";
   padding-left: 8px;
 }
 .uniform-grid {
-  grid-template-columns: 1fr 22px;
+  grid-template-columns: 1fr;
 }
 .rule-grid.four-col {
   grid-template-columns: 70px 1fr 70px 1fr;

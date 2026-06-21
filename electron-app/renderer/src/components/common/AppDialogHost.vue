@@ -1,6 +1,18 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
 import { dialogState, resolveDialog } from "../../composables/useAppDialog";
+import AppIcon from "./AppIcon.vue";
+
+const overlayRef = ref<HTMLDivElement | null>(null);
+const confirmBtnRef = ref<HTMLButtonElement | null>(null);
+
+const dialogIconName = computed<"info" | "success" | "warning">(() => {
+  if (dialogState.kind === "success") return "success";
+  if (dialogState.kind === "danger" || dialogState.kind === "warning") return "warning";
+  return "info";
+});
+
+const titleId = "app-dialog-title";
 
 const parsedMessage = computed(() => {
   const lines = String(dialogState.message || "")
@@ -19,18 +31,90 @@ const parsedMessage = computed(() => {
   }
   return { intro, details };
 });
+
+let previouslyFocused: HTMLElement | null = null;
+
+function getFocusable(): HTMLElement[] {
+  const root = overlayRef.value;
+  if (!root) return [];
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+}
+
+function rootContains(el: HTMLElement | null): boolean {
+  if (!el) return false;
+  return overlayRef.value?.contains(el) ?? false;
+}
+
+function onKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    resolveDialog(false);
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusables = getFocusable();
+  if (!focusables.length) return;
+  const first = focusables[0];
+  const last = focusables[focusables.length - 1];
+  const active = document.activeElement as HTMLElement | null;
+  if (event.shiftKey) {
+    if (active === first || !rootContains(active)) {
+      event.preventDefault();
+      last?.focus();
+    }
+  } else {
+    if (active === last || !rootContains(active)) {
+      event.preventDefault();
+      first?.focus();
+    }
+  }
+}
+
+watch(
+  () => dialogState.open,
+  async (open) => {
+    if (open) {
+      previouslyFocused = document.activeElement as HTMLElement | null;
+      await nextTick();
+      confirmBtnRef.value?.focus();
+    } else {
+      const restore = previouslyFocused;
+      previouslyFocused = null;
+      await nextTick();
+      restore?.focus?.();
+    }
+  },
+);
+
+onBeforeUnmount(() => {
+  previouslyFocused = null;
+});
 </script>
 
 <template>
   <Teleport to="body">
     <Transition name="dialog-fade">
-      <div v-if="dialogState.open" class="dialog-backdrop" @click.self="resolveDialog(false)" @keydown.esc="resolveDialog(false)" tabindex="-1">
+      <div
+        v-if="dialogState.open"
+        ref="overlayRef"
+        class="dialog-overlay"
+        role="dialog"
+        aria-modal="true"
+        :aria-labelledby="titleId"
+        tabindex="-1"
+        @keydown="onKeydown"
+      >
+        <div class="dialog-backdrop" @click="resolveDialog(false)" />
         <div class="dialog-card glass-card" :class="`dialog-${dialogState.kind}`">
           <div class="dialog-icon">
-            {{ dialogState.kind === 'success' ? '✓' : dialogState.kind === 'danger' ? '!' : dialogState.kind === 'warning' ? '!' : 'i' }}
+            <AppIcon :name="dialogIconName" :size="20" />
           </div>
           <div class="dialog-content">
-            <h3>{{ dialogState.title }}</h3>
+            <h3 :id="titleId">{{ dialogState.title }}</h3>
             <div class="dialog-message">
               <p v-for="line in parsedMessage.intro" :key="line" class="dialog-message-line">{{ line }}</p>
               <div v-if="parsedMessage.details.length" class="dialog-details">
@@ -42,7 +126,12 @@ const parsedMessage = computed(() => {
             </div>
             <div class="dialog-actions">
               <button v-if="dialogState.showCancel" class="btn btn-outline" @click="resolveDialog(false)">{{ dialogState.cancelText }}</button>
-              <button class="btn" :class="dialogState.kind === 'danger' ? 'btn-danger' : dialogState.kind === 'success' ? 'btn-success' : 'btn-primary'" @click="resolveDialog(true)">{{ dialogState.confirmText }}</button>
+              <button
+                ref="confirmBtnRef"
+                class="btn"
+                :class="dialogState.kind === 'danger' ? 'btn-danger' : dialogState.kind === 'success' ? 'btn-success' : 'btn-primary'"
+                @click="resolveDialog(true)"
+              >{{ dialogState.confirmText }}</button>
             </div>
           </div>
         </div>
@@ -52,7 +141,7 @@ const parsedMessage = computed(() => {
 </template>
 
 <style scoped>
-.dialog-backdrop {
+.dialog-overlay {
   position: fixed;
   inset: 0;
   z-index: 2000;
@@ -60,11 +149,17 @@ const parsedMessage = computed(() => {
   align-items: center;
   justify-content: center;
   padding: 24px;
+}
+.dialog-backdrop {
+  position: absolute;
+  inset: 0;
   background: rgba(15, 23, 42, 0.38);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
+  transition: opacity 0.2s ease;
 }
 .dialog-card {
+  position: relative;
   width: min(460px, calc(100vw - 48px));
   display: grid;
   grid-template-columns: 44px 1fr;
@@ -72,6 +167,7 @@ const parsedMessage = computed(() => {
   padding: 20px;
   border-radius: var(--radius-xl);
   box-shadow: 0 24px 80px rgba(15, 23, 42, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
 }
 .dialog-icon {
   display: flex;
@@ -80,7 +176,6 @@ const parsedMessage = computed(() => {
   width: 38px;
   height: 38px;
   border-radius: 999px;
-  font-weight: 800;
   background: var(--color-primary-bg);
   color: var(--color-primary);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.72);
@@ -137,8 +232,11 @@ const parsedMessage = computed(() => {
   gap: 10px;
   margin-top: 20px;
 }
-.dialog-fade-enter-active,
-.dialog-fade-leave-active { transition: opacity var(--transition-fast); }
-.dialog-fade-enter-from,
-.dialog-fade-leave-to { opacity: 0; }
+.dialog-fade-enter-from .dialog-backdrop,
+.dialog-fade-leave-to .dialog-backdrop { opacity: 0; }
+.dialog-fade-enter-from .dialog-card,
+.dialog-fade-leave-to .dialog-card {
+  opacity: 0;
+  transform: scale(0.96) translateY(8px);
+}
 </style>

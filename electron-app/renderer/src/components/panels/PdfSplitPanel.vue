@@ -4,7 +4,7 @@ import type { PdfSplitConfig, PdfSplitPlan, ExecuteSummary } from "../../env";
 import { useEngineTask, generateTaskId } from "../../composables/useEngineTask";
 import { useToast } from "../../composables/useToast";
 import { useAppDialog } from "../../composables/useAppDialog";
-import { positiveInt } from "../../utils";
+import { positiveInt, formatEngineError } from "../../utils";
 import AppSelect from "../common/AppSelect.vue";
 import AppIcon from "../common/AppIcon.vue";
 
@@ -31,10 +31,26 @@ const previewTextLines = ref<string[]>([]);
 const previewSignature = ref("");
 const previewing = ref(false);
 let previewToken = 0;
+const previewTimer = ref<number | null>(null);
+const composing = ref(false);
 
 onBeforeUnmount(() => {
   previewToken++;
+  if (previewTimer.value !== null) {
+    window.clearTimeout(previewTimer.value);
+    previewTimer.value = null;
+  }
 });
+
+function schedulePreview() {
+  // IME 组字期不触发预览，避免反复 IPC
+  if (composing.value) return;
+  if (previewTimer.value !== null) window.clearTimeout(previewTimer.value);
+  previewTimer.value = window.setTimeout(() => {
+    previewTimer.value = null;
+    refreshPreview();
+  }, 220);
+}
 const summary = ref<ExecuteSummary | null>(null);
 const error = ref("");
 const dragOver = ref(false);
@@ -54,24 +70,41 @@ const sizeUnitOptions = [
 
 const fileBasename = (p: string) => p.split(/[\\/]/).pop() || p;
 
-const { state: taskState, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
+function collectOutputFiles(result: any): string[] {
+  const files = Array.isArray(result?.output_files) ? result.output_files : [];
+  const nested = Array.isArray(result?.operations)
+    ? result.operations.flatMap((operation: any) => Array.isArray(operation?.output_files) ? operation.output_files : [])
+    : [];
+  return Array.from(new Set([...files, ...nested].filter(Boolean).map(String)));
+}
+
+const { state: taskState, busy: taskBusy, cancellable: taskCancellable, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
   onComplete: (payload) => {
+    const outputFiles = collectOutputFiles(payload.result);
     if (payload.ok) {
       summary.value = payload.result as ExecuteSummary;
       error.value = "";
       const s = summary.value;
       if (s) toast.success(`拆分完成：成功 ${s.successful} / ${s.total}，失败 ${s.failed}`);
+      // #27 取消时已生成的文件不删除，提示用户保留了多少个
+      if (payload.cancelled && outputFiles.length > 0) {
+        toast.info(`已取消，但保留了 ${outputFiles.length} 个已生成的文件`);
+      }
     } else {
-      error.value = payload.error || "执行失败";
+      error.value = formatEngineError(payload);
       toast.error(error.value);
+      // #27 即便失败/取消，也可能有部分输出文件
+      if (payload.cancelled && outputFiles.length > 0) {
+        toast.info(`已取消，但保留了 ${outputFiles.length} 个已生成的文件`);
+      }
     }
   },
 });
 
 const activeFile = computed(() => files.value[activeIndex.value]);
 const validCount = computed(() => files.value.filter((f) => f.valid).length);
-const canPreview = computed(() => validCount.value > 0 && !previewing.value && !taskState.value.running);
-const canRun = computed(() => validCount.value > 0 && !previewing.value && !taskState.value.running);
+const canPreview = computed(() => validCount.value > 0 && !previewing.value && !taskBusy.value);
+const canRun = computed(() => validCount.value > 0 && !previewing.value && !taskBusy.value);
 const isCancelledSummary = computed(() => Boolean(summary.value?.errors?.some((msg: string) => String(msg).includes("已取消"))));
 
 const hasPreview = computed(() => previewPlans.value.length > 0 || previewTextLines.value.length > 0);
@@ -124,6 +157,10 @@ const previewLines = computed(() => {
     const dir = plan.output_dir || "";
     lines.push(`${base}  (${pageCount})`);
     if (dir) lines.push(`  输出目录: ${dir}`);
+    // #26 valid 时如果 message 非 OK 也追加提示（如 size_warning）
+    if (plan.valid && plan.message && plan.message !== "OK") {
+      lines.push(`  ℹ️ ${plan.message}`);
+    }
     for (const o of plan.outputs) {
       const range = o.page_range ? ` (${o.page_range[0]}-${o.page_range[1]})` : "";
       lines.push(`  - ${o.filename}${range}`);
@@ -187,16 +224,21 @@ async function pickFiles() {
 }
 
 async function appendFiles(paths: string[]) {
+  const engine = window.engine;
+  if (!engine) {
+    error.value = "引擎未就绪，无法校验 PDF 文件";
+    return;
+  }
   const exists = new Set(files.value.map((f) => f.path));
   const newPaths = paths.filter((p) => !exists.has(p) && /\.pdf$/i.test(p));
   if (!newPaths.length) return;
   const validations: FileItem[] = await Promise.all(
     newPaths.map(async (p) => {
       try {
-        const r = await window.engine!.pdfSplit.validate(p);
+        const r = await engine.pdfSplit.validate(p);
         return { path: p, pageCount: r.page_count, valid: r.valid, message: r.message };
       } catch (e: any) {
-        return { path: p, pageCount: null, valid: false, message: e?.message || "校验失败" };
+        return { path: p, pageCount: null, valid: false, message: formatEngineError(e) };
       }
     }),
   );
@@ -267,7 +309,7 @@ async function refreshPreview() {
       previewPlans.value = [];
       previewTextLines.value = [];
       previewSignature.value = "";
-      error.value = e?.message || "预览失败";
+      error.value = formatEngineError(e);
     }
   } finally {
     if (token === previewToken) previewing.value = false;
@@ -314,7 +356,7 @@ async function executeSplit() {
     const res = await window.engine.pdfSplit.executeAsync(paths, normalizedConfig(), taskId);
     if (res?.queued) markQueued(res.position || 1);
   } catch (e: any) {
-    error.value = e?.message || "提交任务失败";
+    error.value = formatEngineError(e);
     resetTask();
   }
 }
@@ -386,13 +428,16 @@ async function onDrop(e: DragEvent) {
       <section class="right-col">
         <!-- 拆分模式 -->
         <fieldset class="group glass-card section-card">
-          <div class="segment-group segmented-control">
+          <div
+            class="segment-group segmented-control segmented-animated"
+            :style="{ '--active-index': Math.max(0, splitModeOptions.findIndex((opt) => opt.value === config.mode)), '--segment-count': splitModeOptions.length }"
+          >
             <button
               v-for="opt in splitModeOptions"
               :key="opt.value"
               class="segment-btn segmented-item"
               :class="{ active: config.mode === opt.value }"
-              @click="config.mode = opt.value as any; refreshPreview()"
+              @click="config.mode = opt.value as any; schedulePreview()"
             >{{ opt.label }}</button>
           </div>
 
@@ -403,7 +448,9 @@ async function onDrop(e: DragEvent) {
               type="number"
               min="1"
               :value="config.page_count ?? 1"
-              @input="config.page_count = positiveInt(($event.target as HTMLInputElement).value); refreshPreview()"
+              @input="config.page_count = positiveInt(($event.target as HTMLInputElement).value); schedulePreview()"
+              @compositionstart="composing = true"
+              @compositionend="composing = false; schedulePreview()"
             />
           </div>
           <div v-else-if="config.mode === 'by_page_range'" class="form-row-layout mt-3">
@@ -412,7 +459,9 @@ async function onDrop(e: DragEvent) {
               class="input"
               placeholder="如：1-3, 5, 10-12"
               :value="config.page_ranges ?? ''"
-              @input="config.page_ranges = ($event.target as HTMLInputElement).value; refreshPreview()"
+              @input="config.page_ranges = ($event.target as HTMLInputElement).value; schedulePreview()"
+              @compositionstart="composing = true"
+              @compositionend="composing = false; schedulePreview()"
             />
           </div>
           <div v-else-if="config.mode === 'by_file_size'" class="form-row-layout mt-3">
@@ -424,14 +473,16 @@ async function onDrop(e: DragEvent) {
               min="0.1"
               step="0.1"
                 :value="config.max_size ?? 10"
-                @input="config.max_size = positiveNumber(($event.target as HTMLInputElement).value, 10); refreshPreview()"
+                @input="config.max_size = positiveNumber(($event.target as HTMLInputElement).value, 10); schedulePreview()"
+                @compositionstart="composing = true"
+                @compositionend="composing = false; schedulePreview()"
               />
               <AppSelect
                 class="unit-select"
                 :model-value="config.size_unit ?? 'MB'"
                 :options="sizeUnitOptions"
                 min-width="72px"
-                @update:model-value="config.size_unit = $event as 'MB' | 'KB'; refreshPreview()"
+                @update:model-value="config.size_unit = $event as 'MB' | 'KB'; schedulePreview()"
               />
             </div>
           </div>
@@ -442,7 +493,9 @@ async function onDrop(e: DragEvent) {
               type="number"
               min="1"
               :value="config.bookmark_level ?? 1"
-              @input="config.bookmark_level = positiveInt(($event.target as HTMLInputElement).value); refreshPreview()"
+              @input="config.bookmark_level = positiveInt(($event.target as HTMLInputElement).value); schedulePreview()"
+              @compositionstart="composing = true"
+              @compositionend="composing = false; schedulePreview()"
             />
           </div>
         </fieldset>
@@ -468,13 +521,15 @@ async function onDrop(e: DragEvent) {
             <button
               class="btn btn-primary btn-block"
               :disabled="!canPreview"
+              :aria-busy="previewing"
               @click="refreshPreview"
             >
+              <span v-if="previewing" class="btn-spinner" aria-hidden="true" />
               {{ previewing ? "预览中…" : "预览拆分结果" }}
             </button>
             <button
               class="btn btn-outline"
-              :disabled="!previewLines.length || previewStale || previewing || taskState.running"
+              :disabled="!previewLines.length || previewStale || previewing || taskBusy"
               @click="copyPreview"
             >复制预览</button>
           </div>
@@ -486,11 +541,11 @@ async function onDrop(e: DragEvent) {
             当前预览基于旧设置，请重新生成后再复制或核对输出文件名。
           </div>
 
-          <div v-if="taskState.running" class="progress mt-3" :class="{ indeterminate: !taskState.total }">
+          <div v-if="taskBusy" class="progress mt-3" :class="{ indeterminate: !taskState.total }">
             <div class="progress-bar" :style="{ width: taskState.total ? (taskState.current / taskState.total * 100) + '%' : undefined }" />
           </div>
-          <div v-if="taskState.running" class="progress-text">
-            {{ taskState.phase || "处理中" }} · {{ taskState.current }}/{{ taskState.total }}
+          <div v-if="taskBusy" class="progress-text">
+            {{ taskState.phase || (taskState.queued ? "排队中" : "处理中") }} · {{ taskState.current }}/{{ taskState.total }}
             <span v-if="taskState.file"> · {{ taskState.file }}</span>
           </div>
           <div v-if="error" class="error-line">{{ error }}</div>
@@ -503,14 +558,15 @@ async function onDrop(e: DragEvent) {
           </div>
 
           <div class="preview-box mt-3" :class="{ empty: !previewLines.length, stale: previewStale }">
-            <div v-if="!previewLines.length" class="preview-placeholder">
-              点击「预览拆分结果」生成预览
+            <div v-if="!previewLines.length" class="empty-state preview-empty-state">
+              <div class="empty-title">尚未生成预览</div>
+              <div class="empty-hint">点击「预览拆分结果」查看输出计划</div>
             </div>
             <pre v-else class="preview-text selectable">{{ previewLines.join("\n") }}</pre>
           </div>
 
           <button
-            v-if="taskState.running"
+            v-if="taskCancellable"
             class="btn btn-danger btn-lg btn-block mt-3"
             @click="cancelTask"
           >取消</button>
@@ -614,9 +670,9 @@ async function onDrop(e: DragEvent) {
 }
 .preview-box.empty {
   display: flex;
-  align-items: flex-start;
-  justify-content: flex-start;
-  background: var(--color-gray-50);
+  align-items: center;
+  justify-content: center;
+  background: rgba(248, 250, 252, 0.56);
 }
 .preview-box.stale {
   border-color: rgba(217, 119, 6, 0.35);
@@ -625,6 +681,43 @@ async function onDrop(e: DragEvent) {
 .preview-placeholder {
   color: var(--color-gray-400);
   font-size: var(--font-md);
+}
+/* #16 预览框空状态 */
+.preview-empty-state {
+  width: min(100%, 280px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 18px 16px;
+  color: var(--color-gray-500);
+  text-align: center;
+}
+.preview-empty-state .empty-title {
+  font-size: var(--font-md);
+  font-weight: 600;
+  color: var(--color-gray-700);
+}
+.preview-empty-state .empty-hint {
+  font-size: var(--font-sm);
+  line-height: 1.6;
+  color: var(--color-gray-500);
+}
+/* #11 按钮 spinner */
+.btn-spinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pdfspin 0.6s linear infinite;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+@keyframes pdfspin {
+  to { transform: rotate(360deg); }
 }
 .preview-status {
   display: inline-flex;

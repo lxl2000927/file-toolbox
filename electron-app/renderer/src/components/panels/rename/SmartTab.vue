@@ -31,7 +31,7 @@ function patch(p: Partial<RenameRule>) {
 </script>
 
 <template>
-  <fieldset class="rules-group">
+  <fieldset class="rules-group rename-tab-rules">
     <legend>智能识别</legend>
     <p class="text-muted text-sm">从文件内容中提取信息作为新文件名（PDF / 文本）。</p>
     <div class="grid">
@@ -54,29 +54,5 @@ function patch(p: Partial<RenameRule>) {
 </template>
 
 <style scoped>
-.rules-group {
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  padding: 10px 12px 14px;
-  background: var(--color-white);
-}
-.rules-group legend {
-  padding: 0 6px;
-  font-weight: 600;
-  color: var(--color-gray-800);
-  font-size: var(--font-md);
-}
-.grid {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  align-items: center;
-  gap: 10px;
-  margin-top: 6px;
-}
-.label-inline {
-  font-size: var(--font-md);
-  color: var(--color-gray-700);
-  font-weight: 500;
-}
 .text-sm { font-size: var(--font-sm); margin-bottom: 6px; }
 </style>

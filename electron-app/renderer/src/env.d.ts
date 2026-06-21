@@ -111,6 +111,18 @@ export type TaskNotification =
       params: { task_id: string; message: string };
     }
   | {
+      method: "task.queued";
+      params: { task_id: string; queued: boolean; position?: number; message?: string };
+    }
+  | {
+      method: "task.warning";
+      params: { task_id?: string; message: string; remaining_queued?: number };
+    }
+  | {
+      method: "engine.status";
+      params: { status: "starting" | "ready" | "error"; error?: string };
+    }
+  | {
       method: "task.complete";
       params:
         | { task_id: string; ok: true; result: any; task_type?: string; elapsed_ms?: number; cancelled?: boolean }
@@ -138,7 +150,6 @@ export interface EngineAPI {
     }>;
     preview: (pdfPath: string, config: PdfSplitConfig) => Promise<PdfSplitPlan>;
     previewMany: (pdfPaths: string[], config: PdfSplitConfig) => Promise<PdfSplitPreviewMany>;
-    execute: (pdfPaths: string[], config: PdfSplitConfig) => Promise<ExecuteSummary>;
     executeAsync: (
       pdfPaths: string[],
       config: PdfSplitConfig,

@@ -21,6 +21,14 @@ _RE_VALIDATE_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 _RESERVED_NAMES = {"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
 
 
+def _safe_int(value, default: int) -> int:
+    """[Bug#4 Fix] 防御前端传入字符串数值（如 "3"），统一转 int；转换失败回退默认值。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class RenameOperation(Enum):
     INSERT_TEXT = "insert_text"
     INSERT_NUMBER = "insert_number"
@@ -74,7 +82,7 @@ class RenameRule:
         elif position == "后缀":
             name = name + text
         elif position == "指定位置":
-            index = self.config.get("index", 1) - 1
+            index = _safe_int(self.config.get("index", 1), 1) - 1  # [Bug#4 Fix]
             index = max(0, min(index, len(name)))
             name = name[:index] + text + name[index:]
         
@@ -82,9 +90,11 @@ class RenameRule:
     
     def _apply_insert_number(self, name: str, ext: str, file_index: int) -> str:
         prefix = self.config.get("prefix", "")
-        start = self.config.get("start", 1)
-        step = self.config.get("step", 1)
-        digits = self.config.get("digits", 3)
+        start = _safe_int(self.config.get("start", 1), 1)    # [Bug#4 Fix]
+        step = _safe_int(self.config.get("step", 1), 1)      # [Bug#4 Fix]
+        digits = _safe_int(self.config.get("digits", 3), 3)  # [Bug#4 Fix]
+        if digits < 1:
+            digits = 1
         position = self.config.get("position", "后缀")
         
         number = start + file_index * step
@@ -106,10 +116,11 @@ class RenameRule:
             chars = self.config.get("chars", "")
             name = name.replace(chars, "")
         elif delete_type == "删除前N个字符":
-            count = self.config.get("count", 1)
-            name = name[count:]
+            count = _safe_int(self.config.get("count", 1), 1)  # [Bug#4 Fix]
+            if count > 0:
+                name = name[count:]
         elif delete_type == "删除后N个字符":
-            count = self.config.get("count", 1)
+            count = _safe_int(self.config.get("count", 1), 1)  # [Bug#4 Fix]
             if count <= 0:
                 pass  # Bug fix: count=0 causes name[:-0]="" in Python
             else:
@@ -175,9 +186,9 @@ class RenameRule:
 
     def _extract_title_from_pdf(self, filepath: str) -> str:
         try:
-            import PyPDF2
+            import pypdf
             with open(filepath, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = pypdf.PdfReader(f)
                 meta = getattr(reader, "metadata", None)
                 if meta and getattr(meta, "title", None):
                     title = str(meta.title).strip()
@@ -189,9 +200,9 @@ class RenameRule:
 
     def _extract_invoice_info_from_pdf(self, filepath: str) -> str:
         try:
-            import PyPDF2
+            import pypdf
             with open(filepath, "rb") as f:
-                reader = PyPDF2.PdfReader(f)
+                reader = pypdf.PdfReader(f)
                 if not reader.pages:
                     return ""
                 text = reader.pages[0].extract_text() or ""
@@ -231,7 +242,7 @@ class RenameRule:
     def _apply_smart_recognize(self, name: str, ext: str, file_index: int, filepath: Optional[str]) -> str:
         mode = self.config.get("mode", "content_title")
         position = self.config.get("position", "覆盖原名")
-        index = int(self.config.get("index", 1) or 1)
+        index = _safe_int(self.config.get("index", 1) or 1, 1)
 
         recognized = ""
         try:
@@ -291,7 +302,11 @@ class RenameRule:
 
         start = int(m.group(1))
         end = int(m.group(2)) if m.group(2) else start
-        if start <= 0 or end <= 0:
+        # [Bug #31] start<=0 时自动从 1 开始（用户输入 "0-5" 视为 "1-5"）；
+        # end<=0 时返回原名是合理的（保留 0 个字符）。
+        if start <= 0:
+            start = 1
+        if end <= 0:
             return name + ext
         if start > end:
             start, end = end, start

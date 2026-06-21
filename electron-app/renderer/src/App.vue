@@ -56,7 +56,8 @@ async function probeEngine() {
     await window.engine.ping();
     engineStatus.value = "ready";
   } catch {
-    engineStatus.value = "connecting";
+    // ping 失败说明引擎不可用，不应继续显示 connecting 误导用户
+    engineStatus.value = "error";
   }
 }
 

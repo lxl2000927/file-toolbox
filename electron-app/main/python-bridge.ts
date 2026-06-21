@@ -24,6 +24,8 @@ export class PythonBridge {
   private _starting = false;
   private _startTimer: ReturnType<typeof setTimeout> | null = null;
   private exitHandlers = new Set<ExitHandler>();
+  private authToken = "";
+  private _shuttingDown = false;
 
   private rejectPending(err: Error): void {
     this.pending.forEach(({ reject }) => reject(err));
@@ -35,6 +37,8 @@ export class PythonBridge {
   }
 
   private notifyExit(err: Error): void {
+    // 主动 shutdown 时跳过 exit handler，避免向渲染进程发送 engine.status: error
+    if (this._shuttingDown) return;
     this.exitHandlers.forEach((handler) => {
       try {
         handler(err);
@@ -48,7 +52,10 @@ export class PythonBridge {
     enginePath: string,
     isDev = false,
     pythonExe = "python",
+    authToken = "",
   ): Promise<void> {
+    // 优先使用传入的 token，其次读取环境变量，最后为空（server.py 端会跳过空 token 检查）
+    this.authToken = authToken || process.env.FILE_TOOLBOX_ENGINE_TOKEN || "";
     if (this._starting) throw new Error("PythonBridge 启动中，禁止重复调用");
     if (this.process) throw new Error("PythonBridge 已启动，禁止重复启动");
     this._starting = true;
@@ -61,6 +68,7 @@ export class PythonBridge {
       this.process = spawn(command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
+        env: { ...process.env, FILE_TOOLBOX_ENGINE_TOKEN: authToken },
       });
 
       const rl = createInterface({ input: this.process.stdout! });
@@ -127,7 +135,7 @@ export class PythonBridge {
     });
   }
 
-  async call(method: string, params: any = {}): Promise<any> {
+  async call(method: string, params: any = {}, timeout?: number): Promise<any> {
     if (!this.process) throw new Error("PythonBridge 未启动");
     if (!this.process.stdin || this.process.killed) throw new Error("PythonBridge 不可用");
     const id = ++this.reqId;
@@ -135,22 +143,31 @@ export class PythonBridge {
     const safeParams = JSON.parse(JSON.stringify(params, (k, v) =>
       typeof v === "number" && !Number.isFinite(v) ? null : v
     ));
-    const request = JSON.stringify({ jsonrpc: "2.0", id, method, params: safeParams });
+    const request = JSON.stringify({ jsonrpc: "2.0", id, method, params: safeParams, auth: this.authToken });
+    // 默认 120s；已知同步长操作（rename.execute）延长到 300s
+    // [Bug#3 Fix] 移除已下线的 pdf_split.execute（P0#4 改为 execute_async，异步立即返回）
+    const LONG_RUN_METHODS = new Set(["rename.execute"]);
+    const timeoutMs = timeout ?? (LONG_RUN_METHODS.has(method) ? 300000 : 120000);
     return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id);
-          reject(new Error(`请求超时: ${method} (60s)`));
+          // 超时后尝试通知 Python 取消任务（若有 task_id），失败忽略
+          const taskId = (params as any)?.task_id;
+          if (taskId) {
+            this.call("task.cancel", { task_id: taskId }).catch(() => {});
+          }
+          reject(new Error(`请求超时: ${method} (${timeoutMs / 1000}s)`));
         }
-      }, 60000);
+      }, timeoutMs);
       this.pending.set(id, {
-        resolve: (value) => { clearTimeout(timeout); resolve(value); },
-        reject: (err) => { clearTimeout(timeout); reject(err); },
+        resolve: (value) => { clearTimeout(timer); resolve(value); },
+        reject: (err) => { clearTimeout(timer); reject(err); },
       });
       this.process!.stdin!.write(request + "\n", (err) => {
         if (err && this.pending.has(id)) {
           this.pending.delete(id);
-          clearTimeout(timeout);
+          clearTimeout(timer);
           reject(err);
         }
       });
@@ -167,16 +184,24 @@ export class PythonBridge {
     return () => this.exitHandlers.delete(handler);
   }
 
-  shutdown(): void {
+  async shutdown(): Promise<void> {
+    if (!this.process) return;
+    if (this._shuttingDown) return;  // 防止 window-all-closed + before-quit 双重 shutdown
+    this._shuttingDown = true;
     this.rejectPending(new Error("PythonBridge 已关闭"));
-    if (this.process) {
-      try {
-        this.process.kill();
-      } catch {
-        // ignore
-      }
-      this.process = null;
+    // 尝试优雅关闭：发送 shutdown 通知，等 1.5s 让 Python 写完 history.json
+    try {
+      this.call("shutdown", {}, 2000).catch(() => {});
+      await new Promise((r) => setTimeout(r, 1500));
+    } catch {
+      // ignore：server.py 可能没有 shutdown 方法，重点是不阻塞 kill 流程
     }
+    try {
+      this.process.kill();
+    } catch {
+      // ignore
+    }
+    this.process = null;
   }
 
   private _handleLine(line: string): void {
@@ -221,7 +246,11 @@ export class PythonBridge {
     }
     this.pending.delete(msg.id);
     if (msg.error) {
-      pending.reject(new Error(msg.error.message));
+      const err = Object.assign(new Error(msg.error.message || "Engine error"), {
+        code: msg.error.code,
+        data: msg.error.data,
+      });
+      pending.reject(err);
     } else {
       pending.resolve(msg.result);
     }

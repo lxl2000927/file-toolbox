@@ -1,9 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, computed, watch } from "vue";
+import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, computed, watch } from "vue";
 import type { UpdateCheckResult } from "../../env";
 import AppIcon from "../common/AppIcon.vue";
 import AppSelect from "../common/AppSelect.vue";
+import { useAppDialog } from "../../composables/useAppDialog";
+import { useToast } from "../../composables/useToast";
 import { marked } from "marked";
+
+const dialog = useAppDialog();
+const toast = useToast();
 
 type SettingsTab = "logs" | "updates" | "about";
 type LogLevelFilter = "all" | "error" | "warning" | "success" | "info" | "debug";
@@ -50,31 +55,65 @@ const aboutTips = [
 const updateState = ref<"idle" | "loading" | "error">("idle");
 const updateMsg = ref("");
 const updateResult = ref<UpdateCheckResult | null>(null);
+const ALLOWED_RELEASE_TAGS = new Set([
+  "a", "p", "br", "strong", "em", "b", "i", "u", "s", "code", "pre", "blockquote",
+  "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "img",
+]);
+const ALLOWED_RELEASE_ATTRS = new Set(["href", "src", "alt", "title", "colspan", "rowspan"]);
+
+function isSafeReleaseUrl(value: string, options: { allowRelative?: boolean; allowMailto?: boolean } = {}) {
+  const trimmed = value.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith("#")) return true;
+  if (options.allowMailto && /^mailto:/i.test(trimmed)) return true;
+  if (!options.allowRelative && !/^[a-z][a-z0-9+.-]*:/i.test(trimmed)) return false;
+  try {
+    const url = new URL(trimmed, window.location.origin);
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+const releaseBodyHtmlCache = new Map<string, string>();
+
+// TODO: 后续可换 DOMPurify 降低维护成本（当前白名单清洗逻辑安全，但维护成本较高）
 const releaseBodyHtml = computed(() => {
-  const body = updateResult.value?.body;
+  const release = updateResult.value;
+  const body = release?.body;
   if (!body) return "";
+  // 按 release 标识+body 缓存，避免重复 marked 解析与 DOM 清洗
+  const cacheKey = `${release?.latest || release?.url || ""}::${body.length}`;
+  const cached = releaseBodyHtmlCache.get(cacheKey);
+  if (cached !== undefined) return cached;
   const html = marked.parse(body, { async: false }) as string;
   const template = document.createElement("template");
   template.innerHTML = html;
-  template.content.querySelectorAll("script, style, iframe, object, embed, form, input, button, textarea, select, link, meta").forEach((node) => node.remove());
+  template.content.querySelectorAll("script, style, iframe, object, embed, form, input, button, textarea, select, link, meta, svg, math").forEach((node) => node.remove());
   template.content.querySelectorAll("*").forEach((node) => {
+    const tagName = node.tagName.toLowerCase();
+    if (!ALLOWED_RELEASE_TAGS.has(tagName)) {
+      node.replaceWith(...Array.from(node.childNodes));
+      return;
+    }
     for (const attr of Array.from(node.attributes)) {
       const name = attr.name.toLowerCase();
       const value = attr.value.trim();
-      if (name.startsWith("on") || name === "srcdoc" || name === "style") {
+      if (name.startsWith("on") || !ALLOWED_RELEASE_ATTRS.has(name)) {
         node.removeAttribute(attr.name);
         continue;
       }
-      if ((name === "href" || name === "src") && !/^(https?:|mailto:|#|\/)/i.test(value)) {
-        node.removeAttribute(attr.name);
-      }
+      if (name === "href" && !isSafeReleaseUrl(value, { allowRelative: true, allowMailto: true })) node.removeAttribute(attr.name);
+      if (name === "src" && !isSafeReleaseUrl(value, { allowRelative: false })) node.removeAttribute(attr.name);
     }
-    if (node.tagName.toLowerCase() === "a") {
+    if (tagName === "a") {
       node.setAttribute("target", "_blank");
       node.setAttribute("rel", "noopener noreferrer");
     }
   });
-  return template.innerHTML;
+  const result = template.innerHTML;
+  releaseBodyHtmlCache.set(cacheKey, result);
+  return result;
 });
 const dataDirMsg = ref("");
 const activeSettingsTab = ref<SettingsTab>("logs");
@@ -272,6 +311,19 @@ onMounted(() => {
 
 onBeforeUnmount(() => { stopLogAutoRefresh(); logIo?.disconnect(); });
 
+// KeepAlive 下 onMounted/onBeforeUnmount 不会在切面板时触发，
+// 用 onActivated/onDeactivated 管理定时器避免后台空转
+onActivated(() => {
+  if (activeSettingsTab.value === "logs") {
+    refreshLogs({ silent: true });
+    startLogAutoRefresh();
+  }
+});
+
+onDeactivated(() => {
+  stopLogAutoRefresh();
+});
+
 watch(activeSettingsTab, (tab) => {
   if (tab === "logs") {
     refreshLogs({ silent: true });
@@ -312,35 +364,55 @@ async function refreshLogs(options: { silent?: boolean } = {}) {
 
 async function clearLogs() {
   if (!window.engine || !logRaw.value.length) return;
+  // #29 清空前必须确认，操作不可撤销
+  const confirmed = await dialog.confirm({
+    title: "清空历史记录",
+    message: "此操作不可撤销，确定要清空全部历史记录吗？",
+    kind: "warning",
+    confirmText: "清空",
+  });
+  if (!confirmed) return;
   try {
     const res = await window.engine.history.clear();
     if (res?.cleared) {
       logRaw.value = [];
       logLines.value = [];
+      toast.success("已清空历史记录");
     }
-  } catch {
+  } catch (e: any) {
     logLines.value = ["（清空历史记录失败）"];
+    toast.error("清空失败：" + (e?.message || "未知错误"));
   }
 }
 
 async function exportLogsTxt() {
   if (!filteredLogLines.value.length) return;
-  const text = filteredLogLines.value.join("\n");
-  await window.electronAPI?.saveFile({
-    content: text,
-    defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`,
-    filters: [{ name: "文本文件", extensions: ["txt"] }],
-  });
+  // #33 导出加 try/catch，失败时 toast 提示
+  try {
+    const text = filteredLogLines.value.join("\n");
+    await window.electronAPI?.saveFile({
+      content: text,
+      defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`,
+      filters: [{ name: "文本文件", extensions: ["txt"] }],
+    });
+  } catch (e: any) {
+    toast.error("导出失败：" + (e?.message || "未知错误"));
+  }
 }
 
 async function exportLogsJson() {
   if (!filteredLogRaw.value.length) return;
-  const text = JSON.stringify(filteredLogRaw.value, null, 2);
-  await window.electronAPI?.saveFile({
-    content: text,
-    defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`,
-    filters: [{ name: "JSON 文件", extensions: ["json"] }],
-  });
+  // #33 导出加 try/catch，失败时 toast 提示
+  try {
+    const text = JSON.stringify(filteredLogRaw.value, null, 2);
+    await window.electronAPI?.saveFile({
+      content: text,
+      defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`,
+      filters: [{ name: "JSON 文件", extensions: ["json"] }],
+    });
+  } catch (e: any) {
+    toast.error("导出失败：" + (e?.message || "未知错误"));
+  }
 }
 
 const MAX_RETRY = 3;
@@ -481,13 +553,13 @@ async function openDataDir() {
         </div>
       </div>
 
-      <div v-else-if="activeSettingsTab === 'updates'" class="settings-section glass-card section-card">
+      <div v-else-if="activeSettingsTab === 'updates'" class="settings-section updates-section glass-card section-card">
         <div class="app-brand compact">
           <span class="app-logo"><AppIcon name="package" :size="28" /></span>
           <div>
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.3.0</span>
+              <span class="version-pill">v2.4.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
             </div>
           </div>
@@ -524,11 +596,10 @@ async function openDataDir() {
         <div v-else-if="updateResult?.ok" class="release-panel current-version">
           <div class="release-topline">
             <span class="release-badge current">当前已是最新版本</span>
-            <span class="release-versions">v{{ updateResult.current || '2.3.0' }}</span>
+            <span class="release-versions">v{{ updateResult.current || '2.4.0' }}</span>
           </div>
-          <p>无需更新。当前版本的更新日志如下。</p>
-          <div v-if="updateResult.body" class="release-body selectable" v-html="releaseBodyHtml" />
-          <p v-else class="settings-hint">该版本暂未提供更新说明。</p>
+          <p v-if="updateResult.latest">GitHub 最新正式版本为 v{{ updateResult.latest }}，无需更新。</p>
+          <p v-else>未发现可用的正式 Release，无需更新。</p>
         </div>
 
         <div v-else-if="!updateMsg" class="update-empty-card">
@@ -543,7 +614,7 @@ async function openDataDir() {
           <div class="about-hero-info">
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.3.0</span>
+              <span class="version-pill">v2.4.0</span>
               <span class="version-pill version-pill-sub">Electron</span>
               <span class="version-pill version-pill-sub">Python Engine</span>
             </div>
@@ -612,6 +683,10 @@ async function openDataDir() {
 .settings-section {
   flex: 1;
   overflow: auto;
+}
+.updates-section {
+  display: flex;
+  flex-direction: column;
 }
 
 /* 左：应用介绍 */
@@ -832,21 +907,53 @@ async function openDataDir() {
 .update-status.loading { background: var(--color-gray-100); color: var(--color-gray-600); }
 .update-status.error { background: var(--color-danger-bg); color: var(--color-danger); }
 .update-status.ok { background: var(--color-success-bg); color: var(--color-success); }
-.release-panel,
-.update-empty-card {
+.release-panel {
+  flex: 1;
+  min-height: 0;
   margin-top: 12px;
-  padding: 14px;
+  padding: 18px;
   border-radius: var(--radius-lg);
   border: 1px solid rgba(203, 213, 225, 0.78);
   background:
     radial-gradient(circle at 94% 0%, rgba(37, 99, 235, 0.10), transparent 32%),
     rgba(255, 255, 255, 0.42);
 }
+.update-empty-card {
+  flex: 1;
+  min-height: 280px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 28px;
+  border-radius: var(--radius-lg);
+  border: 1px dashed rgba(37, 99, 235, 0.24);
+  background:
+    radial-gradient(circle at 50% 12%, rgba(37, 99, 235, 0.12), transparent 34%),
+    linear-gradient(180deg, rgba(248, 250, 252, 0.82), rgba(255, 255, 255, 0.48));
+  text-align: center;
+}
+.update-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 60px;
+  height: 60px;
+  margin-bottom: 2px;
+  border-radius: 22px;
+  color: var(--color-primary);
+  background: rgba(37, 99, 235, 0.1);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74), 0 10px 28px rgba(37, 99, 235, 0.10);
+}
 .release-panel.has-update {
+  display: flex;
+  flex-direction: column;
   border-color: rgba(37, 99, 235, 0.30);
   background:
-    radial-gradient(circle at 94% 0%, rgba(37, 99, 235, 0.16), transparent 34%),
-    linear-gradient(135deg, rgba(239, 246, 255, 0.82), rgba(255, 255, 255, 0.44));
+    radial-gradient(circle at 94% 0%, rgba(37, 99, 235, 0.10), transparent 34%),
+    linear-gradient(180deg, rgba(239, 246, 255, 0.62), rgba(255, 255, 255, 0.28));
 }
 .release-panel.current-version {
   border-color: rgba(22, 163, 74, 0.24);
@@ -893,14 +1000,19 @@ async function openDataDir() {
   font-size: var(--font-sm);
   line-height: 1.65;
 }
+.update-empty-card p {
+  max-width: 360px;
+  margin-bottom: 4px;
+}
+.release-panel h4 {
+  flex: 0 0 auto;
+}
 .release-body {
-  max-height: 280px;
-  margin: 8px 0 0;
-  padding: 12px;
+  flex: 1;
+  min-height: 0;
+  margin: 12px -4px 0;
+  padding: 0 4px 4px;
   overflow: auto;
-  border: 1px solid rgba(203, 213, 225, 0.72);
-  border-radius: var(--radius);
-  background: rgba(248, 250, 252, 0.82);
   color: var(--color-gray-700);
   font-size: var(--font-sm);
   line-height: 1.65;
@@ -930,6 +1042,7 @@ async function openDataDir() {
 .release-actions {
   display: flex;
   justify-content: flex-end;
+  flex: 0 0 auto;
   margin-top: 12px;
 }
 .spinner {

@@ -2,7 +2,7 @@
 
 一款面向 Windows 的桌面文件处理工具，专注批量文件重命名、PDF 普通拆分、PDF 扫描拆分与操作历史追踪。
 
-![Version](https://img.shields.io/badge/version-v2.0.0-5b6ee1?style=flat-square)
+![Version](https://img.shields.io/badge/version-v2.4.0-5b6ee1?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-2f80ed?style=flat-square)
 ![Desktop](https://img.shields.io/badge/desktop-Electron%20%2B%20Vue-42b883?style=flat-square)
 ![Engine](https://img.shields.io/badge/engine-Python-3776ab?style=flat-square)
@@ -80,9 +80,9 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 从 GitHub Releases 下载对应版本：
 
-- `File Toolbox-2.0.0-x64-setup.exe`：安装版。
-- `File Toolbox-2.0.0-x64-portable.exe`：便携单文件版。
-- `File Toolbox-2.0.0-x64.zip`：压缩版。
+- `File Toolbox-2.4.0-x64-setup.exe`：安装版。
+- `File Toolbox-2.4.0-x64-portable.exe`：便携单文件版。
+- `File Toolbox-2.4.0-x64.zip`：压缩版。
 
 下载后按版本类型运行：
 
@@ -103,7 +103,7 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 - Windows 10/11
 - Python 3.10+
-- Node.js 20+
+- Node.js 20.19+ 或 22.12+
 - npm
 
 ### 安装 Python 依赖
@@ -161,9 +161,9 @@ npm run package
 
 默认输出目录为 `electron-app/release`，会生成：
 
-- 安装版：`File Toolbox-2.0.0-x64-setup.exe`
-- 便携单文件版：`File Toolbox-2.0.0-x64-portable.exe`
-- 压缩版：`File Toolbox-2.0.0-x64.zip`
+- 安装版：`File Toolbox-2.4.0-x64-setup.exe`
+- 便携单文件版：`File Toolbox-2.4.0-x64-portable.exe`
+- 压缩版：`File Toolbox-2.4.0-x64.zip`
 
 也可以单独打包指定版本：
 

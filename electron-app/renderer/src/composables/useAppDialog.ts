@@ -1,4 +1,4 @@
-import { reactive } from "vue";
+import { reactive, nextTick } from "vue";
 
 type DialogKind = "info" | "success" | "warning" | "danger";
 
@@ -40,6 +40,10 @@ function openDialog(options: DialogOptions) {
     dialogState.cancelText = options.cancelText || "取消";
     dialogState.showCancel = Boolean(options.showCancel);
     dialogState.resolver = resolve;
+    // 打开后聚焦 backdrop，使 ESC keydown 能被捕获
+    nextTick(() => {
+      document.querySelector<HTMLElement>(".dialog-backdrop")?.focus();
+    });
   });
 }
 

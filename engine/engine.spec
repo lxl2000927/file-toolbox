@@ -4,7 +4,8 @@ from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
 from pathlib import Path
 
 
-project_root = str(Path(SPECPATH).resolve().parent)
+engine_dir = Path(SPECPATH).resolve()
+project_root = str(engine_dir.parent)
 hiddenimports = [
     'src.core.rename_engine',
     'src.core.pdf_split_engine',
@@ -12,7 +13,7 @@ hiddenimports = [
     'src.utils.history_manager',
     'src.utils.path_utils',
     'src.utils.pdf_output',
-    'PyPDF2',
+    'pypdf',
     'fitz',
     'numpy',
     'cv2',
@@ -28,7 +29,7 @@ binaries += collect_dynamic_libs('fitz')
 binaries += collect_dynamic_libs('zxingcpp')
 
 a = Analysis(
-    ['server.py'],
+    [str(engine_dir / 'server.py')],
     pathex=[project_root],
     binaries=binaries,
     datas=[],

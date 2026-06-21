@@ -17,7 +17,7 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
 
 <template>
   <aside class="side-nav">
-    <nav class="nav-list nav-top">
+    <nav class="nav-list nav-top" aria-label="功能导航">
       <button
         v-for="item in topItems"
         :key="item.key"
@@ -30,7 +30,7 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
       </button>
     </nav>
     <div class="spacer" />
-    <nav class="nav-list nav-bottom">
+    <nav class="nav-list nav-bottom" aria-label="设置导航">
       <button
         v-for="item in bottomItems"
         :key="item.key"

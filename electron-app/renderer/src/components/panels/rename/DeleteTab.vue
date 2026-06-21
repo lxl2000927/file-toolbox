@@ -58,7 +58,7 @@ function togglePattern(key: string, on: boolean) {
 </script>
 
 <template>
-  <div class="rules-tab">
+  <div class="rules-tab rename-tab-rules">
   <fieldset class="rules-group">
     <legend>规则列表</legend>
     <details open class="rule-block">
@@ -143,56 +143,6 @@ function togglePattern(key: string, on: boolean) {
 </template>
 
 <style scoped>
-.rules-tab {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.rules-group {
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  padding: 10px 12px 14px;
-  background: var(--color-white);
-}
-.rules-group legend {
-  padding: 0 6px;
-  font-weight: 600;
-  color: var(--color-gray-800);
-  font-size: var(--font-md);
-}
-.rule-block {
-  margin-top: 10px;
-}
-.rule-block summary {
-  list-style: none;
-  cursor: pointer;
-  font-weight: 600;
-  color: var(--color-gray-700);
-  padding: 2px 4px;
-  user-select: none;
-}
-.rule-block summary::-webkit-details-marker { display: none; }
-.rule-block summary::before {
-  content: "▾";
-  display: inline-block;
-  margin-right: 6px;
-  color: var(--color-gray-500);
-  transition: transform var(--transition-fast);
-}
-.rule-block:not([open]) summary::before { transform: rotate(-90deg); }
-.grid {
-  display: grid;
-  grid-template-columns: 80px 1fr;
-  align-items: center;
-  gap: 10px;
-  margin-top: 6px;
-  padding-left: 8px;
-}
-.label-inline {
-  font-size: var(--font-md);
-  color: var(--color-gray-700);
-  font-weight: 500;
-}
 .checks {
   display: flex;
   flex-wrap: wrap;

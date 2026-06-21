@@ -8,7 +8,10 @@ from typing import Callable, Optional, Literal
 from urllib.parse import unquote
 import unicodedata
 
-import PyPDF2
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 import fitz
 
 from src.utils.pdf_output import PdfOutputJob, write_pdf_output_jobs
@@ -17,6 +20,22 @@ from src.utils.pdf_output import PdfOutputJob, write_pdf_output_jobs
 ProgressCallback = Callable[[int, int], None]
 LogCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
+
+
+def _safe_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return default
 
 
 @dataclass(frozen=True)
@@ -53,14 +72,16 @@ class PdfScanSplitOptions:
         object.__setattr__(self, "qrcode_max_attempts", max(12, min(500, int(self.qrcode_max_attempts or 180))))
         object.__setattr__(self, "max_segment_pages", max(0, min(10000, int(self.max_segment_pages or 0))))
 
-        # 布尔参数类型保护（防御前端传入字符串或数字的情况）
         _gpu = getattr(self, "enable_gpu", False)
         _mt = getattr(self, "enable_multithread", False)
         _roi = getattr(self, "use_roi", False)
         _qr_roi = getattr(self, "qrcode_use_roi", False)
-        _use_roi = (bool(_roi) if isinstance(_roi, bool) else False) or (bool(_qr_roi) if isinstance(_qr_roi, bool) else False)
-        object.__setattr__(self, "enable_gpu", bool(_gpu) if isinstance(_gpu, bool) else False)
-        object.__setattr__(self, "enable_multithread", bool(_mt) if isinstance(_mt, bool) else False)
+        _use_roi = _safe_bool(_roi) or _safe_bool(_qr_roi)
+        object.__setattr__(self, "marker_as_first_page", _safe_bool(getattr(self, "marker_as_first_page", True), True))
+        object.__setattr__(self, "exclude_marker_page", _safe_bool(getattr(self, "exclude_marker_page", False)))
+        object.__setattr__(self, "qrcode_no_decode", _safe_bool(getattr(self, "qrcode_no_decode", False)))
+        object.__setattr__(self, "enable_gpu", _safe_bool(_gpu))
+        object.__setattr__(self, "enable_multithread", _safe_bool(_mt))
         object.__setattr__(self, "use_roi", _use_roi)
         object.__setattr__(self, "qrcode_use_roi", _use_roi)
 
@@ -2165,6 +2186,7 @@ class PdfScanSplitEngine:
             jobs=jobs,
             cancel_check=cancel_check,
             on_output=on_output,
+            cleanup_outputs_on_cancel=False,
         )
 
     @staticmethod

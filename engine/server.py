@@ -11,12 +11,16 @@ import os
 import sys
 import json
 import math
+import numbers
 import threading
 import traceback
 import time
+import hmac
 from collections import deque
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Callable, Dict
+
+ENGINE_AUTH_TOKEN = os.environ.get("FILE_TOOLBOX_ENGINE_TOKEN", "")
 
 # ── 确保能 import src.*（server.py 在 engine/ 子目录） ──────
 _ENGINE_DIR = __file__ if "__file__" in dir() else "."
@@ -58,6 +62,10 @@ try:
 except Exception:
     _HISTORY_MANAGER = None  # type: ignore[assignment]
 
+# [Bug#2 Fix] 优雅关闭标志：handle_shutdown 置位后，主循环在发送响应后干净退出，
+# 触发 atexit 回调刷盘，避免 Windows 上 process.kill() 硬杀导致最近 5s 历史丢失
+_SHUTDOWN_REQUESTED = False
+
 try:
     from src.utils.path_utils import make_unique_output_path
 except Exception:
@@ -72,7 +80,7 @@ def _make_rename_engine() -> RenameEngine:
 
 def _make_pdf_split_engine() -> PdfSplitEngine:
     if PdfSplitEngine is None:
-        raise RuntimeError("PdfSplitEngine 不可用（缺少依赖：PyPDF2）")
+        raise RuntimeError("PdfSplitEngine 不可用（缺少依赖：pypdf）")
     return PdfSplitEngine(history_manager=_HISTORY_MANAGER)
 
 
@@ -112,10 +120,13 @@ _CANCEL_LOCK = threading.Lock()
 _UNDO_RECORDS: Dict[str, list[dict]] = {}
 _UNDO_LOCK = threading.Lock()
 _MAX_UNDO_RECORDS = 50  # cap to prevent unbounded memory growth
+_MAX_UNDO_OPERATIONS = 50000  # [P2 #26] 所有令牌的 operation 总数上限，超过 LRU 淘汰
 _MAX_ACTIVE_TASKS = 3
 _MAX_QUEUED_TASKS = 50
 _TASK_SEMAPHORE = threading.Semaphore(_MAX_ACTIVE_TASKS)
 _TASK_QUEUE: deque[tuple[str, Any, dict, threading.Event]] = deque()
+# [Bug#6 Fix] 连续线程启动失败计数（模块级，跨 _try_start_queued 调用累积）
+_CONSECUTIVE_THREAD_FAILURES = 0
 
 
 def _new_task_id(prefix: str) -> str:
@@ -165,6 +176,7 @@ def _release_task(task_id: str, *, reserved: bool = True) -> None:
 
 
 def _try_start_queued() -> None:
+    global _CONSECUTIVE_THREAD_FAILURES
     while True:
         with _CANCEL_LOCK:
             if not _TASK_QUEUE:
@@ -184,6 +196,8 @@ def _try_start_queued() -> None:
                 # we re-acquired _CANCEL_LOCK. In this window _cancel_task found
                 # removed_queued=False, set the flag, but did NOT clean _CANCEL_FLAGS
                 # or send task.complete -> frontend hangs + memory leak.
+                # [P1 #8] 删除原 198-203 行的 elif/elif fallback 分支：
+                # flag 未 set 却发 cancelled:True 会让正常任务收到错误通知。
                 if flag.is_set() and task_id in _CANCEL_FLAGS:
                     _CANCEL_FLAGS.pop(task_id, None)
                     send_notification("task.complete", {
@@ -192,22 +206,22 @@ def _try_start_queued() -> None:
                         "cancelled": True,
                         "error": "已取消",
                     })
-                elif not flag.is_set() and task_id not in _CANCEL_FLAGS:
-                    # Edge case fallback: send notification to prevent frontend hang
-                    send_notification("task.complete", {
-                        "task_id": task_id, "ok": False,
-                        "cancelled": True, "error": "Task cancelled",
-                    })
                 continue
 
+        # [P1 #10] task.queued 通知必须在 thread.start() 之前发送，
+        # 否则线程内可能先于本通知发出 task.complete，前端状态错乱。
+        send_notification("task.queued", {"task_id": task_id, "queued": False, "position": 0})
         try:
             thread = threading.Thread(target=runner, args=(task_id, params, flag), daemon=True)
             thread.start()
-            send_notification("task.queued", {"task_id": task_id, "queued": False, "position": 0})
+            with _CANCEL_LOCK:  # [Bug#6 Fix] 计数器需加锁：_try_start_queued 会被 worker 线程并发调用
+                _CONSECUTIVE_THREAD_FAILURES = 0  # 启动成功，重置计数
             return
         except Exception as exc:
             with _CANCEL_LOCK:
                 _CANCEL_FLAGS.pop(task_id, None)
+                _CONSECUTIVE_THREAD_FAILURES += 1
+                fail_count = _CONSECUTIVE_THREAD_FAILURES
             _TASK_SEMAPHORE.release()
             send_notification("task.complete", {
                 "task_id": task_id,
@@ -215,6 +229,28 @@ def _try_start_queued() -> None:
                 "cancelled": False,
                 "error": f"无法启动后台线程: {exc}",
             })
+            # [P1 #12][Bug#6 Fix] 连续失败超过 3 次：保留剩余队列项，停止雪崩，发 warning 通知
+            # （原为局部变量，每次调用从 0 开始，无法跨调用检测连续失败；
+            #  现为模块级变量且加锁，可跨调用安全累积）
+            if fail_count >= 3:
+                remaining = []
+                with _CANCEL_LOCK:
+                    while _TASK_QUEUE:
+                        remaining.append(_TASK_QUEUE.popleft())
+                    for queued_id, _runner, _params, _flag in remaining:
+                        _CANCEL_FLAGS.pop(queued_id, None)
+                send_notification("task.warning", {
+                    "message": f"连续 {fail_count} 次启动后台线程失败，已暂停派发队列任务",
+                    "remaining_queued": len(remaining),
+                })
+                for queued_id, _runner, _params, _flag in remaining:
+                    send_notification("task.complete", {
+                        "task_id": queued_id,
+                        "ok": False,
+                        "cancelled": False,
+                        "error": "后台线程连续启动失败，队列任务已终止",
+                    })
+                break
             continue
 
 
@@ -248,6 +284,14 @@ def _cancel_task(task_id: str) -> bool:
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (str, bool, int)):
         return value
+    # [P1 #5] 先处理 numpy 标量（float32/float64/int* 等）→ 走 numbers.Real 分支，
+    # 避免 allow_nan=False 对 numpy.float32('nan') 抛 ValueError
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        try:
+            f = float(value)
+        except Exception:
+            return None
+        return f if math.isfinite(f) else None
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     if is_dataclass(value):
@@ -259,7 +303,15 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 def send(data: dict) -> None:
-    line = json.dumps(_json_safe(data), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    # [P1 #5] send 序列化失败兜底：写 stderr 日志，不发垃圾到 stdout
+    try:
+        line = json.dumps(_json_safe(data), ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except Exception:
+        try:
+            sys.stderr.write("send() serialize failed: " + traceback.format_exc() + "\n")
+        except Exception:
+            pass
+        return
     with _STDOUT_LOCK:
         try:
             sys.stdout.write(line + "\n")
@@ -315,6 +367,12 @@ def handle_rename_execute(params: dict) -> dict:
             # evict oldest entries when cap is exceeded
             while len(_UNDO_RECORDS) > _MAX_UNDO_RECORDS:
                 _UNDO_RECORDS.pop(next(iter(_UNDO_RECORDS)), None)
+            # [P2 #26] 限制所有令牌的 operation 总数，LRU 淘汰最早 token
+            total_ops = sum(len(ops) for ops in _UNDO_RECORDS.values())
+            while total_ops > _MAX_UNDO_OPERATIONS and len(_UNDO_RECORDS) > 1:
+                oldest_token = next(iter(_UNDO_RECORDS))
+                total_ops -= len(_UNDO_RECORDS[oldest_token])
+                _UNDO_RECORDS.pop(oldest_token, None)
         result["undo_token"] = undo_token
     return result
 
@@ -324,8 +382,9 @@ def handle_rename_undo(params: dict) -> dict:
     undo_token = str(params.get("undo_token") or "")
     if not undo_token:
         return {"restored": [], "failed": [{"path": "", "error": "缺少撤销令牌"}]}
+    # [P1 #9] 改为非破坏性 get：执行后仅在全部成功时才 pop，便于失败重试
     with _UNDO_LOCK:
-        operations = _UNDO_RECORDS.pop(undo_token, None)
+        operations = _UNDO_RECORDS.get(undo_token, None)
     if not operations:
         return {"restored": [], "failed": [{"path": "", "error": "撤销令牌无效或已使用"}]}
     restored: list[dict] = []
@@ -339,12 +398,11 @@ def handle_rename_undo(params: dict) -> dict:
             original = str(op.get("original_path") or "")
             new_path = str(op.get("new_path") or "")
             operation = str(op.get("operation") or op.get("operation_type") or "").lower()
-            output_dir = str(op.get("output_dir") or "")
-            if operation not in ("copy", "overwrite") and output_dir:
-                operation = "copy"
+            # [Bug#9 Fix] 删除死代码：FileOperationRecord.to_dict() 不含 output_dir 字段，
+            # op.get("output_dir") 恒为空，原 if operation not in (...) and output_dir 分支永不执行。
+            # 无法确定操作类型时默认按副本处理（只删副本文件，不尝试还原路径），
+            # 避免依赖文件系统状态推断导致的边缘情况错误
             if operation not in ("copy", "overwrite"):
-                # 无法确定操作类型时默认按副本处理（只删副本文件，不尝试还原路径）
-                # 避免依赖文件系统状态推断导致的边缘情况错误
                 operation = "copy"
             if not original or not new_path:
                 continue
@@ -364,6 +422,10 @@ def handle_rename_undo(params: dict) -> dict:
             restored.append({"from": new_path, "to": original})
         except Exception as exc:
             failed.append({"path": str(op.get("new_path") or ""), "error": str(exc)})
+    # [P1 #9] 仅当没有失败项时才销毁令牌；保留令牌以便用户重试
+    if not failed:
+        with _UNDO_LOCK:
+            _UNDO_RECORDS.pop(undo_token, None)
     return {"restored": restored, "failed": failed}
 
 
@@ -436,13 +498,13 @@ def handle_pdf_split_preview_many(params: dict) -> dict:
     return {"lines": lines, "plans": plans}
 
 
-def handle_pdf_split_execute(params: dict) -> dict:
-    # [Bug10 Warning] This runs SYNCHRONOUSLY in the RPC main loop.
-    # Large files (many pages) can block ALL other requests (including cancel!) for
-    # tens of seconds. Prefer pdf_split.execute_async for anything non-trivial.
-    engine = _make_pdf_split_engine()
-    pdf_paths = params.get("pdf_paths", []) if isinstance(params.get("pdf_paths"), (list, tuple)) else []
-    return engine.execute_split(pdf_paths, params.get("config", {}))
+def handle_pdf_split_execute_removed(params: dict) -> dict:
+    # [P0 #4] 已移除同步 handle_pdf_split_execute 路由：
+    # 大 PDF 同步执行会阻塞主循环所有请求（含 task.cancel）。
+    # 前端请改用 pdf_split.execute_async 走后台线程 + 取消令牌。
+    raise RuntimeError(
+        "pdf_split.execute 已下线（同步执行会阻塞主循环），请改用 pdf_split.execute_async"
+    )
 
 
 def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
@@ -772,8 +834,9 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
         if PdfScanSplitEngine is None:
             raise RuntimeError(_pdf_scan_unavailable_message())
         options = _build_scan_options(params.get("options", {}))
-        if not bool(getattr(options, "qrcode_no_decode", False)):
-            options = replace(options, qrcode_max_attempts=min(int(getattr(options, "qrcode_max_attempts", 180) or 180), 48))
+        # [Bug #30] 移除 scan_only 模式对 qrcode_max_attempts 的强制 48 上限：
+        # 前端显示用户配置的值（如 180），后端也应使用该值，避免行为不一致。
+        # 仅通过 log 通知前端当前使用的最大尝试次数。
         page_limit = int(params.get("page_limit", 0) or 0)
         send_notification("task.progress", {"task_id": task_id, "phase": "start", "current": 0, "total": 1})
 
@@ -787,6 +850,9 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             message = str(msg)
             log_tail.append(message)
             send_notification("task.log", {"task_id": task_id, "message": message})
+
+        # [Bug #30] 通知前端当前使用的用户配置最大尝试次数
+        log(f"快速扫描模式：使用用户配置的最大尝试次数 {getattr(options, 'qrcode_max_attempts', 180)}")
 
         result = PdfScanSplitEngine.scan_only(
             params.get("pdf_path", ""),
@@ -949,6 +1015,19 @@ def _normalize_operation_type(value: Any) -> Any:
         return None
 
 
+def handle_shutdown(params: dict) -> dict:
+    """[Bug#2 Fix] 优雅关闭：立即刷盘历史记录，置位退出标志。
+    主循环会在发送本响应后 sys.exit(0)，触发 atexit 的 _flush_exit 兜底。"""
+    global _SHUTDOWN_REQUESTED
+    if _HISTORY_MANAGER is not None:
+        try:
+            _HISTORY_MANAGER._flush_to_disk()
+        except Exception:
+            pass
+    _SHUTDOWN_REQUESTED = True
+    return {"ok": True}
+
+
 # ── 路由表 ─────────────────────────────────────────────────
 
 ROUTES: Dict[str, Callable] = {
@@ -959,7 +1038,7 @@ ROUTES: Dict[str, Callable] = {
     "pdf_split.validate":         handle_pdf_split_validate,
     "pdf_split.preview":          handle_pdf_split_preview,
     "pdf_split.preview_many":     handle_pdf_split_preview_many,
-    "pdf_split.execute":          handle_pdf_split_execute,
+    # [P0 #4] 移除 pdf_split.execute 同步路由，避免大 PDF 阻塞主循环；保留 execute_async
     "pdf_split.execute_async":    handle_pdf_split_execute_async,
     "scan_split.execute_async":   handle_scan_split_execute_async,
     "scan_split.preview_reference": handle_scan_preview_reference,
@@ -968,6 +1047,7 @@ ROUTES: Dict[str, Callable] = {
     "task.cancel":                handle_task_cancel,
     "history.get":                handle_history_get,
     "history.clear":              handle_history_clear,
+    "shutdown":                   handle_shutdown,  # [Bug#2 Fix] 优雅关闭路由
 }
 
 
@@ -982,8 +1062,27 @@ def main() -> None:
         )
         os.makedirs(_log_dir, exist_ok=True)
         sys.stderr = open(os.path.join(_log_dir, "engine.log"), "a", encoding="utf-8", buffering=1)
+        # [P1 #11] 仅重定向 Python sys.stderr 不够，OpenCV 等 C 库仍写 fd 2；
+        # 用 os.dup2 把底层 fd 2 也指向同一日志文件
+        try:
+            _log_fd = os.open(
+                os.path.join(_log_dir, "engine.log"),
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            )
+            os.dup2(_log_fd, 2)
+            os.close(_log_fd)
+        except Exception:
+            pass
     except Exception:
         pass  # Imp1: last-resort fallback only if log dir creation fails
+
+    # [P2 #24] ENGINE_AUTH_TOKEN 未设置时写 warning 到日志，便于排查；
+    # 不拒启以兼顾本地开发体验
+    if not ENGINE_AUTH_TOKEN:
+        try:
+            sys.stderr.write("WARNING: ENGINE_AUTH_TOKEN 未设置，引擎无鉴权\n")
+        except Exception:
+            pass
 
     send({"jsonrpc": "2.0", "method": "ready", "params": {}})
 
@@ -1003,6 +1102,21 @@ def main() -> None:
             continue
 
         req_id = request.get("id")
+        # [P0 #1] 鉴权移入主循环 try 防护范围之外但仍需防御 TypeError：
+        # compare_digest 收到非 ASCII str 会崩溃进程，统一转 utf-8 bytes 比较
+        if ENGINE_AUTH_TOKEN:
+            try:
+                supplied_token = str(request.get("auth", "") or "")
+                if not hmac.compare_digest(
+                    supplied_token.encode("utf-8", "ignore"),
+                    ENGINE_AUTH_TOKEN.encode("utf-8", "ignore"),
+                ):
+                    send(error_response(req_id, -32010, "Unauthorized"))
+                    continue
+            except Exception:
+                send(error_response(req_id, -32010, "Unauthorized"))
+                continue
+
         method = str(request.get("method", "") or "")
         params = request.get("params", {})
         if not isinstance(params, dict):
@@ -1026,6 +1140,10 @@ def main() -> None:
             send(success_response(req_id, result))
         except Exception as exc:
             send(error_response(req_id, -32000, str(exc), traceback.format_exc()))
+
+        # [Bug#2 Fix] shutdown 响应已发出，干净退出（atexit 会再刷一次盘兜底）
+        if _SHUTDOWN_REQUESTED:
+            break
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import { onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref } from "vue";
 
 export type TaskState = {
   taskId: string | null;
@@ -25,6 +25,10 @@ export function useEngineTask(opts: {
   onComplete?: TaskCompleteHandler;
   onQueued?: (position: number) => void;
 }) {
+  // 保留最新的 onComplete 引用，给 engine.status 监听器使用
+  const onCompleteRef = { current: opts.onComplete };
+  onCompleteRef.current = opts.onComplete;
+
   const state = ref<TaskState>({
     taskId: null,
     phase: "",
@@ -36,8 +40,11 @@ export function useEngineTask(opts: {
   });
   const logs = ref<string[]>([]);
   const pending = ref(false);
+  const busy = computed(() => pending.value || state.value.running || state.value.queued);
+  const cancellable = computed(() => Boolean(state.value.taskId) && (pending.value || state.value.running || state.value.queued));
 
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeStatus: (() => void) | null = null;
 
   function start(taskId: string) {
     reset();
@@ -45,6 +52,30 @@ export function useEngineTask(opts: {
     state.value.taskId = taskId;
     state.value.running = false;
     state.value.queued = false;
+    onCompleteRef.current = opts.onComplete;
+
+    // #22 订阅 engine.status 通知：engine 崩溃后发出 error，需要重置 running 避免卡死
+    // preload 未暴露专用 onEngineStatus，统一通过 onNotification 监听 method === "engine.status"
+    unsubscribeStatus = window.engine?.onNotification(({ method, params }) => {
+      if (method !== "engine.status") return;
+      const status = String(params?.status || "");
+      if (status === "error" && (state.value.running || pending.value)) {
+        const prevTaskId = state.value.taskId;
+        state.value.running = false;
+        state.value.queued = false;
+        state.value.taskId = "";
+        pending.value = false;
+        cleanup();
+        if (prevTaskId) {
+          onCompleteRef.current?.({
+            ok: false,
+            error: "引擎异常断开",
+            cancelled: false,
+            result: null,
+          });
+        }
+      }
+    }) ?? null;
 
     unsubscribe = window.engine?.onNotification(({ method, params }) => {
       if (!params || params.task_id !== state.value.taskId) return;
@@ -118,6 +149,8 @@ export function useEngineTask(opts: {
       state.value.running = false;
       state.value.queued = false;
       state.value.phase = "取消失败：任务不存在或已结束";
+      // #24 取消失败时也要 cleanup，避免监听器残留导致状态卡死
+      cleanup();
     }
   }
 
@@ -149,11 +182,15 @@ export function useEngineTask(opts: {
       unsubscribe();
       unsubscribe = null;
     }
+    if (unsubscribeStatus) {
+      unsubscribeStatus();
+      unsubscribeStatus = null;
+    }
   }
 
   onBeforeUnmount(() => cleanup());
 
-  return { state, logs, pending, start, markQueued, cancel, reset };
+  return { state, logs, pending, busy, cancellable, start, markQueued, cancel, reset };
 }
 
 export function generateTaskId(prefix: string): string {

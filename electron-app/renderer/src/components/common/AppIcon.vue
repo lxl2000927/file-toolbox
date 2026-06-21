@@ -1,5 +1,10 @@
 <script setup lang="ts">
-type IconName = "scan" | "pdf" | "rename" | "settings" | "alert" | "check" | "package" | "insert" | "replace" | "delete";
+type IconName =
+  | "scan" | "pdf" | "rename" | "settings"
+  | "alert" | "check" | "package"
+  | "insert" | "replace" | "delete"
+  | "close" | "info" | "success" | "warning"
+  | "folder" | "file" | "chevron-left";
 
 withDefaults(defineProps<{
   name: IconName;
@@ -69,6 +74,34 @@ withDefaults(defineProps<{
     </template>
     <template v-else-if="name === 'delete'">
       <path d="M5 8h14M6 8v11a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V8M9 8V6a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" />
+    </template>
+    <template v-else-if="name === 'close'">
+      <path d="M18 6 6 18" />
+      <path d="m6 6 12 12" />
+    </template>
+    <template v-else-if="name === 'info'">
+      <circle cx="12" cy="12" r="10" />
+      <path d="M12 16v-4" />
+      <path d="M12 8h.01" />
+    </template>
+    <template v-else-if="name === 'success'">
+      <circle cx="12" cy="12" r="10" />
+      <path d="m8 12 3 3 5-6" />
+    </template>
+    <template v-else-if="name === 'warning'">
+      <path d="M10.3 4.1 2.6 17.4A2 2 0 0 0 4.3 20h15.4a2 2 0 0 0 1.7-2.6L13.7 4.1a2 2 0 0 0-3.4 0z" />
+      <path d="M12 9v4" />
+      <path d="M12 17h.01" />
+    </template>
+    <template v-else-if="name === 'folder'">
+      <path d="M4 20a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5a2 2 0 0 1 1.6.8l1.2 1.6A2 2 0 0 0 14 7h6a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2z" />
+    </template>
+    <template v-else-if="name === 'file'">
+      <path d="M14 2H7a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7z" />
+      <path d="M14 2v5h5" />
+    </template>
+    <template v-else-if="name === 'chevron-left'">
+      <path d="m15 18-6-6 6-6" />
     </template>
     <template v-else>
       <path d="m21 8-9-5-9 5 9 5z" />
