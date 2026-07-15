@@ -21,6 +21,9 @@ from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Callable, Dict
 
 ENGINE_AUTH_TOKEN = os.environ.get("FILE_TOOLBOX_ENGINE_TOKEN", "")
+ENGINE_DEBUG_ERRORS = os.environ.get("FILE_TOOLBOX_ENGINE_DEBUG_ERRORS", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 # ── 确保能 import src.*（server.py 在 engine/ 子目录） ──────
 _ENGINE_DIR = __file__ if "__file__" in dir() else "."
@@ -39,12 +42,12 @@ sys.stderr.reconfigure(encoding="utf-8")
 # ── 导入现有引擎（零修改） ──────────────────────────────────
 try:
     from src.core.rename_engine import RenameEngine
-except Exception:
+except ImportError:
     RenameEngine = None  # type: ignore[assignment]
 
 try:
     from src.core.pdf_split_engine import PdfSplitEngine
-except Exception:
+except ImportError:
     PdfSplitEngine = None  # type: ignore[assignment]
 
 PdfScanSplitEngine = None  # type: ignore[assignment]
@@ -54,12 +57,14 @@ _PDF_SCAN_IMPORT_ATTEMPTED = False
 _PDF_SCAN_IMPORT_LOCK = threading.Lock()
 
 # ── 全局 HistoryManager（所有引擎共享，操作自动记录） ────────
+from src.utils.history_manager import HistoryManager
+
+_HISTORY_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "FileToolbox")
+_HISTORY_PATH = os.path.join(_HISTORY_DIR, "history.json")
 try:
-    from src.utils.history_manager import HistoryManager
-    _HISTORY_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "FileToolbox")
-    _HISTORY_PATH = os.path.join(_HISTORY_DIR, "history.json")
     _HISTORY_MANAGER = HistoryManager(storage_path=_HISTORY_PATH)
-except Exception:
+except OSError:
+    traceback.print_exc(file=sys.stderr)
     _HISTORY_MANAGER = None  # type: ignore[assignment]
 
 # [Bug#2 Fix] 优雅关闭标志：handle_shutdown 置位后，主循环在发送响应后干净退出，
@@ -68,7 +73,7 @@ _SHUTDOWN_REQUESTED = False
 
 try:
     from src.utils.path_utils import make_unique_output_path
-except Exception:
+except ImportError:
     make_unique_output_path = None  # type: ignore[assignment]
 
 
@@ -96,7 +101,7 @@ def _ensure_pdf_scan_engine() -> None:
             PdfScanSplitEngine = Engine
             PdfScanSplitOptions = Options
             _PDF_SCAN_IMPORT_ERROR = ""
-        except Exception:
+        except ImportError:
             PdfScanSplitEngine = None
             PdfScanSplitOptions = None
             _PDF_SCAN_IMPORT_ERROR = traceback.format_exc()
@@ -324,10 +329,23 @@ def send_notification(method: str, params: dict) -> None:
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
 
+def exception_trace_for_client(context: str) -> str:
+    trace = traceback.format_exc()
+    try:
+        sys.stderr.write(f"{context}:\n{trace}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+    return trace if ENGINE_DEBUG_ERRORS else ""
+
+
 def error_response(req_id: Any, code: int, message: str, data: str = "") -> dict:
+    error = {"code": code, "message": message}
+    if data and ENGINE_DEBUG_ERRORS:
+        error["data"] = data
     return {
         "jsonrpc": "2.0",
-        "error": {"code": code, "message": message, "data": data},
+        "error": error,
         "id": req_id,
     }
 
@@ -539,12 +557,14 @@ def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Even
         })
     except Exception as exc:
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        trace = exception_trace_for_client("pdf_split async task failed")
         send_notification("task.complete", {
             "task_id": task_id, "ok": False,
             "task_type": "pdf_split",
             "elapsed_ms": elapsed_ms,
             "cancelled": cancel_flag.is_set(),
-            "error": str(exc), "trace": traceback.format_exc(),
+            "error": str(exc),
+            **({"trace": trace} if trace else {}),
         })
     finally:
         _release_task(task_id)
@@ -609,8 +629,18 @@ def _format_probe_log_lines(result: dict, options=None) -> list[str]:
     if total_pages:
         lines.append(f"PDF 总页数：{total_pages}，本次测试：第 {page_number} 页，模式：{result.get('detection_mode') or '-'}")
 
+    stamp = result.get("stamp") if isinstance(result.get("stamp"), dict) else {}
+    if stamp.get("executed") or stamp.get("present") or stamp.get("candidates") is not None:
+        lines.append(
+            "印章："
+            f"{'命中' if stamp.get('present') else '未命中'}，候选 {int(stamp.get('candidates') or 0)}，"
+            f"面积占比 {_fmt_float(stamp.get('area_ratio'), 4)}，圆度 {_fmt_float(stamp.get('circularity'))}"
+        )
+    elif result.get("detection_mode") == "auto" and stamp.get("skipped_reason"):
+        lines.append(f"印章：未执行（{stamp.get('skipped_reason')}）")
+
     qrcode = result.get("qrcode") if isinstance(result.get("qrcode"), dict) else {}
-    if qrcode.get("present") or qrcode.get("infos") or qrcode.get("stats"):
+    if qrcode.get("executed") or qrcode.get("present") or qrcode.get("infos") or qrcode.get("stats"):
         infos = qrcode.get("infos") if isinstance(qrcode.get("infos"), list) else []
         stats = qrcode.get("stats") if isinstance(qrcode.get("stats"), dict) else {}
         detail = f"二维码：{'有候选' if qrcode.get('present') or infos else '无'}，解码 {len(infos)} 个"
@@ -619,21 +649,17 @@ def _format_probe_log_lines(result: dict, options=None) -> list[str]:
         lines.append(detail)
         if qrcode.get("present") and not infos and not bool(getattr(options, "qrcode_no_decode", False)):
             lines.append("检测到疑似二维码，但未能解析内容。内容匹配仅适用于可被通用二维码解码器识别的码图；如只需判断标记页，请勾选“不解码内容”。")
-
-    stamp = result.get("stamp") if isinstance(result.get("stamp"), dict) else {}
-    if stamp.get("present") or stamp.get("candidates") is not None:
-        lines.append(
-            "印章："
-            f"{'命中' if stamp.get('present') else '未命中'}，候选 {int(stamp.get('candidates') or 0)}，"
-            f"面积占比 {_fmt_float(stamp.get('area_ratio'), 4)}，圆度 {_fmt_float(stamp.get('circularity'))}"
-        )
+    elif result.get("detection_mode") == "auto" and qrcode.get("skipped_reason"):
+        lines.append(f"二维码：未执行（{qrcode.get('skipped_reason')}）")
 
     feature = result.get("feature") if isinstance(result.get("feature"), dict) else {}
-    if feature.get("good_matches") or feature.get("inliers") or result.get("detection_mode") in ("feature", "auto"):
+    if feature.get("executed") or feature.get("good_matches") or feature.get("inliers"):
         lines.append(
             f"特征点：匹配 {int(feature.get('good_matches') or 0)}，"
             f"内点 {int(feature.get('inliers') or 0)}，比例 {_fmt_float(feature.get('inlier_ratio'))}"
         )
+    elif result.get("detection_mode") == "auto" and feature.get("skipped_reason"):
+        lines.append(f"特征点：未执行（{feature.get('skipped_reason')}）")
     return lines
 
 
@@ -694,13 +720,15 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
         })
     except Exception as exc:
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        trace = exception_trace_for_client("scan_split async task failed")
         _record_scan_history(params, {"elapsed_ms": elapsed_ms, "log_tail": list(log_tail), "cancelled": cancel_flag.is_set()}, False, str(exc))
         send_notification("task.complete", {
             "task_id": task_id, "ok": False,
             "task_type": "scan_split",
             "elapsed_ms": elapsed_ms,
             "cancelled": cancel_flag.is_set(),
-            "error": str(exc), "trace": traceback.format_exc(),
+            "error": str(exc),
+            **({"trace": trace} if trace else {}),
         })
     finally:
         _release_task(task_id)
@@ -725,7 +753,7 @@ def _record_scan_history(params: dict, result: dict, success: bool, error: str |
         "performance_stats": result.get("performance_stats") or {},
     }
     description = f"{description_prefix} {os.path.basename(pdf_path) or 'PDF'}"
-    level = "error" if not success or error else "warning" if details.get("cancelled") or details.get("suspect_segments") else "success"
+    level = "warning" if details.get("cancelled") else "error" if not success or error else "warning" if details.get("suspect_segments") else "success"
     _HISTORY_MANAGER.add_record(
         "scan_split",
         description,
@@ -770,6 +798,7 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
 
         send_notification("task.progress", {"task_id": task_id, "phase": "testing", "current": 0, "total": 1})
         task_log(f"正在测试第 {display_page} 页…")
+        task_log(PdfScanSplitEngine._format_scan_options_log(options))
         result = PdfScanSplitEngine.probe_page(
             params.get("pdf_path", ""),
             params.get("reference_image_path", ""),
@@ -806,7 +835,7 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
             "elapsed_ms": elapsed_ms,
             "cancelled": cancel_flag.is_set(),
             "error": str(exc),
-            "trace": traceback.format_exc(),
+            **({"trace": traceback.format_exc()} if ENGINE_DEBUG_ERRORS else {}),
         })
     finally:
         _release_task(task_id)
@@ -834,9 +863,6 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
         if PdfScanSplitEngine is None:
             raise RuntimeError(_pdf_scan_unavailable_message())
         options = _build_scan_options(params.get("options", {}))
-        # [Bug #30] 移除 scan_only 模式对 qrcode_max_attempts 的强制 48 上限：
-        # 前端显示用户配置的值（如 180），后端也应使用该值，避免行为不一致。
-        # 仅通过 log 通知前端当前使用的最大尝试次数。
         page_limit = int(params.get("page_limit", 0) or 0)
         send_notification("task.progress", {"task_id": task_id, "phase": "start", "current": 0, "total": 1})
 
@@ -851,8 +877,8 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             log_tail.append(message)
             send_notification("task.log", {"task_id": task_id, "message": message})
 
-        # [Bug #30] 通知前端当前使用的用户配置最大尝试次数
-        log(f"快速扫描模式：使用用户配置的最大尝试次数 {getattr(options, 'qrcode_max_attempts', 180)}")
+        log(f"快速扫描范围：前 {page_limit} 页")
+        log(PdfScanSplitEngine._format_scan_options_log(options))
 
         result = PdfScanSplitEngine.scan_only(
             params.get("pdf_path", ""),
@@ -890,7 +916,7 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             "elapsed_ms": elapsed_ms,
             "cancelled": cancel_flag.is_set(),
             "error": str(exc),
-            "trace": traceback.format_exc(),
+            **({"trace": traceback.format_exc()} if ENGINE_DEBUG_ERRORS else {}),
         })
     finally:
         _release_task(task_id)
@@ -915,7 +941,11 @@ def handle_scan_preview_reference(params: dict) -> dict:
     import base64
     _ensure_pdf_scan_engine()
     if PdfScanSplitEngine is None:
-        return {"ok": False, "error": _pdf_scan_unavailable_message(), "trace": _PDF_SCAN_IMPORT_ERROR}
+        return {
+            "ok": False,
+            "error": _pdf_scan_unavailable_message(),
+            **({"trace": _PDF_SCAN_IMPORT_ERROR} if ENGINE_DEBUG_ERRORS else {}),
+        }
     path = str(params.get("reference_image_path", "") or "")
     if not path or not os.path.exists(path):
         return {"ok": False, "error": "参考文件不存在"}
@@ -1000,9 +1030,13 @@ def handle_history_get(params: dict) -> dict:
 
 def handle_history_clear(params: dict) -> dict:
     if _HISTORY_MANAGER is None:
-        return {"cleared": False}
-    _HISTORY_MANAGER.clear_history()
-    return {"cleared": True, "session_id": _HISTORY_MANAGER.session_id}
+        return {"cleared": False, "error": "历史记录管理器不可用"}
+    cleared = _HISTORY_MANAGER.clear_history()
+    return {
+        "cleared": cleared,
+        "session_id": _HISTORY_MANAGER.session_id,
+        **({"error": _HISTORY_MANAGER.last_error or "历史记录写入失败"} if not cleared else {}),
+    }
 
 
 def _normalize_operation_type(value: Any) -> Any:
@@ -1101,6 +1135,7 @@ def main() -> None:
             send(error_response(None, -32600, "Invalid Request"))
             continue
 
+        has_request_id = "id" in request
         req_id = request.get("id")
         # [P0 #1] 鉴权移入主循环 try 防护范围之外但仍需防御 TypeError：
         # compare_digest 收到非 ASCII str 会崩溃进程，统一转 utf-8 bytes 比较
@@ -1111,10 +1146,12 @@ def main() -> None:
                     supplied_token.encode("utf-8", "ignore"),
                     ENGINE_AUTH_TOKEN.encode("utf-8", "ignore"),
                 ):
-                    send(error_response(req_id, -32010, "Unauthorized"))
+                    if has_request_id:
+                        send(error_response(req_id, -32010, "Unauthorized"))
                     continue
             except Exception:
-                send(error_response(req_id, -32010, "Unauthorized"))
+                if has_request_id:
+                    send(error_response(req_id, -32010, "Unauthorized"))
                 continue
 
         method = str(request.get("method", "") or "")
@@ -1127,19 +1164,24 @@ def main() -> None:
             if not isinstance(params.get("files"), (list, tuple)):
                 params["files"] = []
             if len(params.get("files", [])) > 5000:
-                send(error_response(req_id, -32002, "文件列表过长（最多5000个）"))
+                if has_request_id:
+                    send(error_response(req_id, -32002, "文件列表过长（最多5000个）"))
                 continue
 
         handler = ROUTES.get(method)
         if not handler:
-            send(error_response(req_id, -32601, f"Method not found: {method}"))
+            if has_request_id:
+                send(error_response(req_id, -32601, f"Method not found: {method}"))
             continue
 
         try:
             result = handler(params)
-            send(success_response(req_id, result))
+            if has_request_id:
+                send(success_response(req_id, result))
         except Exception as exc:
-            send(error_response(req_id, -32000, str(exc), traceback.format_exc()))
+            trace = exception_trace_for_client(f"request failed: {method}")
+            if has_request_id:
+                send(error_response(req_id, -32000, str(exc), trace))
 
         # [Bug#2 Fix] shutdown 响应已发出，干净退出（atexit 会再刷一次盘兜底）
         if _SHUTDOWN_REQUESTED:

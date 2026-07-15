@@ -1,6 +1,7 @@
 import json
 import os
 import atexit
+import copy
 import tempfile
 from datetime import datetime
 from typing import Dict, List, Any, Optional
@@ -65,10 +66,18 @@ class OperationRecord:
 class HistoryManager:
     # 模块级常量避免每调用重建
     _allowed_fields = {field.name for field in fields(OperationRecord)}
+    _MAX_DETAILS_BYTES = 64 * 1024
+    _MAX_DETAIL_STRING_CHARS = 4096
+    _DETAIL_LIST_LIMITS = {
+        "log_tail": 80,
+        "operations": 20,
+        "errors": 20,
+        "output_files": 100,
+        "marker_pages": 100,
+        "suspect_segments": 100,
+    }
 
     def __init__(self, max_history_size: int = 100, storage_path: Optional[str] = None):
-        import uuid
-
         if not isinstance(max_history_size, int) or max_history_size <= 0:
             max_history_size = 100
 
@@ -76,6 +85,7 @@ class HistoryManager:
         self._storage_path = storage_path
         self.history: List[OperationRecord] = []
         self._lock = threading.Lock()
+        self._write_lock = threading.Lock()
         self.session_id = str(uuid.uuid4())[:8]
         self.last_error: Optional[str] = None
 
@@ -114,19 +124,116 @@ class HistoryManager:
             detail = details if isinstance(details, dict) else {}
         except Exception:
             detail = {}
+        if detail.get("cancelled"):
+            return "warning"
         if success is False or error_message:
             return "error"
         if success is True:
-            if detail.get("cancelled") or detail.get("suspect_segments"):
+            if detail.get("suspect_segments"):
                 return "warning"
             return "success"
-        if detail.get("cancelled") or detail.get("suspect_segments"):
+        if detail.get("suspect_segments"):
             return "warning"
         if any(token in text for token in _WARN_TOKENS):
             return "warning"
         if any(token in text for token in _DEBUG_TOKENS):
             return "debug"
         return "info"
+
+    @staticmethod
+    def _json_size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+    @classmethod
+    def _truncate_detail_value(cls, value: Any, key: str = "", depth: int = 0) -> Any:
+        if isinstance(value, str):
+            if len(value) <= cls._MAX_DETAIL_STRING_CHARS:
+                return value
+            return value[:cls._MAX_DETAIL_STRING_CHARS] + "…（已截断）"
+        if isinstance(value, list):
+            limit = cls._DETAIL_LIST_LIMITS.get(key, 100)
+            selected = value[-limit:] if key == "log_tail" else value[:limit]
+            return [cls._truncate_detail_value(item, depth=depth + 1) for item in selected]
+        if isinstance(value, dict):
+            if depth >= 8:
+                return {"truncated": True}
+            return {
+                str(item_key): cls._truncate_detail_value(item_value, str(item_key), depth + 1)
+                for item_key, item_value in value.items()
+            }
+        return value
+
+    @classmethod
+    def _shrink_largest_detail(cls, details: Dict[str, Any]) -> bool:
+        candidates = []
+        for key, value in details.items():
+            if key in {"details_truncated", "details_original_bytes"} or key.endswith("_truncated") or key.endswith("_original_count"):
+                continue
+            if isinstance(value, list) and not value:
+                continue
+            if isinstance(value, str) and not value:
+                continue
+            if isinstance(value, dict) and (not value or value == {"truncated": True}):
+                continue
+            try:
+                candidates.append((cls._json_size(value), key, value))
+            except (TypeError, ValueError):
+                continue
+        if not candidates:
+            return False
+
+        _, key, value = max(candidates, key=lambda item: item[0])
+        if isinstance(value, list):
+            details.setdefault(f"{key}_original_count", len(value))
+            details[f"{key}_truncated"] = True
+            if len(value) > 1:
+                keep = max(1, len(value) // 2)
+                details[key] = value[-keep:] if key == "log_tail" else value[:keep]
+            else:
+                details[key] = []
+        elif isinstance(value, str):
+            details[f"{key}_truncated"] = True
+            details[key] = value[:max(0, len(value) // 2)] if len(value) > 32 else ""
+        elif isinstance(value, dict):
+            details[f"{key}_truncated"] = True
+            details[key] = {"truncated": True}
+        else:
+            details.pop(key, None)
+        return True
+
+    @classmethod
+    def _limit_details(cls, details: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            original_size = cls._json_size(details)
+        except (TypeError, ValueError):
+            return details
+        if original_size <= cls._MAX_DETAILS_BYTES:
+            return details
+
+        compact = cls._truncate_detail_value(copy.deepcopy(details))
+        compact["details_truncated"] = True
+        compact["details_original_bytes"] = original_size
+        for key, limit in cls._DETAIL_LIST_LIMITS.items():
+            original = details.get(key)
+            if isinstance(original, list) and len(original) > limit:
+                compact[f"{key}_truncated"] = True
+                compact[f"{key}_original_count"] = len(original)
+
+        for _ in range(256):
+            if cls._json_size(compact) <= cls._MAX_DETAILS_BYTES:
+                break
+            if not cls._shrink_largest_detail(compact):
+                compact = {
+                    "details_truncated": True,
+                    "details_original_bytes": original_size,
+                }
+                break
+        if cls._json_size(compact) > cls._MAX_DETAILS_BYTES:
+            compact = {
+                "details_truncated": True,
+                "details_original_bytes": original_size,
+            }
+        return compact
 
     def add_record(self, operation_type, description: str,
                    details: Dict[str, Any], success: bool = True,
@@ -143,17 +250,7 @@ class HistoryManager:
         record_id = str(uuid.uuid4())[:8]
         timestamp = datetime.now().isoformat()
         details = details if isinstance(details, dict) else {}
-        # Cap single record details at 64 KB to prevent unbounded history growth
-        _MAX_DETAILS_BYTES = 64 * 1024
-        try:
-            import json as _json_mod
-            if len(_json_mod.dumps(details, ensure_ascii=False)) > _MAX_DETAILS_BYTES:
-                for _k in ("operations", "errors"):
-                    if _k in details and isinstance(details[_k], list):
-                        details = {**details, _k: details[_k][:10],
-                                   _k + "_truncated": True}
-        except Exception:
-            pass
+        details = self._limit_details(details)
         normalized_source = source or self.infer_source(operation_type)
         normalized_level = level or self.infer_level(success, error_message, details, description)
         normalized_message = message or description
@@ -200,28 +297,37 @@ class HistoryManager:
                     return record
             return None
 
-    def clear_history(self):
-        with self._lock:
-            self.history.clear()
-            self._dirty.set()
+    def clear_history(self) -> bool:
+        with self._write_lock:
+            with self._lock:
+                previous = list(self.history)
+                self.history.clear()
+                storage_path = self._storage_path
+                if storage_path and not self._save_to_file_unlocked([], storage_path):
+                    self.history = previous
+                    return False
+                self.last_error = None
+                self._dirty.clear()
+        return True
 
     def _save_to_file(self, snapshot: Optional[list[OperationRecord]] = None) -> bool:
-        storage_path = self.storage_path
-        if not storage_path:
-            return False
+        with self._write_lock:
+            storage_path = self.storage_path
+            if not storage_path:
+                return False
 
-        try:
-            self.last_error = None
-            parent = os.path.dirname(storage_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            if snapshot is None:
-                with self._lock:
-                    snapshot = list(self.history)
-            return self._save_to_file_unlocked(snapshot or [], storage_path)
-        except Exception as e:
-            self.last_error = str(e)
-            return False
+            try:
+                self.last_error = None
+                parent = os.path.dirname(storage_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                if snapshot is None:
+                    with self._lock:
+                        snapshot = list(self.history)
+                return self._save_to_file_unlocked(snapshot or [], storage_path)
+            except Exception as e:
+                self.last_error = str(e)
+                return False
 
     def _save_to_file_unlocked(self, snapshot: list[OperationRecord], storage_path: Optional[str] = None) -> bool:
         storage_path = storage_path or self.storage_path
@@ -230,6 +336,7 @@ class HistoryManager:
         data = [record.to_dict() for record in snapshot]
         parent = os.path.dirname(storage_path) or "."
         try:
+            os.makedirs(parent, exist_ok=True)
             # 使用唯一临时文件名避免并发覆盖
             fd, tmp_path = tempfile.mkstemp(dir=parent, suffix=".tmp", prefix="hist_")
             try:
@@ -291,34 +398,46 @@ class HistoryManager:
             return
 
     def _writer_loop(self) -> None:
+        retry_delay = 5.0
         while not self._writer_stop.is_set():
             try:
-                if self._dirty.wait(5):
-                    self._dirty.clear()
-                    self._flush_to_disk()
+                if self._writer_stop.wait(retry_delay):
+                    break
+                if not self._dirty.is_set():
+                    retry_delay = 5.0
+                    continue
+                self._dirty.clear()
+                if self._flush_to_disk():
+                    retry_delay = 5.0
+                else:
+                    self._dirty.set()
+                    retry_delay = min(retry_delay * 2.0, 60.0)
             except Exception as e:
                 self.last_error = f"历史记录后台写入线程异常: {e}"
-                try:
-                    self._dirty.set()
-                except Exception:
-                    pass
+                self._dirty.set()
+                retry_delay = min(retry_delay * 2.0, 60.0)
 
-    def _flush_to_disk(self) -> None:
-        storage_path = self.storage_path
-        if not storage_path:
-            return
-        with self._lock:
-            snapshot = list(self.history)
-        try:
-            self._save_to_file_unlocked(snapshot, storage_path)
-        except Exception as e:
-            self.last_error = str(e)
+    def _flush_to_disk(self) -> bool:
+        with self._write_lock:
+            with self._lock:
+                storage_path = self._storage_path
+                snapshot = list(self.history)
+            if not storage_path:
+                return True
+            try:
+                return self._save_to_file_unlocked(snapshot, storage_path)
+            except Exception as e:
+                self.last_error = str(e)
+                return False
 
     def _flush_exit(self) -> None:
         writer_stop = getattr(self, "_writer_stop", None)
         writer_thread = getattr(self, "_writer_thread", None)
         if writer_stop is not None:
             writer_stop.set()
+        dirty = getattr(self, "_dirty", None)
+        if dirty is not None:
+            dirty.set()
         if writer_thread is not None and writer_thread.is_alive():
             writer_thread.join(timeout=5)  # 等 _writer_loop 自然退出，避免双写
         self._flush_to_disk()             # 补刷一次，确保退出前数据落盘

@@ -1,42 +1,39 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { RenameRule } from "../../../env";
+import type { RenameRule, RenameRuleOf, RenameRulePatch } from "../../../env";
 import AppSelect from "../../common/AppSelect.vue";
+import { findRenameRule, inputPositiveInt, upsertRenameRule } from "../../../utils";
 
 const props = defineProps<{ rules: RenameRule[] }>();
 const emit = defineEmits<{ "update:rules": [rules: RenameRule[]] }>();
 
-const rule = computed<RenameRule>(() => {
-  const found = props.rules.find((r) => r.type === "delete_chars");
-  return found || { type: "delete_chars", delete_type: "删除指定字符", chars: "", count: 1 };
+type DeleteRule = RenameRuleOf<"delete_chars">;
+type KeepRule = RenameRuleOf<"keep_chars">;
+
+const rule = computed<DeleteRule>(() => {
+  return findRenameRule(props.rules, "delete_chars", { delete_type: "删除指定字符", chars: "", count: 1 });
 });
-const keepRule = computed<RenameRule>(() => {
-  const found = props.rules.find((r) => r.type === "keep_chars");
-  return found || { type: "keep_chars", mode: "range", range: "", direction: "从右往左" };
+const keepRule = computed<KeepRule>(() => {
+  return findRenameRule(props.rules, "keep_chars", { mode: "range", range: "", direction: "从右往左" });
 });
 
-function patch(p: Partial<RenameRule>) {
-  const next = [...props.rules];
-  const idx = next.findIndex((r) => r.type === "delete_chars");
-  if (idx >= 0) next[idx] = { ...next[idx], ...p };
-  else next.push({ type: "delete_chars", delete_type: "删除指定字符", chars: "", count: 1, ...p });
-  emit("update:rules", next);
+function patch(p: RenameRulePatch<"delete_chars">) {
+  emit("update:rules", upsertRenameRule(props.rules, "delete_chars", { delete_type: "删除指定字符", chars: "", count: 1 }, p));
 }
 
-function patchKeep(p: Partial<RenameRule>) {
+function patchKeep(p: RenameRulePatch<"keep_chars">) {
   const next = [...props.rules];
   const idx = next.findIndex((r) => r.type === "keep_chars");
-  const current: Partial<RenameRule> = idx >= 0 ? next[idx] : {};
-  const mode = p.mode || current.mode || "range";
-  const base = mode === "specified"
+  const current = idx >= 0 ? next[idx] as KeepRule : keepRule.value;
+  const mode = p.mode || current.mode;
+  const base: KeepRule = mode === "specified"
     ? { type: "keep_chars", mode: "specified", chars: current.mode === "specified" ? current.chars || "" : "" }
     : { type: "keep_chars", mode: "range", range: current.mode === "range" ? current.range || "" : "", direction: current.mode === "range" ? current.direction || "从右往左" : "从右往左" };
-  if (idx >= 0) next[idx] = { ...base, ...p };
-  else next.push({ ...base, ...p });
+  const updated: KeepRule = { ...base, ...p, type: "keep_chars", mode };
+  if (idx >= 0) next[idx] = updated;
+  else next.push(updated);
   emit("update:rules", next);
 }
-
-import { positiveInt } from "../../../utils";
 
 const targets = computed<string[]>(() => Array.isArray(rule.value.targets) ? rule.value.targets : []);
 const deleteTypeOptions = [
@@ -65,7 +62,7 @@ function togglePattern(key: string, on: boolean) {
       <summary>① 删除字符</summary>
     <div class="grid">
       <label class="label-inline">方式</label>
-      <AppSelect :model-value="rule.delete_type || '删除指定字符'" :options="deleteTypeOptions" @update:model-value="patch({ delete_type: $event as string })" />
+      <AppSelect :model-value="rule.delete_type || '删除指定字符'" :options="deleteTypeOptions" @update:model-value="patch({ delete_type: $event as DeleteRule['delete_type'] })" />
 
       <template v-if="rule.delete_type === '删除指定字符'">
         <label class="label-inline">字符</label>
@@ -84,7 +81,7 @@ function togglePattern(key: string, on: boolean) {
           type="number"
           min="1"
           :value="rule.count ?? 1"
-          @input="patch({ count: positiveInt(($event.target as HTMLInputElement).value) })"
+          @input="patch({ count: inputPositiveInt(($event.target as HTMLInputElement).value) })"
         />
       </template>
 
@@ -129,7 +126,7 @@ function togglePattern(key: string, on: boolean) {
         <label class="label-inline">范围</label>
         <input class="input" placeholder="例如：1-5" :value="keepRule.range || ''" @input="patchKeep({ mode: 'range', range: ($event.target as HTMLInputElement).value })" />
         <label class="label-inline">方向</label>
-        <AppSelect :model-value="keepRule.direction || '从右往左'" :options="directionOptions" @update:model-value="patchKeep({ mode: 'range', direction: $event as string })" />
+        <AppSelect :model-value="keepRule.direction || '从右往左'" :options="directionOptions" @update:model-value="patchKeep({ mode: 'range', direction: $event as NonNullable<KeepRule['direction']> })" />
         <label class="checkbox span-2">
           <input type="radio" name="keep-mode" :checked="keepRule.mode === 'specified'" @change="patchKeep({ mode: 'specified' })" />
           保留指定字符

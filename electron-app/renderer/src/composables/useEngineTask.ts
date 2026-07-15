@@ -12,8 +12,8 @@ export type TaskState = {
 
 export type TaskCompleteHandler = (
   payload:
-    | { ok: true; result: any; taskType?: string; elapsedMs?: number; cancelled?: boolean }
-    | { ok: false; error: string; trace?: string; result?: any; taskType?: string; elapsedMs?: number; cancelled?: boolean },
+    | { ok: true; result: unknown; taskType?: string; elapsedMs?: number; cancelled?: boolean }
+    | { ok: false; error: string; trace?: string; result?: unknown; taskType?: string; elapsedMs?: number; cancelled?: boolean },
 ) => void;
 
 export type TaskStartResult = { task_id: string; queued?: boolean; position?: number };
@@ -27,7 +27,6 @@ export function useEngineTask(opts: {
 }) {
   // 保留最新的 onComplete 引用，给 engine.status 监听器使用
   const onCompleteRef = { current: opts.onComplete };
-  onCompleteRef.current = opts.onComplete;
 
   const state = ref<TaskState>({
     taskId: null,
@@ -44,7 +43,6 @@ export function useEngineTask(opts: {
   const cancellable = computed(() => Boolean(state.value.taskId) && (pending.value || state.value.running || state.value.queued));
 
   let unsubscribe: (() => void) | null = null;
-  let unsubscribeStatus: (() => void) | null = null;
 
   function start(taskId: string) {
     reset();
@@ -52,32 +50,28 @@ export function useEngineTask(opts: {
     state.value.taskId = taskId;
     state.value.running = false;
     state.value.queued = false;
-    onCompleteRef.current = opts.onComplete;
-
-    // #22 订阅 engine.status 通知：engine 崩溃后发出 error，需要重置 running 避免卡死
-    // preload 未暴露专用 onEngineStatus，统一通过 onNotification 监听 method === "engine.status"
-    unsubscribeStatus = window.engine?.onNotification(({ method, params }) => {
-      if (method !== "engine.status") return;
-      const status = String(params?.status || "");
-      if (status === "error" && (state.value.running || pending.value)) {
-        const prevTaskId = state.value.taskId;
-        state.value.running = false;
-        state.value.queued = false;
-        state.value.taskId = "";
-        pending.value = false;
-        cleanup();
-        if (prevTaskId) {
-          onCompleteRef.current?.({
-            ok: false,
-            error: "引擎异常断开",
-            cancelled: false,
-            result: null,
-          });
-        }
-      }
-    }) ?? null;
 
     unsubscribe = window.engine?.onNotification(({ method, params }) => {
+      if (method === "engine.status") {
+        const status = String(params?.status || "");
+        if (status === "error" && (state.value.running || pending.value)) {
+          const prevTaskId = state.value.taskId;
+          state.value.running = false;
+          state.value.queued = false;
+          state.value.taskId = "";
+          pending.value = false;
+          cleanup();
+          if (prevTaskId) {
+            onCompleteRef.current?.({
+              ok: false,
+              error: "引擎异常断开",
+              cancelled: false,
+              result: null,
+            });
+          }
+        }
+        return;
+      }
       if (!params || params.task_id !== state.value.taskId) return;
       if (method === "task.progress") {
         pending.value = false;
@@ -119,7 +113,7 @@ export function useEngineTask(opts: {
         state.value.queued = false;
         cleanup();
         if (params.ok) {
-          opts.onComplete?.({
+          onCompleteRef.current?.({
             ok: true,
             result: params.result,
             taskType: params.task_type,
@@ -127,9 +121,9 @@ export function useEngineTask(opts: {
             cancelled: Boolean(params.cancelled),
           });
         } else {
-          opts.onComplete?.({
+          onCompleteRef.current?.({
             ok: false,
-            error: params.error,
+            error: params.error || "任务执行失败",
             trace: params.trace,
             result: params.result,
             taskType: params.task_type,
@@ -181,10 +175,6 @@ export function useEngineTask(opts: {
     if (unsubscribe) {
       unsubscribe();
       unsubscribe = null;
-    }
-    if (unsubscribeStatus) {
-      unsubscribeStatus();
-      unsubscribeStatus = null;
     }
   }
 

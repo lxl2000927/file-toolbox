@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, toRaw, onBeforeUnmount, onMounted } from "vue";
+import { ref, computed, watch, toRaw, onBeforeUnmount, onMounted, shallowRef, triggerRef } from "vue";
 import InsertTab from "./rename/InsertTab.vue";
 import ReplaceTab from "./rename/ReplaceTab.vue";
 import DeleteTab from "./rename/DeleteTab.vue";
@@ -8,8 +8,8 @@ import CustomTab from "./rename/CustomTab.vue";
 import type { FileOperation, RenameRule, RenamePreviewItem, ExecuteSummary } from "../../env";
 import { useAppDialog } from "../../composables/useAppDialog";
 import { useToast } from "../../composables/useToast";
-import { formatEngineError } from "../../utils";
-import AppIcon from "../common/AppIcon.vue";
+import { fileBasename, formatEngineError } from "../../utils";
+import PanelBanner from "../common/PanelBanner.vue";
 
 type TabKey = "insert" | "replace" | "delete" | "smart" | "custom";
 type NaturalSortPart = { type: "number"; value: number } | { type: "text"; value: string };
@@ -40,8 +40,6 @@ const deleteTabRules = ref<RenameRule[]>([]);
 const smartTabRules = ref<RenameRule[]>([]);
 const customTabRules = ref<RenameRule[]>([]);
 
-const fileBasename = (p: string) => p.split(/[\\/]/).pop() || p;
-
 const sortDir = ref<"asc" | "desc" | null>(null);
 const sortMode = ref<"name" | "size">("name");
 const sortMenuOpen = ref(false);
@@ -54,24 +52,13 @@ const dragTargetPos = ref<"before" | "after" | null>(null);
 const rowDragPointerId = ref<number | null>(null);
 const rowDragColumnX = ref<number | null>(null);
 const rowDragLastMoveAt = ref(0);
-const fileSizes = ref<Map<string, number>>(new Map());
-
-const activeRules = computed({
-  get: () => {
-    if (activeTab.value === "insert") return insertTabRules.value;
-    if (activeTab.value === "replace") return replaceTabRules.value;
-    if (activeTab.value === "delete") return deleteTabRules.value;
-    if (activeTab.value === "smart") return smartTabRules.value;
-    return customTabRules.value;
-  },
-  set: (value: RenameRule[]) => {
-    if (activeTab.value === "insert") insertTabRules.value = value;
-    else if (activeTab.value === "replace") replaceTabRules.value = value;
-    else if (activeTab.value === "delete") deleteTabRules.value = value;
-    else if (activeTab.value === "smart") smartTabRules.value = value;
-    else customTabRules.value = value;
-  },
-});
+const fileSizes = shallowRef<Map<string, number>>(new Map());
+const tableWrapRef = ref<HTMLElement | null>(null);
+const tableScrollTop = ref(0);
+const tableViewportHeight = ref(0);
+const RENAME_ROW_HEIGHT = 36;
+const RENAME_ROW_OVERSCAN = 12;
+let tableResizeObserver: ResizeObserver | null = null;
 
 function naturalSortKey(name: string): NaturalSortPart[] {
   const stem = name.replace(/\.[^/.]*$/, "");
@@ -100,10 +87,11 @@ function compareNaturalNames(a: string, b: string) {
   return 0;
 }
 
+const insertionIndex = computed(() => new Map(files.value.map((file, index) => [file, index])));
+
 const sortedFiles = computed(() => {
   if (!sortDir.value) return files.value;
   const arr = [...files.value];
-  const insertIndex = new Map(files.value.map((file, index) => [file, index]));
   arr.sort((a, b) => {
     if (sortMode.value === "size") {
       const sa = fileSizes.value.get(a) || 0;
@@ -113,10 +101,31 @@ const sortedFiles = computed(() => {
       const result = compareNaturalNames(fileBasename(a), fileBasename(b));
       if (result !== 0) return sortDir.value === "asc" ? result : -result;
     }
-    return (insertIndex.get(a) || 0) - (insertIndex.get(b) || 0);
+    return (insertionIndex.value.get(a) || 0) - (insertionIndex.value.get(b) || 0);
   });
   return arr;
 });
+
+const visibleWindow = computed(() => {
+  const total = sortedFiles.value.length;
+  if (total <= 300) return { files: sortedFiles.value, start: 0, top: 0, bottom: 0 };
+  const visibleCount = Math.max(1, Math.ceil(tableViewportHeight.value / RENAME_ROW_HEIGHT));
+  const start = Math.max(0, Math.floor(tableScrollTop.value / RENAME_ROW_HEIGHT) - RENAME_ROW_OVERSCAN);
+  const end = Math.min(total, start + visibleCount + RENAME_ROW_OVERSCAN * 2);
+  return {
+    files: sortedFiles.value.slice(start, end),
+    start,
+    top: start * RENAME_ROW_HEIGHT,
+    bottom: Math.max(0, (total - end) * RENAME_ROW_HEIGHT),
+  };
+});
+
+function syncTableViewport() {
+  const element = tableWrapRef.value;
+  if (!element) return;
+  tableScrollTop.value = element.scrollTop;
+  tableViewportHeight.value = element.clientHeight;
+}
 
 const targetFiles = computed(() =>
   sortedFiles.value.filter((p) => selected.value.has(p)),
@@ -149,30 +158,35 @@ function isEffectiveRule(rule: RenameRule) {
   return true;
 }
 
+const sharedInsertNumberRule = computed(() => (
+  insertTabRules.value.find((rule) => rule.type === "insert_number")
+  || customTabRules.value.find((rule) => rule.type === "insert_number")
+));
+
 const currentRules = computed(() => {
-  const source = [
-    ...insertTabRules.value,
+  return [
+    ...insertTabRules.value.filter((rule) => rule.type !== "insert_number"),
+    ...(sharedInsertNumberRule.value ? [sharedInsertNumberRule.value] : []),
     ...replaceTabRules.value,
     ...deleteTabRules.value,
     ...smartTabRules.value,
-    ...customTabRules.value,
-  ];
-  // 所有规则类型统一去重：每种 type 只保留最后出现的那条（由 Tab 优先级决定）
-  // 注意：insert_number 类型在 InsertTab 和 CustomTab 都可能被添加，
-  // 两者都会管理编号规则，后修改者生效（覆盖前者）。
-  // 若需独立控制，可在 UI 上对 CustomTab 的 insert_number 添加做禁用提示。
-  const result: RenameRule[] = [];
-  for (const rule of source) {
-    if (!isEffectiveRule(rule)) continue;
-    const idx = result.findIndex((r) => r.type === rule.type);
-    if (idx >= 0) {
-      result[idx] = rule;
-    } else {
-      result.push(rule);
-    }
-  }
-  return result;
+    ...customTabRules.value.filter((rule) => rule.type !== "insert_number"),
+  ].filter(isEffectiveRule);
 });
+
+const customEditorRules = computed(() => [
+  ...customTabRules.value.filter((rule) => rule.type !== "insert_number"),
+  ...(sharedInsertNumberRule.value ? [sharedInsertNumberRule.value] : []),
+]);
+
+function updateCustomEditorRules(rules: RenameRule[]) {
+  const numberRule = rules.find((rule) => rule.type === "insert_number");
+  customTabRules.value = rules.filter((rule) => rule.type !== "insert_number");
+  insertTabRules.value = [
+    ...insertTabRules.value.filter((rule) => rule.type !== "insert_number"),
+    ...(numberRule ? [numberRule] : []),
+  ];
+}
 
 const bridgeFiles = computed(() => [...targetFiles.value]);
 const bridgeRules = computed(() => currentRules.value.map((rule) => structuredClone(toRaw(rule))));
@@ -314,10 +328,17 @@ onBeforeUnmount(() => {
   // 防御性移除列宽拖拽监听器，避免组件销毁时残留
   document.removeEventListener("mousemove", onColMove);
   document.removeEventListener("mouseup", onColUp);
+  tableResizeObserver?.disconnect();
+  tableResizeObserver = null;
 });
 
 onMounted(() => {
   document.addEventListener("click", closeSortMenu);
+  syncTableViewport();
+  if (typeof ResizeObserver !== "undefined" && tableWrapRef.value) {
+    tableResizeObserver = new ResizeObserver(syncTableViewport);
+    tableResizeObserver.observe(tableWrapRef.value);
+  }
 });
 
 const previewTimer = ref<number | null>(null);
@@ -328,7 +349,6 @@ watch(
   () => {
     schedulePreview();
   },
-  { deep: true },
 );
 
 function schedulePreview() {
@@ -349,8 +369,8 @@ async function doPreview() {
     error.value = "";
     const result = await window.engine.rename.preview(filesSnapshot, rulesSnapshot);
     if (token === previewToken.value) previews.value = result;
-  } catch (e: any) {
-    if (token === previewToken.value) error.value = formatEngineError(e);
+  } catch (caught) {
+    if (token === previewToken.value) error.value = formatEngineError(caught);
   }
 }
 
@@ -391,7 +411,10 @@ function appendFiles(paths: string[]) {
   const addedPaths: string[] = [];
   for (const p of paths) {
     if (!p) continue;
-    if (!set.has(p)) addedPaths.push(p);
+    if (!set.has(p)) {
+      set.add(p);
+      addedPaths.push(p);
+    }
   }
   const MAX_FILES = 5000;
   if (addedPaths.length + files.value.length > MAX_FILES) {
@@ -403,9 +426,8 @@ function appendFiles(paths: string[]) {
     addedPaths.splice(allowed);
     toast.info(`文件数量超过上限 ${MAX_FILES}，仅添加前 ${allowed} 个`);
   }
-  for (const p of addedPaths) set.add(p);
   const prevCount = files.value.length;
-  files.value = Array.from(set);
+  files.value = [...files.value, ...addedPaths];
   const addedCount = files.value.length - prevCount;
   if (addedCount > 0) toast.success(`已添加 ${addedCount} 个文件`);
   for (const p of addedPaths) selectedSet.add(p);
@@ -419,13 +441,22 @@ function updateFileSizes(paths: string[], replace = false) {
   const targetPaths = Array.from(new Set(paths)).filter(Boolean);
   if (!targetPaths.length) return;
   if (window.electronAPI?.statPaths) {
-    window.electronAPI.statPaths(targetPaths).then((stats) => {
-      for (const s of stats) {
-        if (s.isFile && s.size >= 0) {
-          fileSizes.value.set(s.path, s.size);
+    window.electronAPI.statPaths(targetPaths).then((results) => {
+      const failures: string[] = [];
+      for (const result of results) {
+        if (!result.ok) {
+          failures.push(result.error.message);
+          continue;
+        }
+        const stat = result.value;
+        if (stat.isFile && stat.size >= 0) {
+          fileSizes.value.set(stat.path, stat.size);
         }
       }
-      fileSizes.value = new Map(fileSizes.value);
+      triggerRef(fileSizes);
+      if (failures.length) {
+        toast.info(`${failures.length} 个文件无法读取大小：${failures[0]}`);
+      }
     });
   }
 }
@@ -445,7 +476,7 @@ function removeFile(path: string) {
   selected.value.delete(path);
   selected.value = new Set(selected.value);
   fileSizes.value.delete(path);
-  fileSizes.value = new Map(fileSizes.value);
+  triggerRef(fileSizes);
   summary.value = null;
 }
 
@@ -527,8 +558,8 @@ async function execute() {
         updateFileSizes(files.value, true);
       }
     }
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
   } finally {
     executing.value = false;
   }
@@ -559,11 +590,11 @@ async function undo() {
     lastOperations.value = [];
     undoToken.value = "";
     summary.value = null;
-    if (r?.failed?.length) error.value = `部分撤销失败：${r.failed.map((it: any) => it.error || it.path).join("；")}`;
+    if (r?.failed?.length) error.value = `部分撤销失败：${r.failed.map((item) => item.error || item.path).join("；")}`;
     else error.value = "";
     await doPreview();
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
   }
 }
 
@@ -627,12 +658,7 @@ function onColUp() {
 
 <template>
   <div class="rename-shell panel-shell panel-shell-responsive">
-    <div class="banner panel-header rename-banner" :class="`banner-${renameBannerKind}`">
-      <span class="banner-icon"><AppIcon :name="renameBannerIcon" /></span>
-      <span class="banner-title">批量重命名</span>
-      <span class="banner-text">{{ renameBannerMessage }}</span>
-      <span class="banner-kbd">支持拖拽</span>
-    </div>
+    <PanelBanner class="rename-banner" :kind="renameBannerKind" :icon="renameBannerIcon" title="批量重命名" :message="renameBannerMessage" hint="支持拖拽" />
 
     <!-- 主体：左大表 + 右 Tab 规则 -->
     <div class="rename-grid panel-grid">
@@ -646,13 +672,14 @@ function onColUp() {
           <span class="flex-1" />
           <button class="btn btn-secondary btn-pill" :disabled="!files.length" @click="invertSelection">反选</button>
         </div>
-        <div class="table-wrap drop-area" :class="{ dragging: dragOver }" @dragover="onFileAreaDragOver" @dragleave="dragOver = false" @drop="onDrop($event)">
+        <div ref="tableWrapRef" class="table-wrap drop-area" :class="{ dragging: dragOver }" @scroll.passive="syncTableViewport" @dragover="onFileAreaDragOver" @dragleave="dragOver = false" @drop="onDrop($event)">
           <table
             v-if="files.length"
             ref="renameTableRef"
             class="data-table rename-table"
             :class="{ 'row-sorting': draggingFile }"
             :style="{ '--col-check-width': colCheckWidth + 'px' }"
+            :aria-rowcount="sortedFiles.length + 1"
           >
             <colgroup>
               <col class="col-check-def" />
@@ -699,12 +726,15 @@ function onColUp() {
                 <th class="col-ops" scope="col"></th>
               </tr>
             </thead>
-            <!-- TODO: 引入虚拟滚动（vue-virtual-scroller）支持大量文件 -->
             <tbody>
+              <tr v-if="visibleWindow.top" class="virtual-spacer-row" aria-hidden="true">
+                <td colspan="3" :style="{ height: `${visibleWindow.top}px` }"></td>
+              </tr>
               <tr
-                v-for="f in sortedFiles"
+                v-for="(f, visibleIndex) in visibleWindow.files"
                 :key="f"
                 :data-file-path="f"
+                :aria-rowindex="visibleWindow.start + visibleIndex + 2"
                 :class="{
                   'diff-row': previewMap.get(f) && previewMap.get(f) !== fileBasename(f),
                   'row-dragging': draggingFile === f,
@@ -742,6 +772,9 @@ function onColUp() {
                   </div>
                 </td>
               </tr>
+              <tr v-if="visibleWindow.bottom" class="virtual-spacer-row" aria-hidden="true">
+                <td colspan="3" :style="{ height: `${visibleWindow.bottom}px` }"></td>
+              </tr>
             </tbody>
           </table>
           <div v-else class="empty-state empty-drop-state">
@@ -771,7 +804,7 @@ function onColUp() {
           <ReplaceTab v-else-if="activeTab === 'replace'" :rules="replaceTabRules" @update:rules="replaceTabRules = $event" />
           <DeleteTab v-else-if="activeTab === 'delete'" :rules="deleteTabRules" @update:rules="deleteTabRules = $event" />
           <SmartTab v-else-if="activeTab === 'smart'" :rules="smartTabRules" @update:rules="smartTabRules = $event" />
-          <CustomTab v-else :rules="customTabRules" @update:rules="customTabRules = $event" />
+          <CustomTab v-else :rules="customEditorRules" @update:rules="updateCustomEditorRules" />
         </div>
 
         <!-- 底部：选项与操作 -->
@@ -888,6 +921,18 @@ function onColUp() {
 .rename-table tbody tr {
   position: relative;
   transition: background-color var(--transition-fast), opacity 120ms ease, transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1), filter 140ms ease, box-shadow 140ms ease;
+}
+.rename-table tbody tr:not(.virtual-spacer-row) {
+  height: 36px;
+}
+.rename-table .virtual-spacer-row,
+.rename-table .virtual-spacer-row:hover {
+  height: auto;
+  background: transparent;
+}
+.rename-table .virtual-spacer-row td {
+  padding: 0;
+  border: 0;
 }
 .rename-row-move {
   transition: transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1);

@@ -2,7 +2,7 @@
 
 一款面向 Windows 的桌面文件处理工具，专注批量文件重命名、PDF 普通拆分、PDF 扫描拆分与操作历史追踪。
 
-![Version](https://img.shields.io/badge/version-v2.4.0-5b6ee1?style=flat-square)
+![Version](https://img.shields.io/badge/version-v2.5.0-5b6ee1?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-2f80ed?style=flat-square)
 ![Desktop](https://img.shields.io/badge/desktop-Electron%20%2B%20Vue-42b883?style=flat-square)
 ![Engine](https://img.shields.io/badge/engine-Python-3776ab?style=flat-square)
@@ -20,24 +20,6 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 [下载最新版](https://github.com/lxl2000927/file-toolbox/releases/latest) · [查看发布记录](https://github.com/lxl2000927/file-toolbox/releases) · [提交问题](https://github.com/lxl2000927/file-toolbox/issues)
 
 > v2.0.0 起，File Toolbox 已从旧版 PyQt 桌面应用迁移为 Electron 桌面应用，旧 PyQt 入口、旧窗口面板和旧发布脚本已移除。
-
-## 界面预览
-
-### 批量重命名
-
-![批量重命名界面](docs/images/rename.png)
-
-### PDF 普通拆分
-
-![PDF 普通拆分界面](docs/images/pdf-split.png)
-
-### PDF 扫描拆分
-
-![PDF 扫描拆分界面](docs/images/scan-split.png)
-
-### 历史日志与设置
-
-![历史日志与设置界面](docs/images/settings-logs.png)
 
 ## 功能特性
 
@@ -80,15 +62,16 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 从 GitHub Releases 下载对应版本：
 
-- `File Toolbox-2.4.0-x64-setup.exe`：安装版。
-- `File Toolbox-2.4.0-x64-portable.exe`：便携单文件版。
-- `File Toolbox-2.4.0-x64.zip`：压缩版。
+- `File.Toolbox-2.5.0-x64-setup.exe`：安装版。
+- `File.Toolbox-2.5.0-x64-portable.exe`：便携单文件版。
+- `File.Toolbox-2.5.0-x64.zip`：压缩版。
 
 下载后按版本类型运行：
 
 - 安装版：运行安装程序，安装完成后从开始菜单或桌面快捷方式启动。
 - 便携单文件版：直接双击 exe 运行。
 - 压缩版：解压 zip 后运行目录内的 `File Toolbox.exe`。
+- NSIS 安装版支持在“设置 → 更新”中检查、下载并重启安装新版本；便携版和压缩版通过发布页手动更新。
 
 ### 使用提示
 
@@ -161,9 +144,9 @@ npm run package
 
 默认输出目录为 `electron-app/release`，会生成：
 
-- 安装版：`File Toolbox-2.4.0-x64-setup.exe`
-- 便携单文件版：`File Toolbox-2.4.0-x64-portable.exe`
-- 压缩版：`File Toolbox-2.4.0-x64.zip`
+- 安装版：`File.Toolbox-2.5.0-x64-setup.exe`
+- 便携单文件版：`File.Toolbox-2.5.0-x64-portable.exe`
+- 压缩版：`File.Toolbox-2.5.0-x64.zip`
 
 也可以单独打包指定版本：
 
@@ -172,6 +155,15 @@ npm run package:nsis
 npm run package:portable
 npm run package:zip
 ```
+
+发布可供软件内更新的正式版本时，需要设置 `GH_TOKEN`，并确保 `package.json` 版本与 Git 标签一致：
+
+```powershell
+$env:GH_TOKEN="<GitHub token>"
+npm run package:publish
+```
+
+GitHub Release 必须包含 NSIS 安装包、`latest.yml` 和对应的 `.blockmap`。客户端使用 `latest.yml` 中的版本、下载地址和 SHA-512 校验信息完成更新；草稿版和预发布版不会进入正式更新通道。
 
 ## 项目结构
 

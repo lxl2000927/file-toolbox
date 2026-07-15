@@ -8,6 +8,12 @@ type JsonRpcResponse = {
   id: number | null;
 };
 
+type JsonRpcNotification = {
+  jsonrpc: "2.0";
+  method: string;
+  params?: unknown;
+};
+
 type NotificationHandler = (method: string, params: any) => void;
 type ExitHandler = (err: Error) => void;
 
@@ -68,7 +74,11 @@ export class PythonBridge {
       this.process = spawn(command, args, {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-        env: { ...process.env, FILE_TOOLBOX_ENGINE_TOKEN: authToken },
+        env: {
+          ...process.env,
+          FILE_TOOLBOX_ENGINE_TOKEN: authToken,
+          FILE_TOOLBOX_ENGINE_DEBUG_ERRORS: isDev ? "1" : "0",
+        },
       });
 
       const rl = createInterface({ input: this.process.stdout! });
@@ -138,16 +148,16 @@ export class PythonBridge {
   async call(method: string, params: any = {}, timeout?: number): Promise<any> {
     if (!this.process) throw new Error("PythonBridge 未启动");
     if (!this.process.stdin || this.process.killed) throw new Error("PythonBridge 不可用");
-    const id = ++this.reqId;
-    if (!Number.isFinite(id)) this.reqId = 1;
-    const safeParams = JSON.parse(JSON.stringify(params, (k, v) =>
-      typeof v === "number" && !Number.isFinite(v) ? null : v
-    ));
-    const request = JSON.stringify({ jsonrpc: "2.0", id, method, params: safeParams, auth: this.authToken });
+    this.reqId = this.reqId >= Number.MAX_SAFE_INTEGER ? 1 : this.reqId + 1;
+    const id = this.reqId;
+    const request = JSON.stringify(
+      { jsonrpc: "2.0", id, method, params, auth: this.authToken },
+      (_key, value) => typeof value === "number" && !Number.isFinite(value) ? null : value,
+    );
     // 默认 120s；已知同步长操作（rename.execute）延长到 300s
     // [Bug#3 Fix] 移除已下线的 pdf_split.execute（P0#4 改为 execute_async，异步立即返回）
     const LONG_RUN_METHODS = new Set(["rename.execute"]);
-    const timeoutMs = timeout ?? (LONG_RUN_METHODS.has(method) ? 300000 : 120000);
+    const timeoutMs = timeout ?? (method === "task.cancel" ? 10000 : LONG_RUN_METHODS.has(method) ? 300000 : 120000);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pending.has(id)) {
@@ -185,7 +195,11 @@ export class PythonBridge {
   }
 
   async shutdown(): Promise<void> {
-    if (!this.process) return;
+    if (!this.process) {
+      this.notificationHandlers.clear();
+      this.exitHandlers.clear();
+      return;
+    }
     if (this._shuttingDown) return;  // 防止 window-all-closed + before-quit 双重 shutdown
     this._shuttingDown = true;
     this.rejectPending(new Error("PythonBridge 已关闭"));
@@ -202,23 +216,30 @@ export class PythonBridge {
       // ignore
     }
     this.process = null;
+    this.notificationHandlers.clear();
+    this.exitHandlers.clear();
   }
 
   private _handleLine(line: string): void {
     line = line.trim();
     if (!line) return;
 
-    let msg: JsonRpcResponse;
+    let msg: JsonRpcResponse | JsonRpcNotification;
     try {
-      msg = JSON.parse(line);
+      const parsed: unknown = JSON.parse(line);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        console.warn("[python-bridge] 忽略非对象 JSON 消息", line.slice(0, 120));
+        return;
+      }
+      msg = parsed as JsonRpcResponse | JsonRpcNotification;
     } catch {
       console.warn("[python-bridge] 无法解析响应行（非 JSON）:", line.slice(0, 120));
       return;
     }
 
-    if (msg.id == null) {
-      const method = (msg as any).method;
-      const params = (msg as any).params;
+    if (!("id" in msg) || msg.id == null) {
+      const method = "method" in msg && typeof msg.method === "string" ? msg.method : "";
+      const params = "params" in msg ? msg.params : undefined;
       if (method === "ready") {
         if (this.readyResolver) {
           const r = this.readyResolver;

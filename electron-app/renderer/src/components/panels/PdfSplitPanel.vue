@@ -1,12 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, watch, onBeforeUnmount } from "vue";
-import type { PdfSplitConfig, PdfSplitPlan, ExecuteSummary } from "../../env";
+import type { PdfSplitConfig, PdfSplitMode, PdfSplitPlan, ExecuteSummary } from "../../env";
 import { useEngineTask, generateTaskId } from "../../composables/useEngineTask";
 import { useToast } from "../../composables/useToast";
 import { useAppDialog } from "../../composables/useAppDialog";
-import { positiveInt, formatEngineError } from "../../utils";
+import { fileBasename, positiveInt, positiveNumber, inputPositiveInt, inputPositiveNumber, formatEngineError } from "../../utils";
 import AppSelect from "../common/AppSelect.vue";
-import AppIcon from "../common/AppIcon.vue";
+import PanelBanner from "../common/PanelBanner.vue";
 
 type FileItem = { path: string; pageCount: number | null; valid: boolean; message: string };
 
@@ -68,13 +68,13 @@ const sizeUnitOptions = [
   { label: "KB", value: "KB" },
 ];
 
-const fileBasename = (p: string) => p.split(/[\\/]/).pop() || p;
-
-function collectOutputFiles(result: any): string[] {
-  const files = Array.isArray(result?.output_files) ? result.output_files : [];
-  const nested = Array.isArray(result?.operations)
-    ? result.operations.flatMap((operation: any) => Array.isArray(operation?.output_files) ? operation.output_files : [])
-    : [];
+function collectOutputFiles(result: unknown): string[] {
+  const value = result && typeof result === "object" ? result as Record<string, unknown> : {};
+  const files = Array.isArray(value.output_files) ? value.output_files : [];
+  const operations = Array.isArray(value.operations) ? value.operations : [];
+  const nested = operations
+    .filter((operation): operation is { output_files?: unknown[] } => Boolean(operation && typeof operation === "object"))
+    .flatMap((operation) => Array.isArray(operation.output_files) ? operation.output_files : []);
   return Array.from(new Set([...files, ...nested].filter(Boolean).map(String)));
 }
 
@@ -171,10 +171,6 @@ const previewLines = computed(() => {
   return lines;
 });
 
-function positiveNumber(value: string | number, fallback = 1) {
-  return Math.max(0.1, Number(value) || fallback);
-}
-
 function normalizedConfig() {
   const next: PdfSplitConfig = { ...config.value };
   next.page_count = positiveInt(next.page_count ?? 1);
@@ -237,8 +233,8 @@ async function appendFiles(paths: string[]) {
       try {
         const r = await engine.pdfSplit.validate(p);
         return { path: p, pageCount: r.page_count, valid: r.valid, message: r.message };
-      } catch (e: any) {
-        return { path: p, pageCount: null, valid: false, message: formatEngineError(e) };
+      } catch (caught) {
+        return { path: p, pageCount: null, valid: false, message: formatEngineError(caught) };
       }
     }),
   );
@@ -304,12 +300,12 @@ async function refreshPreview() {
       previewTextLines.value = Array.isArray(preview.lines) ? preview.lines : [];
       previewSignature.value = signature;
     }
-  } catch (e: any) {
+  } catch (caught) {
     if (token === previewToken) {
       previewPlans.value = [];
       previewTextLines.value = [];
       previewSignature.value = "";
-      error.value = formatEngineError(e);
+      error.value = formatEngineError(caught);
     }
   } finally {
     if (token === previewToken) previewing.value = false;
@@ -318,7 +314,12 @@ async function refreshPreview() {
 
 async function copyPreview() {
   if (!previewLines.value.length || previewStale.value) return;
-  await navigator.clipboard.writeText(previewLines.value.join("\n"));
+  try {
+    await navigator.clipboard.writeText(previewLines.value.join("\n"));
+    toast.success("预览已复制");
+  } catch {
+    toast.error("复制失败，请检查剪贴板权限");
+  }
 }
 
 async function executeSplit() {
@@ -343,6 +344,9 @@ async function executeSplit() {
   }
   summary.value = null;
   error.value = "";
+  previewPlans.value = [];
+  previewTextLines.value = [];
+  previewSignature.value = "";
   const taskId = generateTaskId("pdf_split");
   previewToken++;
   previewing.value = false;
@@ -355,8 +359,8 @@ async function executeSplit() {
     startTask(taskId);
     const res = await window.engine.pdfSplit.executeAsync(paths, normalizedConfig(), taskId);
     if (res?.queued) markQueued(res.position || 1);
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
     resetTask();
   }
 }
@@ -373,13 +377,7 @@ async function onDrop(e: DragEvent) {
 
 <template>
   <div class="split-shell panel-shell panel-shell-responsive">
-    <!-- 顶部提示横幅 -->
-    <div class="banner panel-header split-banner" :class="`banner-${splitBannerKind}`">
-      <span class="banner-icon"><AppIcon :name="splitBannerIcon" /></span>
-      <span class="banner-title">普通拆分</span>
-      <span class="banner-text">{{ splitBannerMessage }}</span>
-      <span class="banner-kbd">支持批量</span>
-    </div>
+    <PanelBanner class="split-banner" :kind="splitBannerKind" :icon="splitBannerIcon" title="普通拆分" :message="splitBannerMessage" hint="支持批量" />
 
     <div class="split-grid panel-grid">
       <!-- 左：文件选择 -->
@@ -437,7 +435,7 @@ async function onDrop(e: DragEvent) {
               :key="opt.value"
               class="segment-btn segmented-item"
               :class="{ active: config.mode === opt.value }"
-              @click="config.mode = opt.value as any; schedulePreview()"
+              @click="config.mode = opt.value as PdfSplitMode; schedulePreview()"
             >{{ opt.label }}</button>
           </div>
 
@@ -448,7 +446,7 @@ async function onDrop(e: DragEvent) {
               type="number"
               min="1"
               :value="config.page_count ?? 1"
-              @input="config.page_count = positiveInt(($event.target as HTMLInputElement).value); schedulePreview()"
+              @input="config.page_count = inputPositiveInt(($event.target as HTMLInputElement).value, 1); schedulePreview()"
               @compositionstart="composing = true"
               @compositionend="composing = false; schedulePreview()"
             />
@@ -473,7 +471,7 @@ async function onDrop(e: DragEvent) {
               min="0.1"
               step="0.1"
                 :value="config.max_size ?? 10"
-                @input="config.max_size = positiveNumber(($event.target as HTMLInputElement).value, 10); schedulePreview()"
+                @input="config.max_size = inputPositiveNumber(($event.target as HTMLInputElement).value, 10); schedulePreview()"
                 @compositionstart="composing = true"
                 @compositionend="composing = false; schedulePreview()"
               />
@@ -493,7 +491,7 @@ async function onDrop(e: DragEvent) {
               type="number"
               min="1"
               :value="config.bookmark_level ?? 1"
-              @input="config.bookmark_level = positiveInt(($event.target as HTMLInputElement).value); schedulePreview()"
+              @input="config.bookmark_level = inputPositiveInt(($event.target as HTMLInputElement).value, 1); schedulePreview()"
               @compositionstart="composing = true"
               @compositionend="composing = false; schedulePreview()"
             />

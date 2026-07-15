@@ -10,8 +10,8 @@ const statusText: Record<string, string> = {
 </script>
 
 <template>
-  <footer class="status-bar">
-    <span class="status-dot" :class="engineStatus" />
+  <footer class="status-bar" role="status" aria-live="polite" aria-atomic="true">
+    <span class="status-dot" :class="engineStatus" aria-hidden="true" />
     <span class="status-text">{{ statusText[engineStatus] }}</span>
     <button
       v-if="engineStatus === 'error'"
@@ -35,7 +35,7 @@ const statusText: Record<string, string> = {
   background: var(--glass-bg);
   backdrop-filter: blur(var(--glass-blur));
   -webkit-backdrop-filter: blur(var(--glass-blur));
-  border-top: 0.5px solid var(--glass-border);
+  border-top: 1px solid var(--glass-border);
   font-size: var(--font-sm);
   z-index: 2;
 }
@@ -43,24 +43,23 @@ const statusText: Record<string, string> = {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  box-shadow: 0 0 0 3px transparent;
 }
 .status-dot.connecting {
   background: var(--color-warning);
-  box-shadow: 0 0 6px 2px rgba(217, 119, 6, 0.35);
-  animation: pulse 1.4s infinite;
+  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12);
+  animation: pulse 1.5s ease-in-out infinite;
 }
 .status-dot.ready {
   background: var(--color-success);
-  box-shadow: 0 0 6px 2px rgba(22, 163, 74, 0.30);
 }
 .status-dot.error {
   background: var(--color-danger);
-  box-shadow: 0 0 6px 2px rgba(220, 38, 38, 0.30);
 }
 .status-text { color: var(--color-gray-700); }
 .spacer { flex: 1; }
 @keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.35; }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.12); }
+  50% { opacity: 0.62; box-shadow: 0 0 0 5px rgba(217, 119, 6, 0.04); }
 }
 </style>

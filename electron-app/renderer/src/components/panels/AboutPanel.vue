@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, computed, watch } from "vue";
-import type { UpdateCheckResult } from "../../env";
+import type { AppUpdateStatus } from "../../env";
 import AppIcon from "../common/AppIcon.vue";
 import AppSelect from "../common/AppSelect.vue";
 import { useAppDialog } from "../../composables/useAppDialog";
@@ -13,6 +13,21 @@ const toast = useToast();
 type SettingsTab = "logs" | "updates" | "about";
 type LogLevelFilter = "all" | "error" | "warning" | "success" | "info" | "debug";
 type LogSourceFilter = "all" | "rename" | "pdf_split" | "scan_split" | "system";
+type UnknownRecord = Record<string, unknown>;
+type LogRecord = UnknownRecord;
+
+function asRecord(value: unknown): UnknownRecord {
+  return value && typeof value === "object" ? value as UnknownRecord : {};
+}
+
+function errorMessage(error: unknown, fallback = "未知错误"): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === "object" && "message" in error) {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string" && message) return message;
+  }
+  return fallback;
+}
 
 const settingsTabs: { key: SettingsTab; label: string }[] = [
   { key: "logs", label: "日志" },
@@ -52,9 +67,14 @@ const aboutTips = [
   "运行日志可在“日志”分段导出，用于排查任务失败或记录批处理过程。",
 ];
 
-const updateState = ref<"idle" | "loading" | "error">("idle");
-const updateMsg = ref("");
-const updateResult = ref<UpdateCheckResult | null>(null);
+const updateStatus = ref<AppUpdateStatus>({
+  state: "idle",
+  supported: false,
+  packageType: "development",
+  portable: false,
+  current: "",
+});
+let unsubscribeUpdateStatus: (() => void) | null = null;
 const ALLOWED_RELEASE_TAGS = new Set([
   "a", "p", "br", "strong", "em", "b", "i", "u", "s", "code", "pre", "blockquote",
   "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "img",
@@ -79,11 +99,11 @@ const releaseBodyHtmlCache = new Map<string, string>();
 
 // TODO: 后续可换 DOMPurify 降低维护成本（当前白名单清洗逻辑安全，但维护成本较高）
 const releaseBodyHtml = computed(() => {
-  const release = updateResult.value;
+  const release = updateStatus.value;
   const body = release?.body;
   if (!body) return "";
   // 按 release 标识+body 缓存，避免重复 marked 解析与 DOM 清洗
-  const cacheKey = `${release?.latest || release?.url || ""}::${body.length}`;
+  const cacheKey = body;
   const cached = releaseBodyHtmlCache.get(cacheKey);
   if (cached !== undefined) return cached;
   const html = marked.parse(body, { async: false }) as string;
@@ -115,18 +135,64 @@ const releaseBodyHtml = computed(() => {
   releaseBodyHtmlCache.set(cacheKey, result);
   return result;
 });
+const updateBusy = computed(() => ["checking", "downloading", "installing"].includes(updateStatus.value.state));
+const updateHasRelease = computed(() => Boolean(updateStatus.value.latest) && ["available", "downloading", "downloaded", "installing"].includes(updateStatus.value.state));
+const updatePercent = computed(() => Math.max(0, Math.min(100, Math.round(Number(updateStatus.value.percent) || 0))));
+const updatePackageLabel = computed(() => ({
+  installer: "安装版",
+  portable: "便携单文件版",
+  archive: "压缩包版",
+  development: "开发版",
+}[updateStatus.value.packageType]));
+const updateCheckButtonLabel = computed(() => {
+  if (updateStatus.value.state === "unsupported") return "检查更新";
+  switch (updateStatus.value.state) {
+    case "checking": return "检查中…";
+    case "downloading": return "下载中…";
+    case "downloaded": return "已准备安装";
+    case "installing": return "正在安装…";
+    case "idle": return "检查更新";
+    case "available": return "再次检查";
+    default: return "重新检查";
+  }
+});
+const updateStatusTone = computed(() => {
+  if (["checking", "downloading", "installing"].includes(updateStatus.value.state)) return "loading";
+  if (updateStatus.value.state === "error") return "error";
+  if (["downloaded", "up-to-date"].includes(updateStatus.value.state)) return "ok";
+  return "info";
+});
+const updateMessage = computed(() => {
+  const status = updateStatus.value;
+  switch (status.state) {
+    case "checking": return "正在连接更新服务检查新版本…";
+    case "available": return `发现新版本 ${status.latest || ""}（当前 ${status.current}）`;
+    case "downloading": return `正在下载 File Toolbox ${status.latest || "更新"}…`;
+    case "downloaded": return "更新已下载并完成校验，可以重启安装。";
+    case "installing": return "正在退出应用并启动安装程序…";
+    case "up-to-date": return `当前已是最新版本 ${status.current}`;
+    case "unsupported": return "当前版本不支持软件内更新。";
+    case "error": return status.error || "更新失败，请重试。";
+    default: return "";
+  }
+});
 const dataDirMsg = ref("");
 const activeSettingsTab = ref<SettingsTab>("logs");
+const activeSettingsTabIndex = computed(() => settingsTabs.findIndex((tab) => tab.key === activeSettingsTab.value));
 
-const logLines = ref<string[]>([]);
-const logRaw = ref<any[]>([]);
+const logRaw = ref<LogRecord[]>([]);
 const logLoading = ref(false);
+const logClearing = ref(false);
+const logError = ref("");
 const logLevelFilter = ref<LogLevelFilter>("all");
 const logSourceFilter = ref<LogSourceFilter>("all");
 const logSearch = ref("");
 let logAutoRefreshTimer: number | null = null;
+let logRefreshPromise: Promise<void> | null = null;
+let logRefreshGeneration = 0;
 const LOG_PAGE_SIZE = 50;
 const logVisibleCount = ref(LOG_PAGE_SIZE);
+const logViewerRef = ref<HTMLElement | null>(null);
 let logIo: IntersectionObserver | null = null;
 
 const logLevelOptions: { label: string; value: LogLevelFilter; tone?: Exclude<LogLevelFilter, "all"> }[] = [
@@ -145,15 +211,21 @@ const logSourceOptions: { label: string; value: LogSourceFilter; icon: "scan" | 
   { label: "系统", value: "system", icon: "settings" },
 ];
 
-function formatLogRecord(record: any) {
+function formatLogRecord(rawRecord: unknown) {
+  const record = asRecord(rawRecord);
   const _msg = record?.message || record?.description || "日志记录";
-  const _src = normalizeLogSource(record?.source || record?.operation_type);
-  const _status = record?.success === true ? "成功" : record?.success === false ? "失败" : "未知";
-  const details = record?.details && typeof record.details === "object" ? record.details : {};
+  const _src = normalizeLogSource(String(record?.source || record?.operation_type || ""));
+  const details = asRecord(record?.details);
+  const _status = details.cancelled ? "已取消" : record?.success === true ? "成功" : record?.success === false ? "失败" : "未知";
   const detailLogs = Array.isArray(details.log_tail) ? details.log_tail.map((line: unknown) => String(line)).filter(Boolean) : [];
   const scanOptionsText = formatScanOptions(details.options);
   const perfText = formatPerformanceStats(details.performance_stats);
-  const detailText = detailLogs.length ? `\n  详细日志\n${detailLogs.map((line: string) => `    ${line}`).join("\n")}` : "";
+  const detailTruncatedText = details.log_tail_truncated
+    ? `\n    （详细日志已截断${Number(details.log_tail_original_count) > 0 ? `，原 ${Number(details.log_tail_original_count)} 条` : ""}）`
+    : "";
+  const detailText = detailLogs.length || detailTruncatedText
+    ? `\n  详细日志${detailLogs.length ? `\n${detailLogs.map((line: string) => `    ${line}`).join("\n")}` : ""}${detailTruncatedText}`
+    : "";
   const metaText = formatLogMeta(details);
   const _rawText = `[${record.timestamp}] [${_src}] [_LEVEL_] ${_msg} · ${_status}` +
     metaText +
@@ -175,7 +247,8 @@ function formatDuration(seconds: unknown) {
   return `${minutes}m${(value - minutes * 60).toFixed(1)}s`;
 }
 
-function formatScanOptions(options: any) {
+function formatScanOptions(rawOptions: unknown) {
+  const options = asRecord(rawOptions);
   if (!options || typeof options !== "object") return "";
   const modeMap: Record<string, string> = {
     auto: "自动",
@@ -200,7 +273,11 @@ function formatScanOptions(options: any) {
   const qrText = typeof options.qrcode_text_contains === "string" ? options.qrcode_text_contains.trim() : "";
   if (qrText) parts.push(`二维码内容包含“${qrText}”`);
   if (Number(options.qrcode_skip_pages) > 0) parts.push(`命中后跳过 ${Number(options.qrcode_skip_pages)} 页`);
-  if (Number.isFinite(Number(options.qrcode_max_attempts))) parts.push(`二维码最多尝试 ${Number(options.qrcode_max_attempts)}`);
+  if (Number.isFinite(Number(options.qrcode_max_attempts))) {
+    const value = Number(options.qrcode_max_attempts);
+    const label = value < 24 ? "快速" : value < 72 ? "标准" : value < 144 ? "增强" : "极强";
+    parts.push(`二维码识别强度 ${label}`);
+  }
   const markerMode = options.exclude_marker_page === true
     ? "不保存标记页"
     : options.marker_as_first_page === false ? "标记页放上一份末尾" : "标记页放下一份开头";
@@ -216,21 +293,34 @@ function formatScanOptions(options: any) {
   return parts.length ? `\n  配置：${parts.join(" · ")}` : "";
 }
 
-function formatLogMeta(details: any) {
+function formatLogMeta(rawDetails: unknown) {
+  const details = asRecord(rawDetails);
   const parts: string[] = [];
-  if (Array.isArray(details.marker_pages)) parts.push(`标记页 ${details.marker_pages.length}`);
-  if (Array.isArray(details.output_files) && details.output_files.length) parts.push(`输出 ${details.output_files.length}`);
+  if (Array.isArray(details.marker_pages)) {
+    parts.push(`标记页 ${Number(details.marker_pages_original_count) || details.marker_pages.length}`);
+  }
+  if (Array.isArray(details.output_files) && details.output_files.length) {
+    parts.push(`输出 ${Number(details.output_files_original_count) || details.output_files.length}`);
+  }
   if (Number.isFinite(Number(details.elapsed_ms))) parts.push(`耗时 ${formatDuration(Number(details.elapsed_ms) / 1000)}`);
   return parts.length ? `\n  摘要：${parts.join(" · ")}` : "";
 }
 
-function formatPerformanceStats(stats: any) {
+function formatPerformanceStats(rawStats: unknown) {
+  const stats = asRecord(rawStats);
   if (!stats || typeof stats !== "object") return "";
+  const pagesScanned = Number(stats.pages_scanned || 0);
+  const pagesSkipped = Number(stats.pages_skipped || 0);
+  const markerCount = Number(stats.markers_found || 0);
+  const pageScanSeconds = Number(stats.page_scan_seconds);
   const lines = [
-    `扫描：${formatDuration(stats.scan_seconds)} · ${Number(stats.pages_scanned || 0)} 页 · 命中 ${Number(stats.markers_found || 0)} 页`,
+    `识别阶段：${formatDuration(stats.scan_seconds)}${Number.isFinite(pageScanSeconds) ? ` · 页面扫描 ${formatDuration(pageScanSeconds)}` : ""} · 实际处理 ${pagesScanned} 页 · 跳过 ${pagesSkipped} 页 · 命中 ${markerCount} 页`,
     `阶段：渲染 ${formatDuration(stats.render_seconds)} · 二维码 ${formatDuration(stats.qr_seconds)} · 印章 ${formatDuration(stats.stamp_seconds)} · 特征 ${formatDuration(stats.feature_seconds)} · 其他 ${formatDuration(stats.other_seconds)}`,
     `辅助：DPI兜底 ${formatDuration(stats.dpi_fallback_seconds)}（${Number(stats.dpi_fallback_hits || 0)}/${Number(stats.dpi_fallback_attempts || 0)}） · 分段 ${formatDuration(stats.build_seconds)} · 写入 ${formatDuration(stats.write_seconds)}`,
   ];
+  if (Number.isFinite(Number(stats.stamp_hits)) || Number.isFinite(Number(stats.qr_hits)) || Number.isFinite(Number(stats.feature_hits))) {
+    lines.push(`命中来源：印章 ${Number(stats.stamp_hits || 0)} 页 · 二维码 ${Number(stats.qr_hits || 0)} 页 · 特征点 ${Number(stats.feature_hits || 0)} 页 · 全部未命中 ${Math.max(0, pagesScanned - markerCount)} 页`);
+  }
   if (Number(stats.roi_clip_pages || 0) || Number(stats.roi_clip_fallback_pages || 0)) {
     lines.push(`ROI：局部渲染 ${Number(stats.roi_clip_pages || 0)} 页 · 回退 ${Number(stats.roi_clip_fallback_pages || 0)} 页`);
   }
@@ -241,10 +331,11 @@ function formatPerformanceStats(stats: any) {
 }
 
 // 日志级别统一由后端 HistoryManager.infer_level() 推断，前端仅在缺失时做兜底映射
-function normalizeLogLevel(value: unknown, _fallbackText: string, record?: any): Exclude<LogLevelFilter, "all"> {
+function normalizeLogLevel(value: unknown, _fallbackText: string, record?: LogRecord): Exclude<LogLevelFilter, "all"> {
   const level = String(value || "").toLowerCase();
   if (["error", "warning", "success", "info", "debug"].includes(level)) return level as Exclude<LogLevelFilter, "all">;
   // 兜底：后端未提供 level 时按 success 字段推断
+  if (asRecord(record?.details).cancelled === true) return "warning";
   if (record?.success === false) return "error";
   if (record?.success === true) return "success";
   return "info";
@@ -263,7 +354,7 @@ const logItems = computed(() => logRaw.value.map((record) => {
   return {
     text,
     level: normalizeLogLevel(record?.level, text, record),
-    source: normalizeLogSource(record?.source || record?.operation_type),
+    source: normalizeLogSource(String(record?.source || record?.operation_type || "")),
     record,
   };
 }));
@@ -288,11 +379,13 @@ const hasMoreLogs = computed(() => logVisibleCount.value < filteredLogItems.valu
 function setupLogSentinel(el: unknown) {
   logIo?.disconnect();
   if (!(el instanceof Element)) return;
+  const root = logViewerRef.value || (el as HTMLElement).closest<HTMLElement>(".log-viewer");
+  if (!root) return;
   logIo = new IntersectionObserver((entries) => {
     if (entries[0]?.isIntersecting) {
       logVisibleCount.value = Math.min(logVisibleCount.value + LOG_PAGE_SIZE, filteredLogItems.value.length);
     }
-  }, { root: (el as HTMLElement).parentElement, rootMargin: "120px" });
+  }, { root, rootMargin: "120px" });
   logIo.observe(el);
 }
 
@@ -307,9 +400,30 @@ watch(logSourceFilter, () => resetLogVisibleCount());
 onMounted(() => {
   refreshLogs();
   startLogAutoRefresh();
+  const updateApi = window.electronAPI?.update;
+  if (updateApi) {
+    unsubscribeUpdateStatus = updateApi.onStatus((status) => {
+      updateStatus.value = status;
+    });
+    updateApi.getStatus()
+      .then((status) => { updateStatus.value = status; })
+      .catch((error: unknown) => {
+        updateStatus.value = {
+          ...updateStatus.value,
+          state: "error",
+          error: errorMessage(error, "无法读取更新状态"),
+        };
+      });
+  }
 });
 
-onBeforeUnmount(() => { stopLogAutoRefresh(); logIo?.disconnect(); });
+onBeforeUnmount(() => {
+  stopLogAutoRefresh();
+  logRefreshGeneration += 1;
+  logIo?.disconnect();
+  unsubscribeUpdateStatus?.();
+  unsubscribeUpdateStatus = null;
+});
 
 // KeepAlive 下 onMounted/onBeforeUnmount 不会在切面板时触发，
 // 用 onActivated/onDeactivated 管理定时器避免后台空转
@@ -336,7 +450,7 @@ watch(activeSettingsTab, (tab) => {
 function startLogAutoRefresh() {
   if (logAutoRefreshTimer || activeSettingsTab.value !== "logs") return;
   logAutoRefreshTimer = window.setInterval(() => {
-    if (!logLoading.value) refreshLogs({ silent: true });
+    if (!logRefreshPromise && !logClearing.value) refreshLogs({ silent: true });
   }, 2000);
 }
 
@@ -347,23 +461,44 @@ function stopLogAutoRefresh() {
 }
 
 async function refreshLogs(options: { silent?: boolean } = {}) {
-  if (!window.engine) return;
+  const engine = window.engine;
+  if (!engine || logClearing.value) return;
+  if (logRefreshPromise) {
+    if (options.silent) return;
+    logLoading.value = true;
+    try {
+      await logRefreshPromise;
+    } finally {
+      logLoading.value = false;
+    }
+    return;
+  }
+
+  const generation = logRefreshGeneration;
   if (!options.silent) logLoading.value = true;
+  const request = (async () => {
+    try {
+      const res = await engine.history.get(100, { currentSession: false });
+      if (generation !== logRefreshGeneration) return;
+      logRaw.value = Array.isArray(res?.records) ? res.records.map(asRecord) : [];
+      logError.value = "";
+    } catch (error: unknown) {
+      if (generation !== logRefreshGeneration) return;
+      logError.value = `无法获取历史记录：${errorMessage(error)}`;
+    }
+  })();
+  logRefreshPromise = request;
   try {
-    const res = await window.engine.history.get(100, { currentSession: false });
-    const records = res?.records || [];
-    logRaw.value = records;
-    logLines.value = records.map(formatLogRecord);
-  } catch {
-    logLines.value = ["（无法获取历史记录）"];
-    logRaw.value = [];
+    await request;
   } finally {
+    if (logRefreshPromise === request) logRefreshPromise = null;
     if (!options.silent) logLoading.value = false;
   }
 }
 
 async function clearLogs() {
-  if (!window.engine || !logRaw.value.length) return;
+  const engine = window.engine;
+  if (!engine || !logRaw.value.length) return;
   // #29 清空前必须确认，操作不可撤销
   const confirmed = await dialog.confirm({
     title: "清空历史记录",
@@ -372,16 +507,21 @@ async function clearLogs() {
     confirmText: "清空",
   });
   if (!confirmed) return;
+  logRefreshGeneration += 1;
+  logClearing.value = true;
+  logError.value = "";
   try {
-    const res = await window.engine.history.clear();
-    if (res?.cleared) {
-      logRaw.value = [];
-      logLines.value = [];
-      toast.success("已清空历史记录");
-    }
-  } catch (e: any) {
-    logLines.value = ["（清空历史记录失败）"];
-    toast.error("清空失败：" + (e?.message || "未知错误"));
+    const res = await engine.history.clear();
+    if (!res?.cleared) throw new Error(res?.error || "历史记录未能写入磁盘");
+    logRaw.value = [];
+    resetLogVisibleCount();
+    toast.success("已清空历史记录");
+  } catch (e: unknown) {
+    const message = errorMessage(e);
+    logError.value = `清空历史记录失败：${message}`;
+    toast.error("清空失败：" + message);
+  } finally {
+    logClearing.value = false;
   }
 }
 
@@ -395,8 +535,8 @@ async function exportLogsTxt() {
       defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`,
       filters: [{ name: "文本文件", extensions: ["txt"] }],
     });
-  } catch (e: any) {
-    toast.error("导出失败：" + (e?.message || "未知错误"));
+  } catch (e: unknown) {
+    toast.error("导出失败：" + errorMessage(e));
   }
 }
 
@@ -410,75 +550,69 @@ async function exportLogsJson() {
       defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`,
       filters: [{ name: "JSON 文件", extensions: ["json"] }],
     });
-  } catch (e: any) {
-    toast.error("导出失败：" + (e?.message || "未知错误"));
+  } catch (e: unknown) {
+    toast.error("导出失败：" + errorMessage(e));
   }
-}
-
-const MAX_RETRY = 3;
-let retryCount = 0;
-
-function isRateLimitError(msg: string): boolean {
-  const lower = (msg || "").toLowerCase();
-  return lower.includes("rate limit") || lower.includes("403") || lower.includes("频率");
 }
 
 async function checkUpdate() {
-  if (!window.electronAPI) return;
-  retryCount = 0;
+  const updateApi = window.electronAPI?.update;
+  if (!updateApi || updateBusy.value) return;
   activeSettingsTab.value = "updates";
-  updateResult.value = null;
-  updateState.value = "loading";
-  updateMsg.value = "正在连接 GitHub 检查更新...";
-  await attemptCheckUpdate();
-}
-
-async function attemptCheckUpdate() {
-  if (!window.electronAPI) return;
   try {
-    const r = await window.electronAPI.checkUpdate();
-    updateResult.value = r;
-    if (!r.ok) {
-      retryCount++;
-      if (isRateLimitError(r.error || "")) {
-        updateState.value = "idle";
-        updateMsg.value = `GitHub API 访问频率超限，请稍后再试。（${r.error}）`;
-        return;
-      }
-      if (retryCount < MAX_RETRY) {
-        updateMsg.value = `${r.error || "检查失败"} 正在重试 (${retryCount}/${MAX_RETRY})…`;
-        await delay(1200);
-        return attemptCheckUpdate();
-      }
-      updateState.value = "error";
-      updateMsg.value = `${r.error || "检查失败"}（已重试 ${MAX_RETRY} 次）`;
-    } else if (r.hasUpdate) {
-      updateState.value = "idle";
-      updateMsg.value = `发现新版本 ${r.latest}（当前 ${r.current}）`;
-    } else {
-      updateState.value = "idle";
-      updateMsg.value = `已是最新版本 ${r.current}`;
-    }
-  } catch (e: any) {
-    retryCount++;
-    if (retryCount < MAX_RETRY) {
-      updateMsg.value = `${e?.message || "网络请求失败"} 正在重试 (${retryCount}/${MAX_RETRY})…`;
-      await delay(1200);
-      return attemptCheckUpdate();
-    }
-    updateState.value = "error";
-    updateMsg.value = `${e?.message || "网络请求失败"}（已重试 ${MAX_RETRY} 次）`;
+    updateStatus.value = await updateApi.check();
+  } catch (e: unknown) {
+    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "检查更新失败") };
   }
 }
 
-function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function handleUpdatePrimaryAction() {
+  checkUpdate();
 }
 
-function openRelease(e: Event) {
-  e.preventDefault();
-  const url = updateResult.value?.url;
-  if (url) window.electronAPI?.openExternal(url);
+async function downloadUpdate() {
+  const updateApi = window.electronAPI?.update;
+  if (!updateApi || updateBusy.value) return;
+  try {
+    updateStatus.value = await updateApi.download();
+  } catch (e: unknown) {
+    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "下载更新失败") };
+  }
+}
+
+async function openUpdateRelease() {
+  const url = updateStatus.value.url || "https://github.com/LXL2000927/file-toolbox/releases";
+  try {
+    await window.electronAPI?.openExternal(url);
+  } catch (e: unknown) {
+    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "无法打开发布页") };
+  }
+}
+
+async function installUpdate() {
+  const updateApi = window.electronAPI?.update;
+  if (!updateApi || updateStatus.value.state !== "downloaded") return;
+  const confirmed = await dialog.confirm({
+    title: "重启并安装更新",
+    message: "应用将退出并安装新版本。正在运行的文件处理任务会被终止，确定继续吗？",
+    kind: "warning",
+    confirmText: "重启并安装",
+  });
+  if (!confirmed) return;
+  try {
+    const result = await updateApi.install();
+    updateStatus.value = result.status;
+  } catch (e: unknown) {
+    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "无法启动安装程序") };
+  }
+}
+
+function formatBytes(value: unknown) {
+  const bytes = Math.max(0, Number(value) || 0);
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function openGithub(e: Event) {
@@ -492,15 +626,20 @@ async function openDataDir() {
   try {
     const dir = await window.electronAPI.openDataDir();
     dataDirMsg.value = `已打开数据目录：${dir}`;
-  } catch (e: any) {
-    dataDirMsg.value = `无法打开数据目录：${e?.message || "未知错误"}`;
+  } catch (e: unknown) {
+    dataDirMsg.value = `无法打开数据目录：${errorMessage(e)}`;
   }
 }
 </script>
 
 <template>
   <div class="about-shell panel-shell panel-shell-responsive">
-    <div class="settings-tabs segmented-control" role="tablist" aria-label="设置分组">
+    <div
+      class="settings-tabs segmented-control segmented-animated"
+      role="tablist"
+      aria-label="设置分组"
+      :style="{ '--segment-count': settingsTabs.length, '--active-index': activeSettingsTabIndex }"
+    >
       <button
         v-for="tab in settingsTabs"
         :key="tab.key"
@@ -516,24 +655,28 @@ async function openDataDir() {
     </div>
 
     <div class="settings-content">
-      <div v-if="activeSettingsTab === 'logs'" class="settings-section glass-card section-card">
+      <Transition name="settings-view" mode="out-in">
+      <div v-if="activeSettingsTab === 'logs'" key="logs" class="settings-section logs-section glass-card section-card">
         <div class="logs-toolbar section-toolbar">
-          <button class="log-tool-button" @click="() => refreshLogs()" :disabled="logLoading">
+          <button class="log-tool-button log-refresh-button" @click="() => refreshLogs()" :disabled="logLoading || logClearing">
             {{ logLoading ? "刷新中…" : "刷新" }}
           </button>
           <AppSelect class="log-filter-select" v-model="logLevelFilter" :options="logLevelOptions" min-width="128px" />
           <AppSelect class="log-filter-select" v-model="logSourceFilter" :options="logSourceOptions" min-width="136px" />
           <input v-model="logSearch" class="input log-search" placeholder="搜索日志..." />
-          <button class="log-tool-button" :disabled="!logRaw.length" @click="clearLogs">清空</button>
+          <button class="log-tool-button" :disabled="!logRaw.length || logClearing" @click="clearLogs">
+            {{ logClearing ? "清空中…" : "清空" }}
+          </button>
           <button class="log-tool-button" :disabled="!filteredLogLines.length" @click="exportLogsTxt">导出 TXT</button>
           <button class="log-tool-button" :disabled="!filteredLogRaw.length" @click="exportLogsJson">导出 JSON</button>
           <button class="log-tool-button" @click="openDataDir">数据目录</button>
         </div>
         <div v-if="dataDirMsg" class="settings-message">{{ dataDirMsg }}</div>
+        <div v-if="logError" class="settings-message log-error" role="alert">{{ logError }}</div>
 
-        <div class="log-viewer">
+        <div ref="logViewerRef" class="log-viewer">
           <div v-if="!filteredLogItems.length && !logLoading" class="log-placeholder">
-            {{ logLines.length ? "没有符合筛选条件的日志" : "暂无操作记录" }}
+            {{ logRaw.length ? "没有符合筛选条件的日志" : logError ? "当前无法显示历史记录" : "暂无操作记录" }}
           </div>
           <div v-else class="log-record-list selectable">
             <pre
@@ -553,68 +696,127 @@ async function openDataDir() {
         </div>
       </div>
 
-      <div v-else-if="activeSettingsTab === 'updates'" class="settings-section updates-section glass-card section-card">
+      <div v-else-if="activeSettingsTab === 'updates'" key="updates" class="settings-section updates-section glass-card section-card">
         <div class="app-brand compact">
           <span class="app-logo"><AppIcon name="package" :size="28" /></span>
           <div>
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.4.0</span>
-              <span class="version-pill version-pill-sub">Electron</span>
+              <span class="version-pill">v{{ updateStatus.current || '未知' }}</span>
+              <span class="version-pill version-pill-sub">{{ updatePackageLabel }}</span>
             </div>
           </div>
           <span class="flex-1" />
-          <button class="btn btn-primary btn-sm" @click="checkUpdate" :disabled="updateState === 'loading'">
-            {{ updateState === 'loading' ? '检查中…' : '检查更新' }}
+          <button class="btn btn-primary btn-sm" @click="handleUpdatePrimaryAction" :disabled="updateBusy || updateStatus.state === 'downloaded'">
+            {{ updateCheckButtonLabel }}
           </button>
         </div>
 
         <div
-          v-if="updateMsg"
+          v-if="updateMessage && ['checking', 'downloading', 'downloaded', 'installing', 'error'].includes(updateStatus.state)"
           class="update-status"
-          :class="{ loading: updateState === 'loading', error: updateState === 'error', ok: updateState === 'idle' }"
+          :class="updateStatusTone"
+          :role="updateStatus.state === 'error' ? 'alert' : 'status'"
+          aria-live="polite"
         >
-          <span v-if="updateState === 'loading'" class="spinner"></span>
-          {{ updateMsg }}
+          <span v-if="['checking', 'downloading', 'installing'].includes(updateStatus.state)" class="spinner"></span>
+          <AppIcon v-else-if="updateStatusTone === 'ok'" name="success" :size="14" />
+          <AppIcon v-else-if="updateStatusTone === 'error'" name="alert" :size="14" />
+          <AppIcon v-else name="info" :size="14" />
+          {{ updateMessage }}
         </div>
 
-        <div v-if="updateResult?.hasUpdate" class="release-panel has-update">
+        <Transition name="update-state" mode="out-in">
+        <div v-if="updateHasRelease" class="release-panel has-update">
           <div class="release-topline">
-            <span class="release-badge">发现新版本</span>
-            <span class="release-versions">当前 {{ updateResult.current || '未知' }} → 最新 {{ updateResult.latest || '未知' }}</span>
+            <span class="release-badge" :class="{ current: updateStatus.state === 'downloaded' }">
+              {{ updateStatus.state === 'downloaded' ? '已准备安装' : updateStatus.state === 'downloading' ? '正在下载' : updateStatus.state === 'installing' ? '正在安装' : '发现新版本' }}
+            </span>
+            <span class="release-versions">当前 {{ updateStatus.current || '未知' }} → 最新 {{ updateStatus.latest || '未知' }}</span>
           </div>
-          <h4>{{ updateResult.name || `File Toolbox ${updateResult.latest || ''}` }}</h4>
-          <div v-if="updateResult.body" class="release-body selectable" v-html="releaseBodyHtml" />
+          <h4>{{ updateStatus.name || `File Toolbox ${updateStatus.latest || ''}` }}</h4>
+
+          <div v-if="updateStatus.state === 'downloading'" class="update-download-progress">
+            <div class="progress">
+              <div class="progress-bar" :style="{ width: `${updatePercent}%` }" />
+            </div>
+            <div class="update-progress-meta">
+              <strong>{{ updatePercent }}%</strong>
+              <span>
+                {{ formatBytes(updateStatus.transferred) }} / {{ formatBytes(updateStatus.total) }}
+                <template v-if="Number(updateStatus.bytesPerSecond) > 0"> · {{ formatBytes(updateStatus.bytesPerSecond) }}/s</template>
+              </span>
+            </div>
+          </div>
+
+          <div v-if="updateStatus.body" class="release-body selectable" v-html="releaseBodyHtml" />
           <p v-else class="settings-hint">该版本暂未提供更新说明。</p>
           <div class="release-actions">
-            <a :href="updateResult.url || '#'" class="btn btn-primary" @click="openRelease" target="_blank">
-              前往下载
-            </a>
+            <button
+              v-if="updateStatus.state === 'available' && updateStatus.supported"
+              class="btn btn-primary"
+              type="button"
+              @click="downloadUpdate"
+            >立即下载</button>
+            <button
+              v-else-if="updateStatus.state === 'available'"
+              class="btn btn-primary"
+              type="button"
+              @click="openUpdateRelease"
+            >打开发布页</button>
+            <button
+              v-else-if="updateStatus.state === 'downloaded'"
+              class="btn btn-primary"
+              type="button"
+              @click="installUpdate"
+            >重启并安装</button>
           </div>
         </div>
 
-        <div v-else-if="updateResult?.ok" class="release-panel current-version">
+        <div v-else-if="updateStatus.state === 'up-to-date'" class="release-panel current-version">
           <div class="release-topline">
             <span class="release-badge current">当前已是最新版本</span>
-            <span class="release-versions">v{{ updateResult.current || '2.4.0' }}</span>
+            <span class="release-versions">v{{ updateStatus.current || '未知' }}</span>
           </div>
-          <p v-if="updateResult.latest">GitHub 最新正式版本为 v{{ updateResult.latest }}，无需更新。</p>
-          <p v-else>未发现可用的正式 Release，无需更新。</p>
+          <p v-if="updateStatus.latest">最新正式版本为 v{{ updateStatus.latest }}，无需更新。</p>
+          <p v-else>未发现可用的正式更新。</p>
         </div>
 
-        <div v-else-if="!updateMsg" class="update-empty-card">
-          <div class="update-empty-title">版本检查</div>
-          <p>点击“检查更新”连接 GitHub Release 获取最新版本信息。发现新版本后，更新说明会直接显示在这里。</p>
+        <div v-else-if="updateStatus.state === 'unsupported'" class="release-panel update-unsupported">
+          <div class="release-topline">
+            <span class="release-badge manual">{{ updatePackageLabel }}</span>
+            <span class="release-versions">v{{ updateStatus.current || '未知' }}</span>
+          </div>
+          <h4>{{ updatePackageLabel }}更新方式</h4>
+          <p>{{ updateStatus.error }}</p>
         </div>
+
+        <div v-else-if="updateStatus.state === 'error'" class="release-panel update-error-panel">
+          <div class="release-topline">
+            <span class="release-badge error">更新失败</span>
+            <span class="release-versions">v{{ updateStatus.current || '未知' }}</span>
+          </div>
+          <p>{{ updateStatus.error || '无法检查更新，请稍后重试。' }}</p>
+          <div class="release-actions">
+            <button class="btn btn-primary" type="button" @click="checkUpdate">重新检查</button>
+          </div>
+        </div>
+
+        <div v-else-if="updateStatus.state === 'idle' || updateStatus.state === 'checking'" class="update-empty-card">
+          <span class="update-empty-icon"><AppIcon name="package" :size="28" /></span>
+          <div class="update-empty-title">版本检查</div>
+          <p>当前版本 v{{ updateStatus.current || '未知' }}</p>
+        </div>
+        </Transition>
       </div>
 
-      <div v-else class="settings-section glass-card section-card about-section">
+      <div v-else key="about" class="settings-section glass-card section-card about-section">
         <div class="about-hero">
           <span class="app-logo"><AppIcon name="package" :size="28" /></span>
           <div class="about-hero-info">
             <span class="app-name">File Toolbox</span>
             <div class="version-pills">
-              <span class="version-pill">v2.4.0</span>
+              <span class="version-pill">v{{ updateStatus.current || '未知' }}</span>
               <span class="version-pill version-pill-sub">Electron</span>
               <span class="version-pill version-pill-sub">Python Engine</span>
             </div>
@@ -646,7 +848,7 @@ async function openDataDir() {
           <section class="about-info-card">
             <h4>本地与隐私</h4>
             <p>
-              文件处理在本机完成，不需要上传到第三方服务器。只有点击"检查更新"时，应用会请求 GitHub Release 信息用于版本检查。
+              文件处理在本机完成，不需要上传到第三方服务器。检查或下载更新时，应用会连接 GitHub Release 获取版本信息和安装包。
             </p>
           </section>
           <section class="about-info-card">
@@ -657,6 +859,7 @@ async function openDataDir() {
           </section>
         </div>
       </div>
+      </Transition>
     </div>
 
   </div>
@@ -679,6 +882,7 @@ async function openDataDir() {
   flex: 1;
   min-height: 0;
   display: flex;
+  position: relative;
 }
 .settings-section {
   flex: 1;
@@ -687,6 +891,20 @@ async function openDataDir() {
 .updates-section {
   display: flex;
   flex-direction: column;
+  padding: 12px 14px;
+}
+
+.settings-view-enter-active,
+.settings-view-leave-active {
+  transition: opacity 0.14s ease, transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.settings-view-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.settings-view-leave-to {
+  opacity: 0;
+  transform: translateY(-2px);
 }
 
 /* 左：应用介绍 */
@@ -697,7 +915,9 @@ async function openDataDir() {
   margin-bottom: 14px;
 }
 .app-brand.compact {
-  margin-bottom: 12px;
+  margin-bottom: 0;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--color-border);
 }
 .app-logo {
   display: inline-flex;
@@ -705,7 +925,9 @@ async function openDataDir() {
   justify-content: center;
   width: 32px;
   height: 32px;
+  border-radius: var(--radius);
   color: var(--color-primary-dark);
+  background: var(--color-primary-bg);
 }
 .app-name {
   font-size: var(--font-lg);
@@ -779,8 +1001,8 @@ async function openDataDir() {
   position: relative;
   padding: 10px;
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  background: linear-gradient(135deg, rgba(255, 255, 255, 0.68), rgba(255, 255, 255, 0.32));
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.34);
   overflow: hidden;
 }
 .about-feature-card::before {
@@ -791,31 +1013,15 @@ async function openDataDir() {
   background: var(--color-primary);
   opacity: 0.88;
 }
-.about-feature-card.accent-2::before {
-  background: var(--color-info);
-}
-.about-feature-card.accent-3::before {
-  background: #7c3aed;
-}
 .about-feature-label {
   position: relative;
   display: inline-flex;
   align-items: center;
   min-height: 22px;
-  padding: 1px 8px;
-  border-radius: 999px;
+  padding: 0;
   color: var(--color-primary-dark);
-  background: var(--color-primary-bg);
   font-size: var(--font-sm);
   font-weight: 700;
-}
-.about-feature-card.accent-2 .about-feature-label {
-  color: var(--color-info);
-  background: rgba(8, 145, 178, 0.08);
-}
-.about-feature-card.accent-3 .about-feature-label {
-  color: #7c3aed;
-  background: rgba(124, 58, 237, 0.08);
 }
 .about-feature-card h4,
 .about-info-card h4 {
@@ -838,10 +1044,8 @@ async function openDataDir() {
   gap: 10px;
 }
 .about-info-card {
-  padding: 10px 12px;
-  border: 1px solid rgba(203, 213, 225, 0.76);
-  border-radius: var(--radius-lg);
-  background: rgba(248, 250, 252, 0.62);
+  padding: 10px 2px 2px;
+  border-top: 1px solid var(--color-border);
 }
 .about-info-card.span-2 {
   grid-column: 1 / -1;
@@ -894,72 +1098,68 @@ async function openDataDir() {
   font-size: var(--font-sm);
 }
 
-/* 右：运行日志 */
+/* 更新页 */
 .update-status {
   font-size: var(--font-sm);
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  margin-bottom: 8px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  margin-top: 10px;
   display: flex;
   align-items: center;
   gap: 6px;
 }
-.update-status.loading { background: var(--color-gray-100); color: var(--color-gray-600); }
-.update-status.error { background: var(--color-danger-bg); color: var(--color-danger); }
-.update-status.ok { background: var(--color-success-bg); color: var(--color-success); }
+.update-status.loading { border-color: var(--color-border); background: var(--color-gray-50); color: var(--color-gray-600); }
+.update-status.error { border-color: color-mix(in srgb, var(--color-danger) 22%, transparent); background: color-mix(in srgb, var(--color-danger-bg) 42%, transparent); color: var(--color-danger); }
+.update-status.ok { border-color: color-mix(in srgb, var(--color-success) 20%, transparent); background: color-mix(in srgb, var(--color-success-bg) 38%, transparent); color: var(--color-success); }
+.update-status.info { border-color: rgba(37, 99, 235, 0.16); background: color-mix(in srgb, var(--color-primary-bg) 54%, transparent); color: var(--color-primary-dark); }
 .release-panel {
   flex: 1;
   min-height: 0;
   margin-top: 12px;
-  padding: 18px;
-  border-radius: var(--radius-lg);
-  border: 1px solid rgba(203, 213, 225, 0.78);
-  background:
-    radial-gradient(circle at 94% 0%, rgba(37, 99, 235, 0.10), transparent 32%),
-    rgba(255, 255, 255, 0.42);
+  padding: 16px 2px 2px;
+  border-top: 1px solid var(--color-border);
+  background: transparent;
 }
 .update-empty-card {
   flex: 1;
-  min-height: 280px;
+  min-height: 220px;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 10px;
+  gap: 8px;
   margin-top: 12px;
-  padding: 28px;
-  border-radius: var(--radius-lg);
-  border: 1px dashed rgba(37, 99, 235, 0.24);
-  background:
-    radial-gradient(circle at 50% 12%, rgba(37, 99, 235, 0.12), transparent 34%),
-    linear-gradient(180deg, rgba(248, 250, 252, 0.82), rgba(255, 255, 255, 0.48));
+  padding: 24px;
+  border-top: 1px solid var(--color-border);
+  background: transparent;
   text-align: center;
 }
 .update-empty-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 60px;
-  height: 60px;
+  width: 48px;
+  height: 48px;
   margin-bottom: 2px;
-  border-radius: 22px;
+  border-radius: var(--radius);
   color: var(--color-primary);
-  background: rgba(37, 99, 235, 0.1);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.74), 0 10px 28px rgba(37, 99, 235, 0.10);
+  background: var(--color-primary-bg);
+  box-shadow: inset 0 0 0 1px rgba(37, 99, 235, 0.08);
 }
 .release-panel.has-update {
   display: flex;
   flex-direction: column;
-  border-color: rgba(37, 99, 235, 0.30);
-  background:
-    radial-gradient(circle at 94% 0%, rgba(37, 99, 235, 0.10), transparent 34%),
-    linear-gradient(180deg, rgba(239, 246, 255, 0.62), rgba(255, 255, 255, 0.28));
 }
 .release-panel.current-version {
-  border-color: rgba(22, 163, 74, 0.24);
-  background:
-    radial-gradient(circle at 94% 0%, rgba(22, 163, 74, 0.12), transparent 32%),
-    rgba(255, 255, 255, 0.42);
+  border-color: var(--color-border);
+}
+.release-panel.update-unsupported {
+  border-color: var(--color-border);
+}
+.release-panel.update-error-panel {
+  border-color: color-mix(in srgb, var(--color-danger) 24%, var(--color-border));
 }
 .release-topline {
   display: flex;
@@ -982,6 +1182,14 @@ async function openDataDir() {
 .release-badge.current {
   color: var(--color-success);
   background: var(--color-success-bg);
+}
+.release-badge.manual {
+  color: var(--color-gray-700);
+  background: var(--color-gray-100);
+}
+.release-badge.error {
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
 }
 .release-versions {
   color: var(--color-gray-600);
@@ -1042,8 +1250,64 @@ async function openDataDir() {
 .release-actions {
   display: flex;
   justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
   flex: 0 0 auto;
   margin-top: 12px;
+}
+.update-state-enter-active,
+.update-state-leave-active {
+  transition: opacity 0.14s ease, transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.update-state-enter-from {
+  opacity: 0;
+  transform: translateY(4px);
+}
+.update-state-leave-to {
+  opacity: 0;
+  transform: translateY(-2px);
+}
+.update-download-progress {
+  margin: 10px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid rgba(148, 163, 184, 0.26);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.52);
+}
+.update-download-progress .progress {
+  height: 7px;
+}
+.update-progress-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 7px;
+  color: var(--color-gray-600);
+  font-size: var(--font-sm);
+}
+.update-progress-meta strong {
+  color: var(--color-primary-dark);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 520px) {
+  .updates-section .app-brand {
+    flex-wrap: wrap;
+  }
+
+  .updates-section .app-brand > .btn {
+    width: 100%;
+  }
+
+  .update-progress-meta {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .updates-section .release-actions .btn {
+    flex: 1 1 120px;
+  }
 }
 .spinner {
   width: 14px; height: 14px;
@@ -1059,11 +1323,12 @@ async function openDataDir() {
   min-height: 140px;
   border: 1px solid rgba(148, 163, 184, 0.42);
   border-radius: var(--radius);
-  background:
-    linear-gradient(180deg, rgba(248, 250, 252, 0.92), rgba(241, 245, 249, 0.68)),
-    rgba(255, 255, 255, 0.34);
-  padding: 12px;
+  background: rgba(248, 250, 252, 0.78);
+  padding: 0;
   overflow-y: auto;
+}
+.logs-section {
+  overflow: hidden;
 }
 .logs-toolbar {
   flex-wrap: nowrap;
@@ -1078,26 +1343,22 @@ async function openDataDir() {
   padding: 0 10px;
   border: 1px solid rgba(148, 163, 184, 0.36);
   border-radius: var(--radius);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(248, 250, 252, 0.46)),
-    rgba(255, 255, 255, 0.34);
+  background: rgba(255, 255, 255, 0.66);
   color: var(--color-gray-600);
   font-size: var(--font-sm);
   font-weight: 600;
   letter-spacing: 0.01em;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72), 0 1px 2px rgba(15, 23, 42, 0.04);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
   transform: translateY(0) scale(1);
   transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, box-shadow 0.14s ease, transform 0.14s ease;
   white-space: nowrap;
 }
 .log-tool-button:hover:not(:disabled) {
   border-color: rgba(100, 116, 139, 0.44);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.84), rgba(241, 245, 249, 0.62)),
-    rgba(255, 255, 255, 0.48);
+  background: rgba(255, 255, 255, 0.88);
   color: var(--color-gray-800);
   transform: translateY(-1px) scale(1.005);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.84), 0 4px 10px rgba(15, 23, 42, 0.07);
+  box-shadow: var(--shadow-sm);
 }
 .log-tool-button:active:not(:disabled) {
   transform: translateY(0) scale(0.985);
@@ -1120,14 +1381,20 @@ async function openDataDir() {
   min-width: 140px;
   height: 30px;
 }
+.log-error {
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
+  border: 1px solid color-mix(in srgb, var(--color-danger) 24%, transparent);
+}
 .log-placeholder {
+  padding: 12px;
   color: var(--color-gray-500);
   font-size: var(--font-md);
 }
 .log-record-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 0;
 }
 .log-sentinel {
   text-align: center;
@@ -1145,11 +1412,12 @@ async function openDataDir() {
   word-break: break-word;
 }
 .log-record {
-  padding: 8px 10px 8px 12px;
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-left-width: 4px;
-  border-radius: var(--radius-sm);
-  background: rgba(255, 255, 255, 0.48);
+  padding: 9px 12px 9px 14px;
+  border: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.20);
+  border-left: 3px solid transparent;
+  border-radius: 0;
+  background: rgba(255, 255, 255, 0.34);
   content-visibility: auto;
   contain-intrinsic-size: auto 80px;
 }
@@ -1172,6 +1440,55 @@ async function openDataDir() {
 .log-record-info {
   border-left-color: var(--color-info);
   background: color-mix(in srgb, rgba(8, 145, 178, 0.10) 58%, white);
+}
+
+@media (max-width: 900px) {
+  .logs-toolbar {
+    flex-wrap: wrap;
+    align-items: stretch;
+  }
+
+  .log-filter-select {
+    flex: 1 1 128px;
+    min-width: 112px !important;
+  }
+
+  .logs-toolbar .log-filter-select:nth-of-type(2) {
+    flex-basis: 136px;
+  }
+
+  .log-search {
+    flex: 1 1 220px;
+  }
+}
+
+@media (max-width: 520px) {
+  .logs-toolbar {
+    gap: 6px;
+  }
+
+  .log-search {
+    flex: 1 1 100%;
+    min-width: 0;
+  }
+
+  .log-tool-button {
+    flex: 1 1 68px;
+    min-width: 0;
+    padding-inline: 6px;
+  }
+
+  .log-refresh-button {
+    flex-grow: 0;
+  }
+
+  .log-viewer {
+    padding: 8px;
+  }
+
+  .log-text {
+    font-size: 12px;
+  }
 }
 
 </style>

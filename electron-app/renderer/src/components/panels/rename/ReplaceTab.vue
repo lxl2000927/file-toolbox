@@ -1,21 +1,19 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { RenameRule } from "../../../env";
+import type { RenameRule, RenameRuleOf, RenameRulePatch } from "../../../env";
+import { findRenameRule, upsertRenameRule } from "../../../utils";
 
 const props = defineProps<{ rules: RenameRule[] }>();
 const emit = defineEmits<{ "update:rules": [rules: RenameRule[]] }>();
 
-const rule = computed<RenameRule>(() => {
-  const found = props.rules.find((r) => r.type === "replace_text");
-  return found || { type: "replace_text", find: "", replace: "", case_sensitive: false };
+type ReplaceRule = RenameRuleOf<"replace_text">;
+
+const rule = computed<ReplaceRule>(() => {
+  return findRenameRule(props.rules, "replace_text", { find: "", replace: "", case_sensitive: false });
 });
 
-function patch(p: Partial<RenameRule>) {
-  const next = [...props.rules];
-  const idx = next.findIndex((r) => r.type === "replace_text");
-  if (idx >= 0) next[idx] = { ...next[idx], ...p };
-  else next.push({ type: "replace_text", find: "", replace: "", case_sensitive: false, ...p });
-  emit("update:rules", next);
+function patch(p: RenameRulePatch<"replace_text">) {
+  emit("update:rules", upsertRenameRule(props.rules, "replace_text", { find: "", replace: "", case_sensitive: false }, p));
 }
 </script>
 

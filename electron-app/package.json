@@ -1,6 +1,6 @@
 {
   "name": "file-toolbox-electron",
-  "version": "2.4.0",
+  "version": "2.5.0",
   "description": "File Toolbox - Electron + Python 桌面应用",
   "main": "dist/main/index.js",
   "engines": {
@@ -17,6 +17,7 @@
     "package:nsis": "npm run build && electron-builder --win nsis",
     "package:portable": "npm run build && electron-builder --win portable",
     "package:zip": "npm run build && electron-builder --win zip",
+    "package:publish": "npm run build && electron-builder --win nsis --publish always",
     "typecheck": "vue-tsc --noEmit"
   },
   "devDependencies": {
@@ -32,7 +33,12 @@
     "wait-on": "^8.0.0"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "marked": "^15.0.12",
     "vue": "^3.5.35"
+  },
+  "allowScripts": {
+    "electron@42.3.3": true,
+    "esbuild@0.28.1": true
   }
 }

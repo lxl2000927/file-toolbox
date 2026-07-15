@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import threading
 import time
-from dataclasses import dataclass
+from functools import wraps
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Literal
 from urllib.parse import unquote
 import unicodedata
@@ -22,6 +23,61 @@ LogCallback = Callable[[str], None]
 CancelCheck = Callable[[], bool]
 
 
+_OPENCV_TASK_LOCK = threading.RLock()
+
+
+def _serialized_opencv_task(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        options = args[2] if len(args) > 2 else kwargs.get("options")
+        log = kwargs.get("log")
+        cancel_check = kwargs.get("cancel_check")
+        while not _OPENCV_TASK_LOCK.acquire(timeout=0.1):
+            try:
+                if cancel_check and cancel_check():
+                    if log:
+                        log("任务已取消：等待视觉识别资源时取消")
+                    raise RuntimeError("已取消")
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+        try:
+            _, cv2 = PdfScanSplitEngine._require_deps()
+            previous_threads = None
+            previous_opencl = None
+            previous_optimized = None
+            try:
+                if hasattr(cv2, "getNumThreads"):
+                    previous_threads = int(cv2.getNumThreads())
+                if hasattr(cv2, "ocl") and hasattr(cv2.ocl, "useOpenCL"):
+                    previous_opencl = bool(cv2.ocl.useOpenCL())
+                if hasattr(cv2, "useOptimized"):
+                    previous_optimized = bool(cv2.useOptimized())
+                PdfScanSplitEngine._configure_acceleration(options, cv2=cv2, log=log)
+                return func(*args, **kwargs)
+            finally:
+                if previous_threads is not None and hasattr(cv2, "setNumThreads"):
+                    try:
+                        cv2.setNumThreads(previous_threads)
+                    except Exception:
+                        pass
+                if previous_opencl is not None and hasattr(cv2, "ocl") and hasattr(cv2.ocl, "setUseOpenCL"):
+                    try:
+                        cv2.ocl.setUseOpenCL(previous_opencl)
+                    except Exception:
+                        pass
+                if previous_optimized is not None and hasattr(cv2, "setUseOptimized"):
+                    try:
+                        cv2.setUseOptimized(previous_optimized)
+                    except Exception:
+                        pass
+        finally:
+            _OPENCV_TASK_LOCK.release()
+
+    return wrapper
+
+
 def _safe_bool(value, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -36,6 +92,20 @@ def _safe_bool(value, default: bool = False) -> bool:
         if normalized in {"0", "false", "no", "n", "off", ""}:
             return False
     return default
+
+
+def _normalize_qr_effort(value) -> int:
+    try:
+        effort = int(value)
+    except (TypeError, ValueError):
+        effort = 144
+    if effort < 24:
+        return 12
+    if effort < 72:
+        return 24
+    if effort < 144:
+        return 72
+    return 144
 
 
 @dataclass(frozen=True)
@@ -55,7 +125,7 @@ class PdfScanSplitOptions:
     qrcode_skip_pages: int = 0
     use_roi: bool = False
     qrcode_use_roi: bool = False
-    qrcode_max_attempts: int = 180
+    qrcode_max_attempts: int = 144
     max_segment_pages: int = 0
     enable_multithread: bool = False
     enable_gpu: bool = False
@@ -69,7 +139,7 @@ class PdfScanSplitOptions:
         object.__setattr__(self, "ransac_reproj_threshold", max(0.1, min(50.0, float(self.ransac_reproj_threshold or 5.0))))
         object.__setattr__(self, "min_inlier_ratio", max(0.01, min(1.0, float(self.min_inlier_ratio or 0.45))))
         object.__setattr__(self, "qrcode_skip_pages", max(0, min(50, int(self.qrcode_skip_pages or 0))))
-        object.__setattr__(self, "qrcode_max_attempts", max(12, min(500, int(self.qrcode_max_attempts or 180))))
+        object.__setattr__(self, "qrcode_max_attempts", _normalize_qr_effort(self.qrcode_max_attempts))
         object.__setattr__(self, "max_segment_pages", max(0, min(10000, int(self.max_segment_pages or 0))))
 
         _gpu = getattr(self, "enable_gpu", False)
@@ -98,8 +168,13 @@ class PdfScanSplitResult:
 @dataclass
 class _PerfStats:
     pages_scanned: int = 0
+    pages_skipped: int = 0
     markers_found: int = 0
+    stamp_hits: int = 0
+    qr_hits: int = 0
+    feature_hits: int = 0
     scan_seconds: float = 0.0
+    page_scan_seconds: float = 0.0
     render_seconds: float = 0.0
     qr_seconds: float = 0.0
     stamp_seconds: float = 0.0
@@ -131,6 +206,15 @@ class _DetectionContext:
     roi_base_size: tuple[int, int] | None
 
 
+@dataclass
+class _QRCodeScanCache:
+    bbox: tuple[float, float, float, float] | None = None
+    variant: str = "original"
+    hits: int = 0
+    misses: int = 0
+    logged_diagnostics: set[str] = field(default_factory=set)
+
+
 class PdfScanSplitEngine:
     _zxingcpp = None
     _zxingcpp_checked = False
@@ -138,9 +222,6 @@ class PdfScanSplitEngine:
 
     @staticmethod
     def _configure_acceleration(options: PdfScanSplitOptions, *, cv2=None, log: Optional[LogCallback] = None):
-        # 注意：cv2.setNumThreads / cv2.ocl.setUseOpenCL 是进程全局设置。
-        # 当前 engine 为单请求串行模型，不存在并发覆盖问题。
-        # 若未来引入多请求并发，需为此函数加锁或改为每次请求独立配置。
         if cv2 is None:
             _, cv2 = PdfScanSplitEngine._require_deps()
         if hasattr(cv2, "setUseOptimized"):
@@ -159,7 +240,13 @@ class PdfScanSplitEngine:
                 if log:
                     log("OpenCV多线程：启用失败（OpenCV 未支持或受限）")
 
-        if bool(getattr(options, "enable_gpu", False)):
+        use_gpu = bool(getattr(options, "enable_gpu", False))
+        if not use_gpu and hasattr(cv2, "ocl") and hasattr(cv2.ocl, "setUseOpenCL"):
+            try:
+                cv2.ocl.setUseOpenCL(False)
+            except Exception:
+                pass
+        if use_gpu:
             enabled = False
             detail = ""
             try:
@@ -207,8 +294,13 @@ class PdfScanSplitEngine:
         other = max(0.0, scan - measured)
         return {
             "pages_scanned": int(stats.pages_scanned),
+            "pages_skipped": int(stats.pages_skipped),
             "markers_found": int(stats.markers_found),
+            "stamp_hits": int(stats.stamp_hits),
+            "qr_hits": int(stats.qr_hits),
+            "feature_hits": int(stats.feature_hits),
             "scan_seconds": float(stats.scan_seconds),
+            "page_scan_seconds": float(stats.page_scan_seconds),
             "render_seconds": float(stats.render_seconds),
             "qr_seconds": float(stats.qr_seconds),
             "stamp_seconds": float(stats.stamp_seconds),
@@ -231,7 +323,7 @@ class PdfScanSplitEngine:
 
     @staticmethod
     def _qrcode_max_attempts(options: PdfScanSplitOptions) -> int:
-        return int(options.qrcode_max_attempts or 180)
+        return int(options.qrcode_max_attempts or 144)
 
     @staticmethod
     def _qrcode_fallback_dpis(current_dpi: int) -> list[int]:
@@ -239,7 +331,7 @@ class PdfScanSplitEngine:
         if current < 200:
             candidates = [200, 220]
         elif current == 200:
-            candidates = [180, 220]
+            candidates = [220, 180]
         else:
             candidates = [200, 180]
         result: list[int] = []
@@ -261,7 +353,6 @@ class PdfScanSplitEngine:
         use_stamp = mode in ("stamp", "auto")
         use_feature = mode in ("feature", "auto")
         np, cv2 = PdfScanSplitEngine._require_deps()
-        PdfScanSplitEngine._configure_acceleration(options, cv2=cv2, log=log)
         detector = cv2.QRCodeDetector() if use_qr else None
         orb = cv2.ORB_create(nfeatures=int(options.nfeatures)) if use_feature else None
         matcher = cv2.BFMatcher(cv2.NORM_HAMMING) if use_feature else None
@@ -365,16 +456,6 @@ class PdfScanSplitEngine:
         return bool(cancel_check and cancel_check())
 
     @staticmethod
-    def _qr_decode_failure_hint(strong: bool = False) -> str:
-        if strong:
-            return "多页疑似二维码均未能解析内容。后续页已自动降级为仅检测码是否存在；该码图可能无法被通用二维码解码器识别，或需要特定扫码环境解析。"
-        return "已连续 3 页检测到疑似二维码，但本地解码器未解析到内容。若只需识别标记页，可勾选“不解码内容”。"
-
-    @staticmethod
-    def _probe_qr_decode_failure_hint() -> str:
-        return "检测到疑似二维码，但未能解析内容。内容匹配仅适用于可被通用二维码解码器识别的码图；如只需判断标记页，请勾选“不解码内容”。"
-
-    @staticmethod
     def _raise_if_cancelled(cancel_check: Optional[CancelCheck]) -> None:
         if PdfScanSplitEngine._is_cancelled(cancel_check):
             raise RuntimeError("已取消")
@@ -427,14 +508,6 @@ class PdfScanSplitEngine:
         return page_bgr
 
     @staticmethod
-    def _get_pdf_page_count(pdf_path: str) -> int:
-        doc = fitz.open(pdf_path)
-        try:
-            return PdfScanSplitEngine._load_ready_pdf(doc)
-        finally:
-            doc.close()
-
-    @staticmethod
     def _log_execute_scan_start(mode: str, total_pages: int, log: Optional[LogCallback]) -> None:
         if not log:
             return
@@ -447,7 +520,7 @@ class PdfScanSplitEngine:
         elif mode == "stamp":
             log("开始识别标记页（印章识别模式）…")
         elif mode == "auto":
-            log("开始识别标记页（自动模式：二维码/印章/特征匹配）…")
+            log("开始识别标记页（自动模式：印章/二维码/特征匹配）…")
 
     @staticmethod
     def _format_roi_log(options: PdfScanSplitOptions, roi_base_size: tuple[int, int] | None) -> str:
@@ -462,6 +535,40 @@ class PdfScanSplitEngine:
         return f"ROI：已启用，区域 x={x}, y={y}, w={w}, h={h}"
 
     @staticmethod
+    def _format_scan_options_log(options: PdfScanSplitOptions) -> str:
+        mode_labels = {
+            "auto": "自动",
+            "qrcode": "二维码",
+            "stamp": "印章",
+            "feature": "特征点",
+        }
+        strength_labels = {12: "快速", 24: "标准", 72: "增强", 144: "极强"}
+        mode = PdfScanSplitEngine._normalize_detection_mode(options.detection_mode)
+        parts = [f"模式 {mode_labels.get(mode, mode)}", f"DPI {int(options.dpi)}"]
+        if mode in ("qrcode", "auto"):
+            strength = int(options.qrcode_max_attempts or 144)
+            parts.append(f"二维码强度 {strength_labels.get(strength, strength)}")
+            if options.qrcode_no_decode:
+                parts.append("二维码不解码")
+            elif (options.qrcode_text_contains or "").strip():
+                parts.append(f"二维码内容包含“{str(options.qrcode_text_contains).strip()}”")
+        if int(options.qrcode_skip_pages or 0) > 0:
+            parts.append(f"命中后跳过 {int(options.qrcode_skip_pages)} 页")
+        if options.exclude_marker_page:
+            parts.append("不保存标记页")
+        elif options.marker_as_first_page:
+            parts.append("标记页放下一份开头")
+        else:
+            parts.append("标记页放上一份末尾")
+        if int(options.max_segment_pages or 0) > 0:
+            parts.append(f"每份最多 {int(options.max_segment_pages)} 页")
+        if options.enable_multithread:
+            parts.append("OpenCV 多线程")
+        if options.enable_gpu:
+            parts.append("OpenCL 加速")
+        return "扫描参数：" + "，".join(parts)
+
+    @staticmethod
     def _log_execute_summary(
         *,
         outputs: list[str],
@@ -469,10 +576,14 @@ class PdfScanSplitEngine:
         scan_elapsed_s: float,
         write_elapsed_s: float,
         log: Optional[LogCallback],
+        cancelled: bool = False,
     ) -> None:
         if not log:
             return
-        log(f"拆分写入完成：{len(outputs)} 个文件，用时 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)}")
+        if cancelled:
+            log(f"写入阶段结束：任务已取消，已保留 {len(outputs)} 个已生成文件")
+        else:
+            log(f"拆分写入完成：{len(outputs)} 个文件，用时 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)}")
         log(f"总耗时：{PdfScanSplitEngine._fmt_seconds(total_elapsed_s)} (识别 {PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)} + 写入 {PdfScanSplitEngine._fmt_seconds(write_elapsed_s)})")
 
     @staticmethod
@@ -496,12 +607,12 @@ class PdfScanSplitEngine:
         if use_qr and roi_base_size and options.reference_roi and options.use_roi:
             dst_size = (int(page_bgr_full.shape[1]), int(page_bgr_full.shape[0]))
             page_roi = PdfScanSplitEngine._scale_roi(options.reference_roi, src_size=roi_base_size, dst_size=dst_size)
-            page_roi = PdfScanSplitEngine._expand_roi(page_roi, dst_size=dst_size, pad_ratio=0.22)
+            page_roi = PdfScanSplitEngine._expand_roi(page_roi, dst_size=dst_size, pad_ratio=0.45)
             page_bgr_qr = PdfScanSplitEngine._apply_roi(page_bgr_full, page_roi)
         if use_stamp and roi_base_size and options.reference_roi and options.use_roi:
             dst_size = (int(page_bgr_full.shape[1]), int(page_bgr_full.shape[0]))
             page_roi = PdfScanSplitEngine._scale_roi(options.reference_roi, src_size=roi_base_size, dst_size=dst_size)
-            page_roi = PdfScanSplitEngine._expand_roi(page_roi, dst_size=dst_size, pad_ratio=0.22)
+            page_roi = PdfScanSplitEngine._expand_roi(page_roi, dst_size=dst_size, pad_ratio=0.45)
             page_bgr_stamp = PdfScanSplitEngine._apply_roi(page_bgr_full, page_roi)
         return page_bgr_qr, page_bgr_stamp, page_bgr_feature
 
@@ -510,7 +621,16 @@ class PdfScanSplitEngine:
         return bool(options.use_roi and options.reference_roi and roi_base_size)
 
     @staticmethod
-    def _prepare_page_images_from_roi_clip(page_bgr_roi, *, use_qr: bool, use_stamp: bool, use_feature: bool):
+    def _prepare_page_images_from_roi_clip(
+        page_bgr_roi,
+        *,
+        use_qr: bool,
+        use_stamp: bool,
+        use_feature: bool,
+        reference_roi: tuple[int, int, int, int] | None = None,
+        roi_base_size: tuple[int, int] | None = None,
+        pad_ratio: float = 0.45,
+    ):
         """Return per-detector input images from the ROI crop.
         Callers must ensure page_bgr_roi is not None before calling.
         """
@@ -518,13 +638,43 @@ class PdfScanSplitEngine:
             raise ValueError(
                 "_prepare_page_images_from_roi_clip: page_bgr_roi must not be None"
             )
+        feature_image = page_bgr_roi
+        if use_feature and reference_roi and roi_base_size:
+            try:
+                src_w, src_h = [float(v) for v in roi_base_size]
+                x, y, w, h = [float(v) for v in reference_roi]
+                pad_x = w * max(0.0, float(pad_ratio))
+                pad_y = h * max(0.0, float(pad_ratio))
+                expanded_left = max(0.0, x - pad_x)
+                expanded_top = max(0.0, y - pad_y)
+                expanded_right = min(src_w, x + w + pad_x)
+                expanded_bottom = min(src_h, y + h + pad_y)
+                image_h, image_w = page_bgr_roi.shape[:2]
+                expanded_w = expanded_right - expanded_left
+                expanded_h = expanded_bottom - expanded_top
+                if expanded_w > 0 and expanded_h > 0:
+                    left = int(round((x - expanded_left) / expanded_w * image_w))
+                    top = int(round((y - expanded_top) / expanded_h * image_h))
+                    right = int(round((x + w - expanded_left) / expanded_w * image_w))
+                    bottom = int(round((y + h - expanded_top) / expanded_h * image_h))
+                    left = max(0, min(left, image_w - 1))
+                    top = max(0, min(top, image_h - 1))
+                    right = max(left + 1, min(right, image_w))
+                    bottom = max(top + 1, min(bottom, image_h))
+                    feature_image = page_bgr_roi[top:bottom, left:right]
+            except Exception:
+                feature_image = page_bgr_roi
         return (
             page_bgr_roi if use_qr else None,
             page_bgr_roi if use_stamp else None,
-            page_bgr_roi if use_feature else None,
+            feature_image if use_feature else None,
         )
+
     @staticmethod
     def _new_probe_result(page_index: int, total: int, mode: str, options: PdfScanSplitOptions) -> dict:
+        stamp_enabled = mode in ("stamp", "auto")
+        qr_enabled = mode in ("qrcode", "auto")
+        feature_enabled = mode in ("feature", "auto")
         return {
             "page_index": int(page_index),
             "page_number": int(page_index) + 1,
@@ -532,9 +682,24 @@ class PdfScanSplitEngine:
             "detection_mode": mode,
             "marked": False,
             "reason": "",
-            "qrcode": {"present": False, "infos": []},
-            "stamp": {"present": False},
-            "feature": {"good_matches": 0, "inliers": 0, "inlier_ratio": 0.0},
+            "qrcode": {
+                "present": False,
+                "infos": [],
+                "executed": False,
+                "skipped_reason": "" if qr_enabled else "当前模式未启用",
+            },
+            "stamp": {
+                "present": False,
+                "executed": False,
+                "skipped_reason": "" if stamp_enabled else "当前模式未启用",
+            },
+            "feature": {
+                "good_matches": 0,
+                "inliers": 0,
+                "inlier_ratio": 0.0,
+                "executed": False,
+                "skipped_reason": "" if feature_enabled else "当前模式未启用",
+            },
             "params": {
                 "dpi": int(options.dpi),
                 "nfeatures": int(options.nfeatures),
@@ -546,64 +711,6 @@ class PdfScanSplitEngine:
         }
 
     @staticmethod
-    def _detect_qr_for_probe(
-        result: dict,
-        page_bgr_qr,
-        options: PdfScanSplitOptions,
-        *,
-        detector=None,
-        cv2=None,
-        log: Optional[LogCallback] = None,
-        cancel_check: Optional[CancelCheck] = None,
-    ) -> None:
-        needle = (options.qrcode_text_contains or "").strip()
-        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-        present = PdfScanSplitEngine._qr_detect_confident(page_bgr_qr, detector=detector, cv2=cv2)
-        if not present:
-            present = PdfScanSplitEngine._qr_detect_likely(page_bgr_qr, detector=detector, cv2=cv2)
-        result["qrcode"]["present"] = bool(present)
-        if not present:
-            return
-        try:
-            area, aspect, solidity = PdfScanSplitEngine._qr_detect_stats(page_bgr_qr, detector=detector, cv2=cv2)
-            result["qrcode"]["stats"] = {"area": float(area), "aspect": float(aspect), "solidity": float(solidity)}
-        except Exception as exc:
-            result["qrcode"]["stats"] = None
-            if log:
-                log(f"[警告] 二维码统计收集失败: {exc}")
-
-        if options.qrcode_no_decode:
-            result["marked"] = True
-            result["reason"] = "二维码存在（未解码）"
-            return
-
-        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-        infos = PdfScanSplitEngine._detect_qrcodes(
-            page_bgr_qr,
-            detector=detector,
-            cv2=cv2,
-            max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
-            cancel_check=cancel_check,
-        )
-        result["qrcode"]["infos"] = list(infos or [])
-        if infos:
-            matched_infos = PdfScanSplitEngine._match_texts(infos, needle)
-            if matched_infos:
-                result["marked"] = True
-                result["reason"] = "二维码解码命中"
-            else:
-                result["marked"] = False
-                result["reason"] = "二维码解码到内容，但未命中关键字"
-            return
-
-        if present and not needle:
-            result["marked"] = False
-            result["reason"] = "检测到二维码但未解码（未勾选“二维码存在（未解码）”，未视为标记页）"
-        elif present:
-            result["marked"] = False
-            result["reason"] = "检测到二维码但未能解析内容"
-
-    @staticmethod
     def _detect_qr_for_scan(
         doc,
         page_index: int,
@@ -613,8 +720,8 @@ class PdfScanSplitEngine:
         detector=None,
         cv2=None,
         roi_base_size: tuple[int, int] | None = None,
+        scan_cache: _QRCodeScanCache | None = None,
         status: Optional[dict] = None,
-        decode_content: bool = True,
         perf: Optional[_PerfStats] = None,
         log: Optional[LogCallback] = None,
         cancel_check: Optional[CancelCheck] = None,
@@ -625,77 +732,93 @@ class PdfScanSplitEngine:
             status.clear()
 
         PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-        present = PdfScanSplitEngine._qr_detect_confident(page_bgr_qr, detector=detector, cv2=cv2)
-        if not present:
-            present = PdfScanSplitEngine._qr_detect_likely(page_bgr_qr, detector=detector, cv2=cv2)
-        if not present:
-            if options.qrcode_no_decode or not decode_content:
-                if status is not None:
-                    status.update({"present": False, "decoded": False, "decode_failed": False})
-                return False
-            enhance_initial_miss = options.detection_mode == "qrcode" or bool(options.use_roi and options.reference_roi)
-            if not enhance_initial_miss:
-                if status is not None:
-                    status.update({"present": False, "decoded": False, "decode_failed": False})
-                return False
-            infos_light = PdfScanSplitEngine._detect_qrcodes(
-                page_bgr_qr,
-                detector=detector,
-                cv2=cv2,
-                max_robust_attempts=24,
-                cancel_check=cancel_check,
-            )
-            if infos_light:
-                if status is not None:
-                    status.update({"present": True, "decoded": True, "decode_failed": False})
-                matched_infos = PdfScanSplitEngine._match_texts(infos_light, needle)
-                if matched_infos:
-                    if log:
-                        sample = PdfScanSplitEngine._sample_text(matched_infos[0])
-                        log(f"第 {page_index + 1} 页：二维码初筛未通过，增强解码命中 {sample}")
-                    return True
-                if log and needle:
-                    sample = PdfScanSplitEngine._sample_text(infos_light[0])
-                    log(f"第 {page_index + 1} 页：二维码初筛未通过，但增强解码内容不包含关键字“{needle}” {sample}")
-                return False
+        if options.qrcode_no_decode:
+            present = PdfScanSplitEngine._qr_detect_confident(page_bgr_qr, detector=detector, cv2=cv2)
             if status is not None:
-                status.update({"present": False, "decoded": False, "decode_failed": False})
-            return False
-        if status is not None:
-            status.update({"present": True, "decoded": False, "decode_failed": False})
-
-        if options.qrcode_no_decode or not decode_content:
+                status.update(
+                    {
+                        "present": bool(present),
+                        "candidate_confident": bool(present),
+                        "decoded": False,
+                        "decode_failed": False,
+                        "infos": [],
+                        "variant": "candidate",
+                        "bbox": None,
+                        "dpi": int(options.dpi),
+                    }
+                )
+            if not present:
+                return False
             if needle and log:
-                log(f"第 {page_index + 1} 页：检测到二维码（未解码），已忽略“二维码内容包含”筛选")
+                log(f"第 {page_index + 1} 页：检测到高可信二维码候选（未解码），已忽略“二维码内容包含”筛选")
             if log:
-                log(f"第 {page_index + 1} 页：检测到二维码（未解码）")
+                log(f"第 {page_index + 1} 页：检测到高可信二维码候选（未解码）")
             return True
 
+        qr_details: dict = {}
         infos = PdfScanSplitEngine._detect_qrcodes(
             page_bgr_qr,
             detector=detector,
             cv2=cv2,
             max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
+            text_contains=needle,
+            scan_cache=scan_cache,
+            details=qr_details,
             cancel_check=cancel_check,
         )
+        if log:
+            for diagnostic in [str(item) for item in qr_details.get("diagnostics", []) if item]:
+                if scan_cache is not None:
+                    if diagnostic in scan_cache.logged_diagnostics:
+                        continue
+                    scan_cache.logged_diagnostics.add(diagnostic)
+                log(f"二维码识别降级：{diagnostic}")
+        candidate_present = bool(qr_details.get("candidate_present"))
+        candidate_confident = bool(qr_details.get("candidate_confident"))
+        if status is not None:
+            status.update(
+                {
+                    "present": bool(infos or candidate_present),
+                    "candidate_confident": candidate_confident,
+                    "decoded": bool(infos),
+                    "decode_failed": bool(candidate_confident and not infos),
+                    "infos": list(infos or []),
+                    "variant": str(qr_details.get("variant") or ""),
+                    "bbox": qr_details.get("bbox"),
+                    "dpi": int(options.dpi),
+                    "diagnostics": list(qr_details.get("diagnostics") or []),
+                }
+            )
         if infos:
-            if status is not None:
-                status.update({"present": True, "decoded": True, "decode_failed": False})
             matched_infos = PdfScanSplitEngine._match_texts(infos, needle)
             if matched_infos:
+                if scan_cache is not None and qr_details.get("bbox"):
+                    scan_cache.bbox = tuple(float(v) for v in qr_details["bbox"])
+                    scan_cache.variant = str(qr_details.get("variant") or "original")
+                    scan_cache.hits += 1
+                    scan_cache.misses = 0
                 if log:
                     sample = PdfScanSplitEngine._sample_text(matched_infos[0])
-                    log(f"第 {page_index + 1} 页：识别到二维码（{len(matched_infos)} 个） {sample}")
+                    variant = str(qr_details.get("variant") or "original")
+                    log(f"第 {page_index + 1} 页：识别到二维码（{len(matched_infos)} 个，{variant}） {sample}")
                 return True
             if log and needle:
                 sample = PdfScanSplitEngine._sample_text(infos[0])
                 log(f"第 {page_index + 1} 页：识别到二维码，但不包含关键字“{needle}” {sample}")
+            if scan_cache is not None:
+                scan_cache.misses += 1
+                if scan_cache.misses >= 3:
+                    scan_cache.bbox = None
+                    scan_cache.variant = "original"
             return False
 
-        if not infos and status is not None:
-            status.update({"present": True, "decoded": False, "decode_failed": True})
-
-        for retry_dpi in fallback_dpis:
+        retry_dpis: list[int] = []
+        if candidate_confident:
+            retry_dpis = fallback_dpis[:2 if options.detection_mode == "qrcode" else 1]
+        elif options.detection_mode == "qrcode":
+            higher_dpis = [dpi for dpi in fallback_dpis if dpi > int(options.dpi)]
+            retry_dpis = higher_dpis[:1]
+        for retry_dpi in retry_dpis:
             PdfScanSplitEngine._raise_if_cancelled(cancel_check)
             retry_started_at = time.perf_counter()
             if perf is not None:
@@ -725,18 +848,45 @@ class PdfScanSplitEngine:
                 PdfScanSplitEngine._raise_if_cancelled(cancel_check)
                 continue
             PdfScanSplitEngine._raise_if_cancelled(cancel_check)
+            retry_details: dict = {}
             infos_retry = PdfScanSplitEngine._detect_qrcodes(
                 page_bgr_retry,
                 detector=detector,
                 cv2=cv2,
                 max_robust_attempts=PdfScanSplitEngine._qrcode_max_attempts(options),
+                text_contains=needle,
+                scan_cache=scan_cache,
+                details=retry_details,
                 cancel_check=cancel_check,
             )
+            if log:
+                for diagnostic in [str(item) for item in retry_details.get("diagnostics", []) if item]:
+                    if scan_cache is not None:
+                        if diagnostic in scan_cache.logged_diagnostics:
+                            continue
+                        scan_cache.logged_diagnostics.add(diagnostic)
+                    log(f"二维码识别降级：{diagnostic}")
             if infos_retry:
                 if status is not None:
-                    status.update({"present": True, "decoded": True, "decode_failed": False})
+                    status.update(
+                        {
+                            "present": True,
+                            "decoded": True,
+                            "decode_failed": False,
+                            "infos": list(infos_retry),
+                            "variant": str(retry_details.get("variant") or ""),
+                            "bbox": retry_details.get("bbox"),
+                            "dpi": int(retry_dpi),
+                            "diagnostics": list(retry_details.get("diagnostics") or []),
+                        }
+                    )
                 matched_infos = PdfScanSplitEngine._match_texts(infos_retry, needle)
                 if matched_infos:
+                    if scan_cache is not None and retry_details.get("bbox"):
+                        scan_cache.bbox = tuple(float(v) for v in retry_details["bbox"])
+                        scan_cache.variant = str(retry_details.get("variant") or "original")
+                        scan_cache.hits += 1
+                        scan_cache.misses = 0
                     if perf is not None:
                         perf.dpi_fallback_hits += 1
                     if log:
@@ -746,15 +896,23 @@ class PdfScanSplitEngine:
                 if log and needle:
                     sample = PdfScanSplitEngine._sample_text(infos_retry[0])
                     log(f"第 {page_index + 1} 页：二维码 {retry_dpi} DPI 兜底重试识别到，但不包含关键字“{needle}” {sample}")
-            else:
-                present_after_retry = PdfScanSplitEngine._qr_detect_confident(page_bgr_retry, detector=detector, cv2=cv2)
-                if present_after_retry and status is not None:
-                    status.update({"present": True, "decoded": False, "decode_failed": True})
-        if not needle and log:
+            elif status is not None and retry_details.get("candidate_confident"):
+                status.update({"present": True, "candidate_confident": True, "decode_failed": True})
+        if scan_cache is not None:
+            scan_cache.misses += 1
+            if scan_cache.misses >= 3:
+                scan_cache.bbox = None
+                scan_cache.variant = "original"
+        if candidate_present and not needle and log:
             area, aspect, solidity = PdfScanSplitEngine._qr_detect_stats(page_bgr_qr, detector=detector, cv2=cv2)
             log(
-                f"第 {page_index + 1} 页：检测到二维码但未能解码（已尝试增强解码和 DPI 兜底；未勾选“二维码存在（未解码）”，未视为标记页）"
+                f"第 {page_index + 1} 页：检测到二维码候选但未能解码（未视为标记页）"
                 f"  面积 {int(area)}  形状 {aspect:.2f}  填充 {solidity:.2f}"
+            )
+        elif candidate_present and log:
+            log(
+                f"第 {page_index + 1} 页：检测到二维码候选但未能解码，"
+                f"无法匹配关键字“{needle}”，未视为标记页"
             )
         return False
 
@@ -772,8 +930,22 @@ class PdfScanSplitEngine:
             log(f"第 {page_index + 1} 页：未匹配")
 
     @staticmethod
-    def _detect_stamp_for_scan(page_index: int, page_bgr_stamp, *, cv2=None, log: Optional[LogCallback] = None) -> tuple[bool, dict]:
+    def _detect_stamp_for_scan(
+        page_index: int,
+        page_bgr_stamp,
+        *,
+        cv2=None,
+        log: Optional[LogCallback] = None,
+        logged_diagnostics: Optional[set[str]] = None,
+    ) -> tuple[bool, dict]:
         stamp = PdfScanSplitEngine._detect_red_stamp(page_bgr_stamp, cv2=cv2)
+        if log:
+            for diagnostic in [str(item) for item in stamp.get("diagnostics", []) if item]:
+                if logged_diagnostics is not None:
+                    if diagnostic in logged_diagnostics:
+                        continue
+                    logged_diagnostics.add(diagnostic)
+                log(f"印章识别降级：{diagnostic}")
         if stamp.get("present"):
             if log:
                 log(
@@ -817,7 +989,7 @@ class PdfScanSplitEngine:
     @staticmethod
     def _detect_stamp_for_probe(result: dict, page_bgr_stamp, *, cv2=None) -> None:
         stamp = PdfScanSplitEngine._detect_red_stamp(page_bgr_stamp, cv2=cv2)
-        result["stamp"] = dict(stamp or {})
+        result["stamp"] = {**dict(stamp or {}), "executed": True, "skipped_reason": ""}
         if stamp.get("present"):
             result["marked"] = True
             result["reason"] = "检测到印章"
@@ -851,6 +1023,8 @@ class PdfScanSplitEngine:
             "good_matches": int(good_count),
             "inliers": int(inliers),
             "inlier_ratio": float(inlier_ratio),
+            "executed": True,
+            "skipped_reason": "",
         }
         if PdfScanSplitEngine._is_feature_match(good_count, inliers, inlier_ratio, options):
             result["marked"] = True
@@ -1106,12 +1280,35 @@ class PdfScanSplitEngine:
         return good_count, inliers, inlier_ratio
 
     @staticmethod
+    def _order_qr_quad(quad, *, np=None):
+        if np is None:
+            np, _ = PdfScanSplitEngine._require_deps()
+        try:
+            points = np.asarray(quad, dtype="float32").reshape(4, 2)
+            sums = points.sum(axis=1)
+            diffs = points[:, 0] - points[:, 1]
+            return np.array(
+                [
+                    points[sums.argmin()],
+                    points[diffs.argmax()],
+                    points[sums.argmax()],
+                    points[diffs.argmin()],
+                ],
+                dtype="float32",
+            )
+        except Exception:
+            return None
+
+    @staticmethod
     def _detect_qrcodes(
         img_bgr,
         *,
         detector=None,
         cv2=None,
         max_robust_attempts: int | None = None,
+        text_contains: str = "",
+        scan_cache: _QRCodeScanCache | None = None,
+        details: Optional[dict] = None,
         cancel_check: Optional[CancelCheck] = None,
     ) -> list[str]:
         if cv2 is None:
@@ -1127,151 +1324,156 @@ class PdfScanSplitEngine:
                 max_robust_attempts = int(os.getenv("FILETOOLBOX_QR_MAX_ATTEMPTS", "180") or "180")
             except Exception:
                 max_robust_attempts = 180
-        max_robust_attempts = max(24, int(max_robust_attempts or 180))
+        effort = max(12, int(max_robust_attempts or 180))
+        required_text = str(text_contains or "").strip()
+        out = details if details is not None else {}
+        out.update({"candidate_present": False, "candidate_confident": False, "variant": "", "bbox": None, "decoded_items": [], "diagnostics": []})
+
+        def _diagnostic(stage: str, exc: Exception) -> None:
+            message = f"{stage}失败：{type(exc).__name__}: {exc}"
+            diagnostics = out.setdefault("diagnostics", [])
+            if message not in diagnostics:
+                diagnostics.append(message)
 
         def _cancelled() -> bool:
             return PdfScanSplitEngine._is_cancelled(cancel_check)
 
-        def _min_area_threshold(gray_img) -> float:
-            h, w = gray_img.shape[:2]
-            return max(35.0, 0.00006 * float(h * w))
-
-        def _filter_decoded(decoded: list[str], pts, area_threshold: float) -> list[str]:
-            infos: list[str] = []
-            if not decoded:
-                return infos
-            if pts is None:
-                for s in decoded:
-                    s = str(s or "").strip()
-                    if len(s) >= 1:
-                        infos.append(s)
-                return infos
+        def _position_bbox(item, *, offset_x: int, offset_y: int, base_w: int, base_h: int):
             try:
-                pts_arr = pts
-                if hasattr(pts_arr, "shape") and len(getattr(pts_arr, "shape", ())) >= 3:
-                    for i, s in enumerate(decoded):
-                        s = str(s or "").strip()
-                        if len(s) < 1:
-                            continue
-                        try:
-                            poly = pts_arr[i]
-                            area = float(cv2.contourArea(poly.astype("float32")))
-                        except Exception:
-                            area = 0.0
-                        if area >= area_threshold:
-                            infos.append(s)
-                    return infos
+                pos = item.position
+                pts = [pos.top_left, pos.top_right, pos.bottom_right, pos.bottom_left]
+                xs = [float(p.x) + float(offset_x) for p in pts]
+                ys = [float(p.y) + float(offset_y) for p in pts]
+                left = max(0.0, min(xs)) / float(base_w)
+                top = max(0.0, min(ys)) / float(base_h)
+                right = min(float(base_w), max(xs)) / float(base_w)
+                bottom = min(float(base_h), max(ys)) / float(base_h)
+                if right > left and bottom > top:
+                    return (left, top, right - left, bottom - top)
             except Exception:
                 pass
-            for s in decoded:
-                s = str(s or "").strip()
-                if len(s) >= 1:
-                    infos.append(s)
-            return infos
+            return None
 
-        def _decode_zxing(gray_img) -> list[str]:
+        def _decode_zxing(image, *, variant: str, offset_x: int = 0, offset_y: int = 0) -> list[str]:
+            if _cancelled():
+                return []
             zxingcpp = PdfScanSplitEngine._load_zxingcpp()
             if zxingcpp is None:
                 return []
             try:
-                results = zxingcpp.read_barcodes(gray_img)
-            except Exception:
+                results = zxingcpp.read_barcodes(
+                    image,
+                    formats=zxingcpp.BarcodeFormat.QRCode,
+                    try_rotate=True,
+                    try_downscale=True,
+                    try_invert=True,
+                )
+            except Exception as exc:
+                _diagnostic(f"ZXing {variant} 解码", exc)
                 return []
             infos: list[str] = []
-            try:
-                items = list(results or [])
-            except Exception:
-                items = []
-            for item in items:
+            decoded_items: list[dict] = []
+            for item in list(results or []):
                 try:
-                    fmt = str(getattr(item, "format", "") or "").lower()
-                    if fmt and "qr" not in fmt:
+                    if not bool(getattr(item, "valid", True)):
                         continue
                     text = str(getattr(item, "text", "") or "").strip()
-                    if text:
-                        infos.append(text)
+                    if not text:
+                        continue
+                    infos.append(text)
+                    decoded_items.append(
+                        {
+                            "text": text,
+                            "bbox": _position_bbox(item, offset_x=offset_x, offset_y=offset_y, base_w=w, base_h=h),
+                        }
+                    )
                 except Exception:
                     continue
+            if infos:
+                selected = next(
+                    (
+                        item
+                        for item in decoded_items
+                        if not required_text or PdfScanSplitEngine._match_texts([str(item.get("text") or "")], required_text)
+                    ),
+                    None,
+                )
+                out.update(
+                    {
+                        "candidate_present": True,
+                        "candidate_confident": True,
+                        "variant": variant,
+                        "bbox": selected.get("bbox") if selected else None,
+                        "decoded_items": decoded_items,
+                    }
+                )
             return infos
 
-        def _decode_from_detect(gray_img, *, area_threshold: float) -> list[str]:
+        def _cached_crop():
+            if scan_cache is None or scan_cache.bbox is None:
+                return None
+            try:
+                nx, ny, nw, nh = scan_cache.bbox
+                pad_x = nw * 0.75
+                pad_y = nh * 0.75
+                x1 = max(0, int(round((nx - pad_x) * w)))
+                y1 = max(0, int(round((ny - pad_y) * h)))
+                x2 = min(w, int(round((nx + nw + pad_x) * w)))
+                y2 = min(h, int(round((ny + nh + pad_y) * h)))
+                if x2 - x1 < 16 or y2 - y1 < 16:
+                    return None
+                return img_bgr[y1:y2, x1:x2], x1, y1
+            except Exception as exc:
+                _diagnostic("二维码缓存区域裁剪", exc)
+                return None
+
+        def _candidate_quads(gray_img) -> list:
             polys: list = []
             try:
                 if hasattr(detector, "detectMulti"):
                     ok, pts = detector.detectMulti(gray_img)
-                    ok_flag = False
-                    try:
-                        ok_flag = bool(ok)
-                    except Exception:
-                        try:
-                            ok_flag = bool(ok.any()) if hasattr(ok, "any") else False
-                        except Exception:
-                            ok_flag = False
-                    if ok_flag and pts is not None:
+                    if bool(ok) and pts is not None:
                         polys = list(pts)
-            except Exception:
+            except Exception as exc:
+                _diagnostic("OpenCV 多二维码候选检测", exc)
                 polys = []
             if not polys:
                 try:
-                    detected, pts = detector.detect(gray_img)
-                    detected_flag = False
-                    try:
-                        detected_flag = bool(detected)
-                    except Exception:
-                        try:
-                            detected_flag = bool(detected.any()) if hasattr(detected, "any") else False
-                        except Exception:
-                            detected_flag = False
-                    if detected_flag and pts is not None:
+                    ok, pts = detector.detect(gray_img)
+                    if bool(ok) and pts is not None:
                         polys = [pts]
-                except Exception:
+                except Exception as exc:
+                    _diagnostic("OpenCV 二维码候选检测", exc)
                     polys = []
-
-            def _normalize_poly(poly):
-                try:
-                    p = poly
-                    if hasattr(p, "shape") and tuple(getattr(p, "shape", ())) == (1, 4, 2):
-                        p = p[0]
-                    if hasattr(p, "shape") and tuple(getattr(p, "shape", ())) == (4, 2):
-                        return p.astype("float32")
-                except Exception:
-                    return None
-                return None
-
-            def _order_quad(quad):
-                s = quad.sum(axis=1)
-                diff = (quad[:, 0] - quad[:, 1])
-                tl = quad[s.argmin()]
-                br = quad[s.argmax()]
-                tr = quad[diff.argmin()]
-                bl = quad[diff.argmax()]
-                try:
-                    return np.array([tl, tr, br, bl], dtype="float32")
-                except Exception:
-                    return None
-
+            normalized: list = []
             for poly in polys:
-                quad = _normalize_poly(poly)
-                if quad is None:
-                    continue
                 try:
-                    area = float(cv2.contourArea(quad))
-                except Exception:
-                    area = 0.0
-                if area < float(area_threshold):
+                    quad = poly[0] if tuple(getattr(poly, "shape", ())) == (1, 4, 2) else poly
+                    if tuple(getattr(quad, "shape", ())) == (4, 2):
+                        normalized.append(quad.astype("float32"))
+                except Exception as exc:
+                    _diagnostic("二维码候选坐标标准化", exc)
                     continue
-                try:
-                    x, y, bw, bh = cv2.boundingRect(quad.astype("float32"))
-                    if bw <= 0 or bh <= 0:
-                        continue
-                    ratio = float(max(bw, bh)) / float(min(bw, bh))
-                    if ratio > 2.2:
-                        continue
-                except Exception:
-                    pass
+            return normalized
 
+        def _decode_warped_candidates(gray_img) -> list[str]:
+            area_threshold = max(55.0, 0.00006 * float(h * w))
+            first_nonmatching_infos: list[str] = []
+            first_nonmatching_bbox = None
+            for quad in _candidate_quads(gray_img):
                 try:
-                    ordered = _order_quad(quad)
+                    area = abs(float(cv2.contourArea(quad)))
+                    x, y, bw, bh = cv2.boundingRect(quad)
+                    if area < area_threshold or bw <= 0 or bh <= 0:
+                        continue
+                    aspect = float(max(bw, bh)) / float(min(bw, bh))
+                    solidity = area / float(bw * bh)
+                    confident = aspect <= 2.0 and solidity >= 0.18
+                    out["candidate_present"] = True
+                    out["candidate_confident"] = bool(out.get("candidate_confident") or confident)
+                    if not confident:
+                        continue
+                    ordered = PdfScanSplitEngine._order_qr_quad(quad, np=np)
                     if ordered is None:
                         continue
                     side = max(
@@ -1282,251 +1484,101 @@ class PdfScanSplitEngine:
                     )
                     if side <= 8:
                         continue
-                    size = int(max(320, min(960, side * 2.2)))
+                    code_size = int(max(240, min(900, side * 2.5)))
+                    quiet = max(20, int(round(code_size * 0.12)))
+                    canvas_size = code_size + quiet * 2
                     dst = np.array(
-                        [[0, 0], [size - 1, 0], [size - 1, size - 1], [0, size - 1]],
+                        [
+                            [quiet, quiet],
+                            [quiet + code_size - 1, quiet],
+                            [quiet + code_size - 1, quiet + code_size - 1],
+                            [quiet, quiet + code_size - 1],
+                        ],
                         dtype="float32",
                     )
-                    M = cv2.getPerspectiveTransform(ordered, dst)
-                    warped = cv2.warpPerspective(gray_img, M, (size, size), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-                except Exception:
+                    matrix = cv2.getPerspectiveTransform(ordered, dst)
+                    warped = cv2.warpPerspective(
+                        gray_img,
+                        matrix,
+                        (canvas_size, canvas_size),
+                        flags=cv2.INTER_CUBIC,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=255,
+                    )
+                    infos = _decode_zxing(warped, variant="perspective")
+                    if infos:
+                        if required_text and not PdfScanSplitEngine._match_texts(infos, required_text):
+                            if not first_nonmatching_infos:
+                                first_nonmatching_infos = infos
+                                first_nonmatching_bbox = (x / float(w), y / float(h), bw / float(w), bh / float(h))
+                            continue
+                        out["bbox"] = (x / float(w), y / float(h), bw / float(w), bh / float(h))
+                        return infos
+                except Exception as exc:
+                    _diagnostic("二维码候选透视校正", exc)
                     continue
-
-                infos = _decode_variants(warped, allow_warp=False)
-                if infos:
-                    return infos
-                infos = _try_threshold_variants(warped, allow_warp=False)
-                if infos:
-                    return infos
+            if first_nonmatching_infos:
+                out["bbox"] = first_nonmatching_bbox
+                return first_nonmatching_infos
             return []
 
-        def _decode_variants(gray_img, *, allow_warp: bool = True):
-            area_threshold = _min_area_threshold(gray_img)
-            infos: list[str] = []
-            try:
-                if hasattr(detector, "detectAndDecodeCurved"):
-                    data, pts, _ = detector.detectAndDecodeCurved(gray_img)
-                    if data:
-                        infos = _filter_decoded([data], pts, area_threshold)
-                        if infos:
-                            return infos
-            except Exception:
-                pass
-            try:
-                data, pts, _ = detector.detectAndDecode(gray_img)
-                if data:
-                    infos = _filter_decoded([data], pts, area_threshold)
-                    if infos:
-                        return infos
-            except Exception:
-                pass
-            try:
-                if hasattr(detector, "detectAndDecodeMulti"):
-                    ok, decoded_info, pts, _ = detector.detectAndDecodeMulti(gray_img)
-                    has_items = False
-                    if decoded_info is not None:
-                        try:
-                            has_items = len(decoded_info) > 0
-                        except Exception:
-                            try:
-                                has_items = bool(decoded_info is not None)
-                            except Exception:
-                                has_items = False
-                    ok_flag = False
-                    try:
-                        ok_flag = bool(ok)
-                    except Exception:
-                        try:
-                            ok_flag = bool(ok.any()) if hasattr(ok, "any") else False
-                        except Exception:
-                            ok_flag = False
-                    if ok_flag and has_items:
-                        try:
-                            decoded_list = list(decoded_info)
-                        except Exception:
-                            decoded_list = [str(decoded_info)]
-                        infos = _filter_decoded(decoded_list, pts, area_threshold)
-                        if infos:
-                            return infos
-            except Exception:
-                pass
-            if allow_warp:
-                infos = _decode_from_detect(gray_img, area_threshold=area_threshold)
-                if infos:
-                    return infos
-            infos = _decode_zxing(gray_img)
-            if infos:
-                return infos
+        try:
+            h, w = img_bgr.shape[:2]
+        except Exception as exc:
+            _diagnostic("读取二维码图像尺寸", exc)
             return []
-
-        def _try_threshold_variants(gray_img, *, allow_warp: bool = True) -> list[str]:
-            try:
-                _, th = cv2.threshold(gray_img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-                infos = _decode_variants(th, allow_warp=allow_warp)
-                if infos:
-                    return infos
-                infos = _decode_variants(cv2.bitwise_not(th), allow_warp=allow_warp)
-                if infos:
-                    return infos
-            except Exception:
-                pass
-            try:
-                h, w = gray_img.shape[:2]
-                min_dim = min(h, w)
-                block = 31 if min_dim >= 31 else (max(3, (min_dim // 2) * 2 - 1))
-                block = int(block)
-                if block >= 3:
-                    for c in (3, 5, 7):
-                        th2 = cv2.adaptiveThreshold(
-                            gray_img,
-                            255,
-                            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                            cv2.THRESH_BINARY,
-                            block,
-                            int(c),
-                        )
-                        infos = _decode_variants(th2, allow_warp=allow_warp)
-                        if infos:
-                            return infos
-                        infos = _decode_variants(cv2.bitwise_not(th2), allow_warp=allow_warp)
-                        if infos:
-                            return infos
-            except Exception:
-                pass
-            return []
-
-        def _rotate_variants(gray_img):
-            yield gray_img
-            try:
-                yield cv2.rotate(gray_img, cv2.ROTATE_90_CLOCKWISE)
-                yield cv2.rotate(gray_img, cv2.ROTATE_180)
-                yield cv2.rotate(gray_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            except Exception:
-                return
-
-        def _scale_variants(gray_img):
-            yield gray_img
-            try:
-                max_dim = max(gray_img.shape[:2])
-                if max_dim >= 2200:
-                    down = cv2.resize(gray_img, None, fx=0.75, fy=0.75, interpolation=cv2.INTER_AREA)
-                    yield down
-                if max_dim < 1800:
-                    up = cv2.resize(gray_img, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
-                    yield up
-                if max_dim < 1400:
-                    up2 = cv2.resize(gray_img, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-                    yield up2
-            except Exception:
-                return
-
-        def _preprocess_variants(gray_img):
-            yield gray_img
-            try:
-                norm = cv2.normalize(gray_img, None, 0, 255, cv2.NORM_MINMAX)
-                yield norm
-            except Exception:
-                pass
-            try:
-                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                yield clahe.apply(gray_img)
-            except Exception:
-                pass
-            try:
-                med = cv2.medianBlur(gray_img, 3)
-                yield med
-            except Exception:
-                pass
-            try:
-                blur = cv2.GaussianBlur(gray_img, (0, 0), 1.2)
-                sharp = cv2.addWeighted(gray_img, 1.55, blur, -0.55, 0)
-                yield sharp
-            except Exception:
-                pass
-
-        def _try_decode_robust(gray_img) -> list[str]:
-            attempts = 0
-
-            def _can_try() -> bool:
-                return attempts < max_robust_attempts and not _cancelled()
-
-            def _counted_decode(fn):
-                nonlocal attempts
-                if not _can_try():
-                    return []
-                attempts += 1
-                return fn()
-
-            for pre in _preprocess_variants(gray_img):
-                if _cancelled():
-                    return []
-                infos = _counted_decode(lambda: _decode_variants(pre, allow_warp=True))
-                if infos:
-                    return infos
-                if not _can_try():
-                    return []
-                for rot in _rotate_variants(pre):
-                    if _cancelled():
-                        return []
-                    infos = _counted_decode(lambda: _decode_variants(rot, allow_warp=True))
-                    if infos:
-                        return infos
-                    infos = _counted_decode(lambda: _try_threshold_variants(rot, allow_warp=True))
-                    if infos:
-                        return infos
-                    if not _can_try():
-                        return []
-                    for scaled in _scale_variants(rot):
-                        if _cancelled():
-                            return []
-                        infos = _counted_decode(lambda: _decode_variants(scaled, allow_warp=True))
-                        if infos:
-                            return infos
-                        infos = _counted_decode(lambda: _try_threshold_variants(scaled, allow_warp=True))
-                        if infos:
-                            return infos
-                        if not _can_try():
-                            return []
-            return []
-
-        gray_full = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        h, w = gray_full.shape[:2]
         if h <= 2 or w <= 2:
             return []
 
-        top_right_x = int(w * 0.55)
-        top_right_h = int(h * 0.55)
-        bottom_y = int(h * 0.6)
-        bottom_right_y = int(h * 0.45)
-        rois = [
-            (top_right_x, 0, w - top_right_x, max(1, top_right_h)),
-            (0, 0, w, max(1, int(h * 0.35))),
-            (0, bottom_y, w, max(1, h - bottom_y)),
-            (top_right_x, bottom_right_y, w - top_right_x, max(1, h - bottom_right_y)),
-            (0, 0, w, h),
-        ]
+        cached = _cached_crop()
+        if cached is not None:
+            crop, x, y = cached
+            infos = _decode_zxing(crop, variant="cache", offset_x=x, offset_y=y)
+            if infos and (not required_text or PdfScanSplitEngine._match_texts(infos, required_text)):
+                return infos
+            if infos:
+                # 缓存区域可能含有另一个二维码；关键词未命中时继续整页扫描。
+                out.update({"variant": "", "bbox": None, "decoded_items": []})
 
-        for x, y, rw, rh in rois:
-            if _cancelled():
-                return []
-            roi = gray_full[y : y + rh, x : x + rw]
-            if roi.size <= 0:
-                continue
-            infos = _decode_variants(roi, allow_warp=True)
+        infos = _decode_zxing(img_bgr, variant="original")
+        if infos:
+            return infos
+
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        variants: list[tuple[str, object]] = []
+        if effort >= 24:
+            try:
+                variants.append(("contrast", cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)))
+            except Exception as exc:
+                _diagnostic("二维码对比度增强", exc)
+        if effort >= 72:
+            try:
+                _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                variants.append(("otsu", otsu))
+            except Exception as exc:
+                _diagnostic("二维码 Otsu 二值化", exc)
+        if effort >= 144:
+            try:
+                block = min(51, max(15, (min(h, w) // 40) | 1))
+                adaptive = cv2.adaptiveThreshold(
+                    gray,
+                    255,
+                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                    cv2.THRESH_BINARY,
+                    block,
+                    5,
+                )
+                variants.append(("adaptive", adaptive))
+            except Exception as exc:
+                _diagnostic("二维码自适应二值化", exc)
+        if scan_cache is not None and scan_cache.variant:
+            variants.sort(key=lambda item: item[0] != scan_cache.variant)
+        for name, image in variants:
+            infos = _decode_zxing(image, variant=name)
             if infos:
                 return infos
 
-        for x, y, rw, rh in rois:
-            if _cancelled():
-                return []
-            roi = gray_full[y : y + rh, x : x + rw]
-            if roi.size <= 0:
-                continue
-            infos = _try_decode_robust(roi)
-            if infos:
-                return infos
-
-        return []
+        return _decode_warped_candidates(gray)
 
     @staticmethod
     def _detect_red_stamp(img_bgr, *, cv2=None) -> dict:
@@ -1538,16 +1590,24 @@ class PdfScanSplitEngine:
             except Exception:
                 np, _ = PdfScanSplitEngine._require_deps()
 
+        diagnostics: list[str] = []
+
+        def _diagnostic(stage: str, exc: Exception) -> None:
+            message = f"{stage}失败：{type(exc).__name__}: {exc}"
+            if message not in diagnostics:
+                diagnostics.append(message)
+
         h, w = img_bgr.shape[:2]
         if h <= 2 or w <= 2:
-            return {"present": False}
+            return {"present": False, "diagnostics": ["图像尺寸无效"]}
 
         try:
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
             mask1 = cv2.inRange(hsv, (0, 45, 35), (10, 255, 255))
             mask2 = cv2.inRange(hsv, (160, 45, 35), (180, 255, 255))
             mask = cv2.bitwise_or(mask1, mask2)
-        except Exception:
+        except Exception as exc:
+            _diagnostic("HSV 红色掩码", exc)
             mask = None
 
         try:
@@ -1555,23 +1615,24 @@ class PdfScanSplitEngine:
             a = lab[:, :, 1]
             _, mask_a = cv2.threshold(a, 155, 255, cv2.THRESH_BINARY)
             mask = mask_a if mask is None else cv2.bitwise_or(mask, mask_a)
-        except Exception:
-            pass
+        except Exception as exc:
+            _diagnostic("LAB 红色掩码", exc)
 
         if mask is None:
-            return {"present": False}
+            return {"present": False, "diagnostics": diagnostics}
 
         try:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-        except Exception:
-            pass
+        except Exception as exc:
+            _diagnostic("印章掩码形态学处理", exc)
 
         try:
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        except Exception:
-            return {"present": False}
+        except Exception as exc:
+            _diagnostic("印章轮廓检测", exc)
+            return {"present": False, "diagnostics": diagnostics}
 
         min_area = max(140.0, 0.00035 * float(h * w))
         best = None
@@ -1623,7 +1684,7 @@ class PdfScanSplitEngine:
                 }
 
         if best is None:
-            return {"present": False, "candidates": int(candidates)}
+            return {"present": False, "candidates": int(candidates), "diagnostics": diagnostics}
 
         present = False
         if best["area_ratio"] >= 0.0012 and best["circularity"] >= 0.10 and best["solidity"] >= 0.20 and best["aspect"] <= 2.2:
@@ -1631,7 +1692,7 @@ class PdfScanSplitEngine:
         elif best["area_ratio"] >= 0.0025 and best["solidity"] >= 0.18 and best["aspect"] <= 2.2:
             present = True
 
-        out = {"present": bool(present), "candidates": int(candidates), "score": float(best_score)}
+        out = {"present": bool(present), "candidates": int(candidates), "score": float(best_score), "diagnostics": diagnostics}
         out.update(best)
         return out
 
@@ -1702,6 +1763,7 @@ class PdfScanSplitEngine:
         return True
 
     @staticmethod
+    @_serialized_opencv_task
     def _scan_markers(
         pdf_path: str,
         reference_image_path: str,
@@ -1731,6 +1793,10 @@ class PdfScanSplitEngine:
         roi_base_size = ctx.roi_base_size
 
         doc = fitz.open(pdf_path)
+        cancel_log_emitted = False
+        total = 0
+        processed = 0
+        markers: list[int] = []
         try:
             total = PdfScanSplitEngine._load_ready_pdf(doc)
             original_total = total
@@ -1741,14 +1807,10 @@ class PdfScanSplitEngine:
                     log(f"PDF 总页数：{original_total}，本次扫描前 {total} 页")
                 else:
                     log(f"PDF 总页数：{original_total}，本次扫描全部页")
-            markers: list[int] = []
             started_at = time.perf_counter()
-            processed = 0
             i = 0
-            qr_decode_fail_streak = 0
-            qr_decode_hint_logged = False
-            qr_decode_strong_hint_logged = False
-            qr_decode_content_enabled = not bool(options.qrcode_no_decode)
+            qr_scan_cache = _QRCodeScanCache() if use_qr and not options.qrcode_no_decode else None
+            stamp_logged_diagnostics: set[str] = set()
             use_roi_clip = PdfScanSplitEngine._should_use_roi_clip(options, roi_base_size)
             roi_clip_logged = False
             if log:
@@ -1789,6 +1851,8 @@ class PdfScanSplitEngine:
                         use_qr=use_qr,
                         use_stamp=use_stamp,
                         use_feature=use_feature,
+                        reference_roi=options.reference_roi,
+                        roi_base_size=roi_base_size,
                     )
                 else:
                     render_started_at = time.perf_counter()
@@ -1813,9 +1877,29 @@ class PdfScanSplitEngine:
                     )
                 processed += 1
                 marked = False
+                hit_detector = ""
                 stamp_debug = None
                 qr_status: dict = {}
-                if use_qr:
+
+                if use_stamp:
+                    stamp_started_at = time.perf_counter()
+                    marked, stamp_debug = PdfScanSplitEngine._detect_stamp_for_scan(
+                        i,
+                        page_bgr_stamp,
+                        cv2=cv2,
+                        log=log,
+                        logged_diagnostics=stamp_logged_diagnostics,
+                    )
+                    if perf is not None:
+                        perf.stamp_seconds += time.perf_counter() - stamp_started_at
+                    if marked:
+                        hit_detector = "stamp"
+                        if perf is not None:
+                            perf.stamp_hits += 1
+                        if mode == "auto" and log:
+                            log(f"第 {i + 1} 页：二维码和特征点匹配已跳过（印章已命中）")
+
+                if not marked and use_qr:
                     qr_started_at = time.perf_counter()
                     marked = PdfScanSplitEngine._detect_qr_for_scan(
                         doc,
@@ -1825,8 +1909,8 @@ class PdfScanSplitEngine:
                         detector=detector,
                         cv2=cv2,
                         roi_base_size=roi_base_size,
+                        scan_cache=qr_scan_cache,
                         status=qr_status,
-                        decode_content=qr_decode_content_enabled,
                         perf=perf,
                         log=log,
                         cancel_check=cancel_check,
@@ -1834,26 +1918,12 @@ class PdfScanSplitEngine:
                     if perf is not None:
                         perf.qr_seconds += time.perf_counter() - qr_started_at
                     PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-                    if qr_status.get("decode_failed"):
-                        qr_decode_fail_streak += 1
-                        if log and qr_decode_fail_streak >= 3 and not qr_decode_hint_logged:
-                            log(PdfScanSplitEngine._qr_decode_failure_hint(False))
-                            qr_decode_hint_logged = True
-                        if log and qr_decode_fail_streak >= 5 and not qr_decode_strong_hint_logged:
-                            if options.qrcode_text_contains:
-                                log("多页疑似二维码均未能解析内容；已保留关键字匹配要求，避免将任意二维码误判为标记页。")
-                            else:
-                                log(PdfScanSplitEngine._qr_decode_failure_hint(True))
-                                qr_decode_content_enabled = False
-                            qr_decode_strong_hint_logged = True
-                    else:
-                        qr_decode_fail_streak = 0
-
-                if not marked and use_stamp:
-                    stamp_started_at = time.perf_counter()
-                    marked, stamp_debug = PdfScanSplitEngine._detect_stamp_for_scan(i, page_bgr_stamp, cv2=cv2, log=log)
-                    if perf is not None:
-                        perf.stamp_seconds += time.perf_counter() - stamp_started_at
+                    if marked:
+                        hit_detector = "qr"
+                        if perf is not None:
+                            perf.qr_hits += 1
+                        if mode == "auto" and log and ref_des is not None:
+                            log(f"第 {i + 1} 页：二维码命中，特征点匹配已跳过")
 
                 if not marked and use_feature and ref_des is not None:
                     feature_started_at = time.perf_counter()
@@ -1871,6 +1941,10 @@ class PdfScanSplitEngine:
                     )
                     if perf is not None:
                         perf.feature_seconds += time.perf_counter() - feature_started_at
+                    if marked:
+                        hit_detector = "feature"
+                        if perf is not None:
+                            perf.feature_hits += 1
 
                 if marked:
                     markers.append(i)
@@ -1879,6 +1953,18 @@ class PdfScanSplitEngine:
                 if progress:
                     progress(i + 1, total)
                 if marked and int(options.qrcode_skip_pages or 0) > 0:
+                    skip_count = min(int(options.qrcode_skip_pages or 0), max(0, total - i - 1))
+                    if skip_count > 0:
+                        if perf is not None:
+                            perf.pages_skipped += skip_count
+                        if log:
+                            skip_start = i + 2
+                            skip_end = i + 1 + skip_count
+                            skip_range = f"第 {skip_start} 页" if skip_start == skip_end else f"第 {skip_start}-{skip_end} 页"
+                            log(
+                                f"第 {i + 1} 页命中{('印章' if hit_detector == 'stamp' else '二维码' if hit_detector == 'qr' else '特征点')}，"
+                                f"按设置跳过后续 {skip_count} 页：{skip_range}"
+                            )
                     i += int(options.qrcode_skip_pages or 0) + 1
                 else:
                     i += 1
@@ -1886,15 +1972,33 @@ class PdfScanSplitEngine:
             elapsed_s = time.perf_counter() - started_at
             if perf is not None:
                 perf.scan_seconds = elapsed_s
+                perf.page_scan_seconds = elapsed_s
                 perf.pages_scanned = processed
                 perf.markers_found = len(markers)
-            if log:
+            if log and PdfScanSplitEngine._is_cancelled(cancel_check):
+                log(
+                    f"扫描已取消：实际处理 {processed}/{total} 页，跳过 {int(perf.pages_skipped if perf else 0)} 页，"
+                    f"已命中 {len(markers)} 页"
+                )
+                cancel_log_emitted = True
+            elif log:
                 avg_ms = int(round((elapsed_s * 1000.0) / float(max(1, processed))))
                 log(
-                    f"标记页扫描完成：处理 {processed}/{total} 页，命中 {len(markers)} 页，耗时 {PdfScanSplitEngine._fmt_seconds(elapsed_s)}，平均 {avg_ms}ms/页"
+                    f"页面扫描完成：实际处理 {processed}/{total} 页，跳过 {int(perf.pages_skipped if perf else 0)} 页，"
+                    f"命中 {len(markers)} 页，耗时 {PdfScanSplitEngine._fmt_seconds(elapsed_s)}，平均 {avg_ms}ms/页"
                 )
+                if perf is not None:
+                    log(
+                        f"识别汇总：印章命中 {perf.stamp_hits} 页，二维码命中 {perf.qr_hits} 页，"
+                        f"特征点命中 {perf.feature_hits} 页，全部检测器未命中 {max(0, processed - len(markers))} 页"
+                    )
             return markers, total
         finally:
+            if log and PdfScanSplitEngine._is_cancelled(cancel_check) and not cancel_log_emitted:
+                log(
+                    f"扫描已取消：实际处理 {processed}/{total if 'total' in locals() else 0} 页，"
+                    f"跳过 {int(perf.pages_skipped if perf else 0)} 页，已命中 {len(markers)} 页"
+                )
             doc.close()
 
     @staticmethod
@@ -1933,6 +2037,7 @@ class PdfScanSplitEngine:
         if isinstance(options, dict):
             options = PdfScanSplitOptions(**options)
         perf = _PerfStats()
+        scan_started_at = time.perf_counter()
         markers, total = PdfScanSplitEngine._scan_markers(
             pdf_path,
             reference_image_path,
@@ -1943,6 +2048,7 @@ class PdfScanSplitEngine:
             log=log,
             cancel_check=cancel_check,
         )
+        perf.scan_seconds = time.perf_counter() - scan_started_at
         build_started_at = time.perf_counter()
         segments = PdfScanSplitEngine.build_segments(int(total), markers, options)
         perf.build_seconds = time.perf_counter() - build_started_at
@@ -1952,6 +2058,7 @@ class PdfScanSplitEngine:
         return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=int(total), suspect_segments=suspect_segments, performance_stats=PdfScanSplitEngine._perf_to_dict(perf))
 
     @staticmethod
+    @_serialized_opencv_task
     def probe_page(
         pdf_path: str,
         reference_image_path: str,
@@ -2014,66 +2121,103 @@ class PdfScanSplitEngine:
                 if page_bgr_full is None:
                     raise RuntimeError("已取消")
                 perf.render_seconds += time.perf_counter() - render_started_at
+            PdfScanSplitEngine._raise_if_cancelled(cancel_check)
+
+            if page_bgr_roi is not None:
+                page_bgr_qr, page_bgr_stamp, page_bgr_feature = PdfScanSplitEngine._prepare_page_images_from_roi_clip(
+                    page_bgr_roi,
+                    use_qr=use_qr,
+                    use_stamp=use_stamp,
+                    use_feature=use_feature,
+                    reference_roi=options.reference_roi,
+                    roi_base_size=roi_base_size,
+                )
+            else:
+                page_bgr_qr, page_bgr_stamp, page_bgr_feature = PdfScanSplitEngine._prepare_page_images(
+                    page_bgr_full,
+                    use_qr=use_qr,
+                    use_stamp=use_stamp,
+                    use_feature=use_feature,
+                    ref_size=ref_size,
+                    roi_base_size=roi_base_size,
+                    options=options,
+                )
+
+            result = PdfScanSplitEngine._new_probe_result(page_index, total, mode, options)
+
+            if use_stamp:
+                PdfScanSplitEngine._raise_if_cancelled(cancel_check)
+                stamp_started_at = time.perf_counter()
+                PdfScanSplitEngine._detect_stamp_for_probe(result, page_bgr_stamp, cv2=cv2)
+                perf.stamp_seconds += time.perf_counter() - stamp_started_at
+                if result["marked"]:
+                    result["qrcode"]["skipped_reason"] = "印章已命中"
+                    result["feature"]["skipped_reason"] = "印章已命中"
+
+            if (not result["marked"]) and use_qr:
+                result["qrcode"].update({"executed": True, "skipped_reason": ""})
+                qr_started_at = time.perf_counter()
+                qr_status: dict = {}
+                result["marked"] = PdfScanSplitEngine._detect_qr_for_scan(
+                    doc,
+                    idx,
+                    page_bgr_qr,
+                    options,
+                    detector=detector,
+                    cv2=cv2,
+                    roi_base_size=roi_base_size,
+                    status=qr_status,
+                    perf=perf,
+                    cancel_check=cancel_check,
+                )
+                perf.qr_seconds += time.perf_counter() - qr_started_at
+                result["qrcode"].update(
+                    {
+                        "present": bool(qr_status.get("present")),
+                        "candidate_confident": bool(qr_status.get("candidate_confident")),
+                        "infos": list(qr_status.get("infos") or []),
+                        "variant": str(qr_status.get("variant") or ""),
+                        "bbox": qr_status.get("bbox"),
+                        "dpi": int(qr_status.get("dpi") or options.dpi),
+                    }
+                )
+                if result["marked"]:
+                    result["reason"] = "二维码解码命中" if qr_status.get("decoded") else "高可信二维码候选（未解码）"
+                    result["feature"]["skipped_reason"] = "二维码已命中"
+                elif qr_status.get("decoded") and options.qrcode_text_contains:
+                    result["reason"] = "二维码解码到内容，但未命中关键字"
+                elif qr_status.get("present"):
+                    result["reason"] = "检测到二维码候选但未解码，未视为标记页"
+
+            if (not result["marked"]) and use_feature and ref_des is not None:
+                PdfScanSplitEngine._raise_if_cancelled(cancel_check)
+                feature_started_at = time.perf_counter()
+                PdfScanSplitEngine._detect_feature_for_probe(
+                    result,
+                    page_bgr_feature,
+                    options,
+                    ref_kps=ref_kps,
+                    ref_des=ref_des,
+                    orb=orb,
+                    matcher=matcher,
+                    np=np,
+                    cv2=cv2,
+                )
+                perf.feature_seconds += time.perf_counter() - feature_started_at
+            elif (not result["marked"]) and use_feature and ref_des is None:
+                result["feature"]["skipped_reason"] = "未提供可用参考特征"
+
+            if not result["reason"]:
+                result["reason"] = "未命中"
+            perf.pages_scanned = 1
+            perf.markers_found = 1 if result.get("marked") else 0
+            perf.scan_seconds = time.perf_counter() - total_started_at
+            perf.page_scan_seconds = perf.scan_seconds
+            perf.total_seconds = perf.scan_seconds
+            result["performance_stats"] = PdfScanSplitEngine._perf_to_dict(perf)
+            return result
         finally:
             doc.close()
-        PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-
-        if page_bgr_roi is not None:
-            page_bgr_qr, page_bgr_stamp, page_bgr_feature = PdfScanSplitEngine._prepare_page_images_from_roi_clip(
-                page_bgr_roi,
-                use_qr=use_qr,
-                use_stamp=use_stamp,
-                use_feature=use_feature,
-            )
-        else:
-            page_bgr_qr, page_bgr_stamp, page_bgr_feature = PdfScanSplitEngine._prepare_page_images(
-                page_bgr_full,
-                use_qr=use_qr,
-                use_stamp=use_stamp,
-                use_feature=use_feature,
-                ref_size=ref_size,
-                roi_base_size=roi_base_size,
-                options=options,
-            )
-
-        result = PdfScanSplitEngine._new_probe_result(page_index, total, mode, options)
-
-        if (not result["marked"]) and use_qr:
-            PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-            qr_started_at = time.perf_counter()
-            PdfScanSplitEngine._detect_qr_for_probe(result, page_bgr_qr, options, detector=detector, cv2=cv2, cancel_check=cancel_check)
-            perf.qr_seconds += time.perf_counter() - qr_started_at
-
-        if (not result["marked"]) and use_stamp:
-            PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-            stamp_started_at = time.perf_counter()
-            PdfScanSplitEngine._detect_stamp_for_probe(result, page_bgr_stamp, cv2=cv2)
-            perf.stamp_seconds += time.perf_counter() - stamp_started_at
-
-        if (not result["marked"]) and use_feature and ref_des is not None:
-            PdfScanSplitEngine._raise_if_cancelled(cancel_check)
-            feature_started_at = time.perf_counter()
-            PdfScanSplitEngine._detect_feature_for_probe(
-                result,
-                page_bgr_feature,
-                options,
-                ref_kps=ref_kps,
-                ref_des=ref_des,
-                orb=orb,
-                matcher=matcher,
-                np=np,
-                cv2=cv2,
-            )
-            perf.feature_seconds += time.perf_counter() - feature_started_at
-
-        if not result["reason"]:
-            result["reason"] = "未命中"
-        perf.pages_scanned = 1
-        perf.markers_found = 1 if result.get("marked") else 0
-        perf.scan_seconds = time.perf_counter() - total_started_at
-        perf.total_seconds = perf.scan_seconds
-        result["performance_stats"] = PdfScanSplitEngine._perf_to_dict(perf)
-        return result
 
     @staticmethod
     def build_segments(total_pages: int, marker_pages: list[int], options: PdfScanSplitOptions) -> list[list[int]]:
@@ -2214,6 +2358,8 @@ class PdfScanSplitEngine:
             output_dir = os.path.dirname(pdf_path)
 
         PdfScanSplitEngine._log_execute_scan_start(mode, 0, log)
+        if log:
+            log(PdfScanSplitEngine._format_scan_options_log(options))
 
         perf = _PerfStats()
         scan_started_at = time.perf_counter()
@@ -2230,13 +2376,14 @@ class PdfScanSplitEngine:
         perf.scan_seconds = scan_elapsed_s
 
         if PdfScanSplitEngine._is_cancelled(cancel_check):
+            if log:
+                log(f"任务已取消：未开始写入，识别阶段耗时 {PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)}")
             perf.total_seconds = time.perf_counter() - total_started_at
             return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=total_pages, performance_stats=PdfScanSplitEngine._perf_to_dict(perf))
 
         if log:
-            log(f"PDF页数：{total_pages}")
-            log(f"识别到标记页：{', '.join(str(p + 1) for p in markers) if markers else '无'}")
-            log(f"标记页识别耗时：{PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)}")
+            log(f"识别结果：PDF 共 {total_pages} 页，标记页：{', '.join(str(p + 1) for p in markers) if markers else '无'}")
+            log(f"识别阶段总耗时：{PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)}")
             log("开始写入拆分结果…")
 
         build_started_at = time.perf_counter()
@@ -2244,6 +2391,8 @@ class PdfScanSplitEngine:
         build_elapsed_s = time.perf_counter() - build_started_at
         perf.build_seconds = build_elapsed_s
         if PdfScanSplitEngine._is_cancelled(cancel_check):
+            if log:
+                log(f"任务已取消：未开始写入，识别阶段耗时 {PdfScanSplitEngine._fmt_seconds(scan_elapsed_s)}")
             perf.total_seconds = time.perf_counter() - total_started_at
             return PdfScanSplitResult(output_files=[], marker_pages=markers, total_pages=total_pages, performance_stats=PdfScanSplitEngine._perf_to_dict(perf))
         if log:
@@ -2262,8 +2411,7 @@ class PdfScanSplitEngine:
         )
         write_elapsed_s = time.perf_counter() - write_started_at
         perf.write_seconds = write_elapsed_s
-        if PdfScanSplitEngine._is_cancelled(cancel_check) and outputs and log:
-            log(f"任务已取消，已保留 {len(outputs)} 个已生成文件")
+        cancelled = PdfScanSplitEngine._is_cancelled(cancel_check)
         total_elapsed_s = time.perf_counter() - total_started_at
         perf.total_seconds = total_elapsed_s
         PdfScanSplitEngine._log_execute_summary(
@@ -2271,6 +2419,7 @@ class PdfScanSplitEngine:
             total_elapsed_s=total_elapsed_s,
             scan_elapsed_s=scan_elapsed_s,
             write_elapsed_s=write_elapsed_s,
+            cancelled=cancelled,
             log=log,
         )
 

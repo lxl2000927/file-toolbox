@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
@@ -16,6 +18,10 @@ from src.utils.path_utils import make_unique_output_path, make_unique_temp_path
 
 CancelCheck = Callable[[], bool]
 OutputCallback = Callable[[str, list[int], float], None]
+
+
+_OUTPUT_RESERVATION_LOCK = threading.Lock()
+_RESERVED_OUTPUT_PATHS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -40,6 +46,28 @@ def _remove_paths(paths: Sequence[str]) -> None:
             pass
 
 
+def _normalized_path(path: str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _reserve_output_paths(output_dir: str, filename: str, used_paths: set[str]) -> tuple[str, str, set[str]]:
+    with _OUTPUT_RESERVATION_LOCK:
+        unavailable = set(used_paths)
+        unavailable.update(_RESERVED_OUTPUT_PATHS)
+        out_path = make_unique_output_path(output_dir, filename, unavailable)
+        temp_name = f".{os.path.basename(out_path)}.{uuid.uuid4().hex}"
+        tmp_path = make_unique_temp_path(output_dir, temp_name, unavailable)
+        reserved = {_normalized_path(out_path), _normalized_path(tmp_path)}
+        _RESERVED_OUTPUT_PATHS.update(reserved)
+        used_paths.update(reserved)
+        return out_path, tmp_path, reserved
+
+
+def _release_output_paths(reserved: set[str]) -> None:
+    with _OUTPUT_RESERVATION_LOCK:
+        _RESERVED_OUTPUT_PATHS.difference_update(reserved)
+
+
 def write_pdf_output_jobs(
     pdf_path: str,
     *,
@@ -56,7 +84,8 @@ def write_pdf_output_jobs(
         return []
 
     os.makedirs(output_dir, exist_ok=True)
-    used_paths = used_paths or set()
+    if used_paths is None:
+        used_paths = set()
     outputs: list[str] = []
 
     with open(pdf_path, "rb") as src_f:
@@ -85,41 +114,42 @@ def write_pdf_output_jobs(
                     raise RuntimeError("已取消")
                 return outputs
             started_at = time.perf_counter()
-            out_path = make_unique_output_path(output_dir, normalized_jobs[0].filename, used_paths)
-            tmp_name = os.path.basename(out_path)
-            tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
+            out_path, tmp_path, reserved = _reserve_output_paths(output_dir, normalized_jobs[0].filename, used_paths)
             try:
-                shutil.copy2(pdf_path, tmp_path)
-                os.replace(tmp_path, out_path)
-            except Exception:
                 try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                    shutil.copy2(pdf_path, tmp_path)
+                    os.replace(tmp_path, out_path)
                 except Exception:
-                    pass
-                if _is_cancelled(cancel_check):
-                    if cleanup_outputs_on_cancel:
-                        _remove_paths(outputs)
-                        raise
-                    return outputs
-                raise
-            if _is_cancelled(cancel_check):
-                if cleanup_outputs_on_cancel:
                     try:
-                        if os.path.exists(out_path):
-                            os.remove(out_path)
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
                     except Exception:
                         pass
-                    _remove_paths(outputs)
-                    raise RuntimeError("已取消")
+                    if _is_cancelled(cancel_check):
+                        if cleanup_outputs_on_cancel:
+                            _remove_paths(outputs)
+                            raise
+                        return outputs
+                    raise
+                if _is_cancelled(cancel_check):
+                    if cleanup_outputs_on_cancel:
+                        try:
+                            if os.path.exists(out_path):
+                                os.remove(out_path)
+                        except Exception:
+                            pass
+                        _remove_paths(outputs)
+                        raise RuntimeError("已取消")
+                    outputs.append(out_path)
+                    if on_output:
+                        on_output(out_path, list(normalized_jobs[0].page_indexes), time.perf_counter() - started_at)
+                    return outputs
                 outputs.append(out_path)
                 if on_output:
                     on_output(out_path, list(normalized_jobs[0].page_indexes), time.perf_counter() - started_at)
                 return outputs
-            outputs.append(out_path)
-            if on_output:
-                on_output(out_path, list(normalized_jobs[0].page_indexes), time.perf_counter() - started_at)
-            return outputs
+            finally:
+                _release_output_paths(reserved)
 
         for job in normalized_jobs:
             if _is_cancelled(cancel_check):
@@ -129,45 +159,46 @@ def write_pdf_output_jobs(
             if not job.page_indexes:
                 continue
             started_at = time.perf_counter()
-            out_path = make_unique_output_path(output_dir, job.filename, used_paths)
-            tmp_name = os.path.basename(out_path)
-            tmp_path = make_unique_temp_path(output_dir, tmp_name, used_paths)
+            out_path, tmp_path, reserved = _reserve_output_paths(output_dir, job.filename, used_paths)
             try:
-                with open(tmp_path, "wb") as out_f:
-                    writer = pypdf.PdfWriter()
-                    for page_index in job.page_indexes:
-                        if _is_cancelled(cancel_check):
-                            raise RuntimeError("已取消")
-                        writer.add_page(reader.pages[page_index])
-                    writer.write(out_f)
-                os.replace(tmp_path, out_path)
-            except Exception:
                 try:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                    with open(tmp_path, "wb") as out_f:
+                        writer = pypdf.PdfWriter()
+                        for page_index in job.page_indexes:
+                            if _is_cancelled(cancel_check):
+                                raise RuntimeError("已取消")
+                            writer.add_page(reader.pages[page_index])
+                        writer.write(out_f)
+                    os.replace(tmp_path, out_path)
                 except Exception:
-                    pass
-                if _is_cancelled(cancel_check):
-                    if cleanup_outputs_on_cancel:
-                        _remove_paths(outputs)
-                        raise
-                    return outputs
-                raise
-            if _is_cancelled(cancel_check):
-                if cleanup_outputs_on_cancel:
                     try:
-                        if os.path.exists(out_path):
-                            os.remove(out_path)
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
                     except Exception:
                         pass
-                    _remove_paths(outputs)
-                    raise RuntimeError("已取消")
+                    if _is_cancelled(cancel_check):
+                        if cleanup_outputs_on_cancel:
+                            _remove_paths(outputs)
+                            raise
+                        return outputs
+                    raise
+                if _is_cancelled(cancel_check):
+                    if cleanup_outputs_on_cancel:
+                        try:
+                            if os.path.exists(out_path):
+                                os.remove(out_path)
+                        except Exception:
+                            pass
+                        _remove_paths(outputs)
+                        raise RuntimeError("已取消")
+                    outputs.append(out_path)
+                    if on_output:
+                        on_output(out_path, list(job.page_indexes), time.perf_counter() - started_at)
+                    return outputs
                 outputs.append(out_path)
                 if on_output:
                     on_output(out_path, list(job.page_indexes), time.perf_counter() - started_at)
-                return outputs
-            outputs.append(out_path)
-            if on_output:
-                on_output(out_path, list(job.page_indexes), time.perf_counter() - started_at)
+            finally:
+                _release_output_paths(reserved)
 
     return outputs

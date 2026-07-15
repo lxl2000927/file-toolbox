@@ -4,12 +4,13 @@ import type { ScanDetectionMode, ScanSplitOptions } from "../../env";
 import { useEngineTask, generateTaskId } from "../../composables/useEngineTask";
 import { useAppDialog } from "../../composables/useAppDialog";
 import { useToast } from "../../composables/useToast";
-import { positiveInt, formatEngineError } from "../../utils";
+import { fileBasename, positiveInt, formatEngineError } from "../../utils";
 import AppSelect from "../common/AppSelect.vue";
-import AppIcon from "../common/AppIcon.vue";
+import PanelBanner from "../common/PanelBanner.vue";
 
-type ScanSplitTaskResult = { output_files: string[]; marker_pages: number[]; total_pages: number; suspect_segments?: any[] };
+type ScanSplitTaskResult = { output_files: string[]; marker_pages: number[]; total_pages: number; suspect_segments?: unknown[] };
 type TuneResult = { title: string; lines: string[] };
+type PresetName = "" | "balanced" | "strict" | "loose" | "high_recall";
 
 const pdfPath = ref("");
 const dialog = useAppDialog();
@@ -30,8 +31,9 @@ const previewStageRef = ref<HTMLDivElement | null>(null);
 const previewImgRef = ref<HTMLImageElement | null>(null);
 const roiImgRef = ref<HTMLImageElement | null>(null);
 const roiStageRef = ref<HTMLElement | null>(null);
+const roiDialogRef = ref<HTMLElement | null>(null);
+const roiConfirmBtnRef = ref<HTMLButtonElement | null>(null);
 const dpiInputRef = ref<HTMLInputElement | null>(null);
-const maxAttemptsInputRef = ref<HTMLInputElement | null>(null);
 const previewNaturalSize = ref({ width: 0, height: 0 });
 const roiNaturalSize = ref({ width: 0, height: 0 });
 const selectionStart = ref<{ x: number; y: number } | null>(null);
@@ -47,7 +49,7 @@ const opts = ref<Required<Omit<ScanSplitOptions, "reference_roi" | "use_roi">> &
   qrcode_no_decode: false,
   qrcode_use_roi: false,
   qrcode_skip_pages: 0,
-  qrcode_max_attempts: 180,
+  qrcode_max_attempts: 144,
   marker_as_first_page: true,
   exclude_marker_page: false,
   max_segment_pages: 10,
@@ -64,7 +66,7 @@ const opts = ref<Required<Omit<ScanSplitOptions, "reference_roi" | "use_roi">> &
 const useMaxSegment = ref(false);
 const probePageIndex = ref(1);
 const quickScanPageLimit = ref(30);
-const preset = ref<"" | "balanced" | "strict" | "loose" | "high_recall">("balanced");
+const preset = ref<PresetName>("balanced");
 const advancedOpen = ref(false);
 const markerPageMode = computed({
   get: () => {
@@ -77,7 +79,6 @@ const markerPageMode = computed({
   },
 });
 
-const fileBasename = (p: string) => p.split(/[\\/]/).pop() || p;
 const isBrowserPreviewImage = computed(() => /\.(png|jpe?g|bmp|webp|gif|svg)$/i.test(referenceImage.value));
 const activeRoi = computed(() => selectionDraft.value || opts.value.reference_roi);
 const imageContentRect = computed(() => {
@@ -163,28 +164,35 @@ const { state: taskState, logs, busy: taskBusy, cancellable: taskCancellable, st
       }
       error.value = formatEngineError(payload);
       // #27 取消时已生成的文件不删除，提示用户保留了多少个
-      if (payload.cancelled && (payload.result?.output_files?.length ?? 0) > 0) {
-        toast.info(`已取消，但保留了 ${payload.result.output_files.length} 个已生成的文件`);
+      const partialResult = normalizeScanSplitResult(payload.result);
+      if (payload.cancelled && partialResult.output_files.length > 0) {
+        toast.info(`已取消，但保留了 ${partialResult.output_files.length} 个已生成的文件`);
       }
       dialog.alert({ title: payload.cancelled ? "扫描任务已取消" : "扫描任务失败", message: error.value, kind: payload.cancelled ? "info" : "danger" });
     }
   },
 });
 
-function inferScanTaskType(payload: any) {
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function inferScanTaskType(payload: unknown) {
   const taskId = taskState.value.taskId || "";
-  if (payload && typeof payload === "object" && "page_index" in payload && "marked" in payload) return "scan_probe";
+  const value = asRecord(payload);
+  if ("page_index" in value && "marked" in value) return "scan_probe";
   if (taskId.startsWith("probe_")) return "scan_probe";
   if (taskId.startsWith("scan_only_")) return "scan_only";
   return "scan_split";
 }
 
-function normalizeScanSplitResult(payload: any): ScanSplitTaskResult {
+function normalizeScanSplitResult(payload: unknown): ScanSplitTaskResult {
+  const value = asRecord(payload);
   return {
-    output_files: Array.isArray(payload?.output_files) ? payload.output_files : [],
-    marker_pages: Array.isArray(payload?.marker_pages) ? payload.marker_pages : [],
-    total_pages: Number(payload?.total_pages || 0),
-    suspect_segments: Array.isArray(payload?.suspect_segments) ? payload.suspect_segments : [],
+    output_files: Array.isArray(value.output_files) ? value.output_files.map(String) : [],
+    marker_pages: Array.isArray(value.marker_pages) ? value.marker_pages.map(Number) : [],
+    total_pages: Number(value.total_pages || 0),
+    suspect_segments: Array.isArray(value.suspect_segments) ? value.suspect_segments : [],
   };
 }
 
@@ -201,39 +209,54 @@ function formatNumber(value: unknown, digits = 2) {
   return Number.isFinite(n) ? n.toFixed(digits) : "-";
 }
 
-function formatProbeTuneResult(payload: any): TuneResult {
-  const pageNumber = Number(payload?.page_number || Number(payload?.page_index || 0) + 1 || 0);
-  const totalPages = Number(payload?.total_pages || 0);
-  const marked = Boolean(payload?.marked);
+function formatProbeTuneResult(payload: unknown): TuneResult {
+  const value = asRecord(payload);
+  const pageNumber = Number(value.page_number || Number(value.page_index || 0) + 1 || 0);
+  const totalPages = Number(value.total_pages || 0);
+  const marked = Boolean(value.marked);
+  const reason = String(value.reason || "");
   const lines = [
     `页码：第 ${pageNumber || "-"} 页${totalPages ? ` / 共 ${totalPages} 页` : ""}`,
-    `结果：${marked ? "命中标记页" : "未命中"}${payload?.reason ? `（${payload.reason}）` : ""}`,
-    `模式：${modeLabel(String(payload?.detection_mode || ""))}`,
+    `结果：${marked ? "命中标记页" : "未命中"}${reason ? `（${reason}）` : ""}`,
+    `模式：${modeLabel(String(value.detection_mode || ""))}`,
   ];
 
-  const qrcode = payload?.qrcode || {};
-  if (qrcode.present || (Array.isArray(qrcode.infos) && qrcode.infos.length) || qrcode.stats) {
-    const decoded = Array.isArray(qrcode.infos) ? qrcode.infos.length : 0;
-    const stats = qrcode.stats ? `，面积 ${formatNumber(qrcode.stats.area, 0)}，形状 ${formatNumber(qrcode.stats.aspect)}` : "";
-    lines.push(`二维码：${qrcode.present || decoded ? "有候选" : "无"}，解码 ${decoded} 个${stats}`);
-  }
-
-  const stamp = payload?.stamp || {};
-  if (stamp.present || stamp.candidates != null) {
+  const stamp = asRecord(value.stamp);
+  if (stamp.executed || stamp.present || stamp.candidates != null) {
     lines.push(`印章：${stamp.present ? "命中" : "未命中"}，候选 ${Number(stamp.candidates || 0)}，面积占比 ${formatNumber(stamp.area_ratio, 4)}，圆度 ${formatNumber(stamp.circularity)}`);
+  } else if (value.detection_mode === "auto" && stamp.skipped_reason) {
+    lines.push(`印章：未执行（${stamp.skipped_reason}）`);
+  }
+  if (Array.isArray(stamp.diagnostics)) {
+    for (const diagnostic of stamp.diagnostics) lines.push(`印章降级：${String(diagnostic)}`);
   }
 
-  const feature = payload?.feature || {};
-  if (feature.good_matches || feature.inliers || payload?.detection_mode === "feature" || payload?.detection_mode === "auto") {
+  const qrcode = asRecord(value.qrcode);
+  if (qrcode.executed || qrcode.present || (Array.isArray(qrcode.infos) && qrcode.infos.length) || qrcode.stats) {
+    const decoded = Array.isArray(qrcode.infos) ? qrcode.infos.length : 0;
+    const qrStats = asRecord(qrcode.stats);
+    const stats = qrcode.stats ? `，面积 ${formatNumber(qrStats.area, 0)}，形状 ${formatNumber(qrStats.aspect)}` : "";
+    lines.push(`二维码：${qrcode.present || decoded ? "有候选" : "无"}，解码 ${decoded} 个${stats}`);
+  } else if (value.detection_mode === "auto" && qrcode.skipped_reason) {
+    lines.push(`二维码：未执行（${qrcode.skipped_reason}）`);
+  }
+  if (Array.isArray(qrcode.diagnostics)) {
+    for (const diagnostic of qrcode.diagnostics) lines.push(`二维码降级：${String(diagnostic)}`);
+  }
+
+  const feature = asRecord(value.feature);
+  if (feature.executed || feature.good_matches || feature.inliers) {
     lines.push(`特征点：匹配 ${Number(feature.good_matches || 0)}，内点 ${Number(feature.inliers || 0)}，比例 ${formatNumber(feature.inlier_ratio)}`);
+  } else if (value.detection_mode === "auto" && feature.skipped_reason) {
+    lines.push(`特征点：未执行（${feature.skipped_reason}）`);
   }
 
-  const params = payload?.params || {};
+  const params = asRecord(value.params);
   lines.push(`参数：DPI ${Number(params.dpi || opts.value.dpi)}，特征点 ${Number(params.nfeatures || opts.value.nfeatures)}，最小匹配 ${Number(params.min_matches || opts.value.min_matches)}`);
   return { title: `单页测试完成：${marked ? "命中" : "未命中"}`, lines };
 }
 
-function formatScanOnlyTuneResult(payload: any): TuneResult {
+function formatScanOnlyTuneResult(payload: unknown): TuneResult {
   const normalized = normalizeScanSplitResult(payload);
   const markerPages = normalized.marker_pages.map((p) => Number(p) + 1).filter((p) => Number.isFinite(p));
   const lines = [
@@ -282,6 +305,7 @@ watch(pdfPath, () => {
 watch(
   () => opts.value.detection_mode,
   (mode) => {
+    if (restoringScanSettings) return;
     opts.value.dpi = scanDpiForMode(mode);
     if (!isQrMode.value) {
       opts.value.qrcode_no_decode = false;
@@ -304,7 +328,7 @@ async function updatePdfPageCount() {
     pdfPageCount.value = res.valid && res.page_count ? res.page_count : null;
     if (pdfPageCount.value) {
       probePageIndex.value = Math.min(Math.max(1, probePageIndex.value), pdfPageCount.value);
-      quickScanPageLimit.value = Math.min(Math.max(1, quickScanPageLimit.value), pdfPageCount.value);
+      quickScanPageLimit.value = Math.max(1, quickScanPageLimit.value);
     }
   } catch {
     if (token === pdfPageCountToken) pdfPageCount.value = null;
@@ -350,20 +374,20 @@ async function loadReferencePreview() {
     }
 
     if (isBrowserPreviewImage.value) {
-      const dataUrl = await window.electronAPI?.readFileAsDataUrl(currentReference);
+      const previewResult = await window.electronAPI?.getFilePreviewUrl(currentReference);
       if (token !== referencePreviewToken || currentReference !== referenceImage.value) return;
-      if (dataUrl) {
-        previewDataUrl.value = dataUrl;
+      if (previewResult?.ok) {
+        previewDataUrl.value = previewResult.value;
         keypointInfo.value = "引擎未就绪，仅显示原图";
         return;
       }
-      previewError.value = "无法读取参考图片，请确认文件路径有效。";
+      previewError.value = previewResult?.error.message || "无法读取参考图片，请确认文件路径有效。";
       return;
     }
 
     previewError.value = "引擎未就绪，请稍后重试。";
-  } catch (e: any) {
-    if (token === referencePreviewToken) previewError.value = formatEngineError(e);
+  } catch (caught) {
+    if (token === referencePreviewToken) previewError.value = formatEngineError(caught);
   } finally {
     if (token === referencePreviewToken) previewLoading.value = false;
   }
@@ -547,6 +571,36 @@ function clearRoi() {
 let _savedPreviewZoom = 1.0;
 let _fittedZoom = 1.0;
 let _roiFittedZoom = 1.0;
+let roiPreviouslyFocused: HTMLElement | null = null;
+
+function roiFocusableElements(): HTMLElement[] {
+  const root = roiDialogRef.value;
+  if (!root) return [];
+  return Array.from(root.querySelectorAll<HTMLElement>(
+    'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+  )).filter((element) => element.offsetParent !== null || element === document.activeElement);
+}
+
+function onRoiDialogKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeRoiDialog();
+    return;
+  }
+  if (event.key !== "Tab") return;
+  const focusable = roiFocusableElements();
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  if (event.shiftKey && (active === first || !roiDialogRef.value?.contains(active))) {
+    event.preventDefault();
+    last?.focus();
+  } else if (!event.shiftKey && (active === last || !roiDialogRef.value?.contains(active))) {
+    event.preventDefault();
+    first?.focus();
+  }
+}
 
 function fitRoiDialogToStage() {
   const stage = roiStageRef.value;
@@ -563,12 +617,14 @@ function fitRoiDialogToStage() {
 
 function openRoiDialog() {
   if (!previewDataUrl.value) return;
+  roiPreviouslyFocused = document.activeElement as HTMLElement | null;
   selectionDraft.value = null;
   selectionStart.value = null;
   _savedPreviewZoom = previewZoom.value;
   roiDialogOpen.value = true;
   nextTick(() => {
     syncPreviewNaturalSize(roiImgRef.value || previewImgRef.value);
+    roiConfirmBtnRef.value?.focus();
     // 等弹窗完成布局后再按弹窗容器计算适配缩放
     requestAnimationFrame(() => fitRoiDialogToStage());
   });
@@ -583,6 +639,11 @@ function closeRoiDialog() {
   selectionStart.value = null;
   roiDialogOpen.value = false;
   previewZoom.value = _savedPreviewZoom;
+  const restore = roiPreviouslyFocused;
+  roiPreviouslyFocused = null;
+  nextTick(() => {
+    if (restore?.isConnected) restore.focus();
+  });
 }
 
 function confirmRoiDialog() {
@@ -594,7 +655,7 @@ function confirmRoiDialog() {
   loadReferencePreview();
 }
 
-function copyResults() {
+async function copyResults() {
   if (!result.value) return;
   const lines = [
     `生成文件：${result.value.output_files.length}`,
@@ -602,12 +663,18 @@ function copyResults() {
     `标记页：${result.value.marker_pages.map((p) => p + 1).join(", ") || "无"}`,
     ...result.value.output_files,
   ];
-  navigator.clipboard?.writeText(lines.join("\n"));
+  try {
+    await navigator.clipboard.writeText(lines.join("\n"));
+    toast.success("结果已复制");
+  } catch {
+    toast.error("复制失败，请检查剪贴板权限");
+  }
 }
 
 function logLineClass(line: string) {
   if (/失败|错误|不可用|异常|超时/.test(line)) return "danger";
-  if (/漏检|未匹配|未命中|忽略|警告/.test(line)) return "warn";
+  if (/未能解码|未视为|不包含关键字|漏检|未匹配|未命中|忽略|警告|取消|回退/.test(line)) return "warn";
+  if (/按设置跳过|已跳过/.test(line)) return "info";
   if (/完成|命中|检测到|生成|成功/.test(line)) return "ok";
   if (/开始|正在|扫描|测试/.test(line)) return "info";
   return "";
@@ -638,47 +705,49 @@ async function pickOutputDir() {
 
 let _applyingPreset = false;
 
-function applyPreset(name: typeof preset.value) {
+function applyPreset(name: PresetName) {
   _applyingPreset = true;
-  if (!name) {
-    preset.value = "";
+  try {
+    if (!name) {
+      preset.value = "";
+      return;
+    }
+    if (name === "strict") {
+      opts.value.nfeatures = Math.min(10000, Math.max(100, 1000));
+      opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.70));
+      opts.value.min_matches = Math.min(1000, Math.max(1, 35));
+      opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 4.0));
+      opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.55));
+    } else if (name === "high_recall") {
+      opts.value.nfeatures = Math.min(10000, Math.max(100, 3000));
+      opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.90));
+      opts.value.min_matches = Math.min(1000, Math.max(1, 12));
+      opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 8.0));
+      opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.25));
+    } else if (name === "loose") {
+      opts.value.nfeatures = Math.min(10000, Math.max(100, 2000));
+      opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.85));
+      opts.value.min_matches = Math.min(1000, Math.max(1, 18));
+      opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 6.0));
+      opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.35));
+    } else {
+      opts.value.nfeatures = Math.min(10000, Math.max(100, 1200));
+      opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.75));
+      opts.value.min_matches = Math.min(1000, Math.max(1, 25));
+      opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 5.0));
+      opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.45));
+    }
+    preset.value = name;
+  } finally {
     _applyingPreset = false;
-    return;
   }
-  if (name === "strict") {
-    opts.value.nfeatures = Math.min(10000, Math.max(100, 1000));
-    opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.70));
-    opts.value.min_matches = Math.min(1000, Math.max(1, 35));
-    opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 4.0));
-    opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.55));
-  } else if (name === "high_recall") {
-    opts.value.nfeatures = Math.min(10000, Math.max(100, 3000));
-    opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.90));
-    opts.value.min_matches = Math.min(1000, Math.max(1, 12));
-    opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 8.0));
-    opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.25));
-  } else if (name === "loose") {
-    opts.value.nfeatures = Math.min(10000, Math.max(100, 2000));
-    opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.85));
-    opts.value.min_matches = Math.min(1000, Math.max(1, 18));
-    opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 6.0));
-    opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.35));
-  } else {
-    // balanced
-    opts.value.nfeatures = Math.min(10000, Math.max(100, 1200));
-    opts.value.ratio = Math.min(1.0, Math.max(0.1, 0.75));
-    opts.value.min_matches = Math.min(1000, Math.max(1, 25));
-    opts.value.ransac_reproj_threshold = Math.min(50.0, Math.max(0.1, 5.0));
-    opts.value.min_inlier_ratio = Math.min(1.0, Math.max(0.01, 0.45));
-  }
-  preset.value = name;
-  nextTick(() => { _applyingPreset = false; });
 }
 
 // 手动修改参数时重置 preset
 watch(
   () => [opts.value.nfeatures, opts.value.min_matches, opts.value.ratio, opts.value.ransac_reproj_threshold, opts.value.min_inlier_ratio],
   () => { if (!_applyingPreset) preset.value = ""; },
+  { flush: "sync" },
 );
 
 function boundedNumber(value: number, min: number, max?: number) {
@@ -701,6 +770,56 @@ function scanDpiForMode(mode: ScanDetectionMode) {
 function boundedProbePage(value: number) {
   const max = pdfPageCount.value || Number.MAX_SAFE_INTEGER;
   return Math.min(max, Math.max(1, Math.floor(Number(value) || 1)));
+}
+
+function boundedQuickScanPageLimit(value: number) {
+  return positiveInt(Number(value), 30);
+}
+
+const quickScanPageLimitExceeded = computed(() => (
+  !!pdfPageCount.value && quickScanPageLimit.value > pdfPageCount.value
+));
+
+const effectiveQuickScanPageLimit = computed(() => (
+  pdfPageCount.value
+    ? Math.min(quickScanPageLimit.value, pdfPageCount.value)
+    : quickScanPageLimit.value
+));
+
+const quickScanPageLimitHint = computed(() => (
+  quickScanPageLimitExceeded.value
+    ? `PDF 共 ${pdfPageCount.value} 页，请输入 1-${pdfPageCount.value}`
+    : ""
+));
+
+function onProbePageInput(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.value === "") return;
+  probePageIndex.value = boundedProbePage(Number(input.value));
+}
+
+function onProbePageBlur(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const value = input.value === ""
+    ? boundedProbePage(probePageIndex.value)
+    : boundedProbePage(Number(input.value));
+  probePageIndex.value = value;
+  input.value = String(value);
+}
+
+function onQuickScanPageLimitInput(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.value === "") return;
+  quickScanPageLimit.value = boundedQuickScanPageLimit(Number(input.value));
+}
+
+function onQuickScanPageLimitBlur(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const value = input.value === ""
+    ? boundedQuickScanPageLimit(quickScanPageLimit.value)
+    : boundedQuickScanPageLimit(Number(input.value));
+  quickScanPageLimit.value = value;
+  input.value = String(value);
 }
 
 // 命中后跳过：独立 checkbox 状态，防止清空数字输入导致整组控件关闭
@@ -734,22 +853,26 @@ function onDpiBlur(e: Event) {
   (e.target as HTMLInputElement).value = String(clamped);
 }
 
-function onMaxAttemptsInput(e: Event) {
-  const raw = (e.target as HTMLInputElement).value;
-  if (raw === "") return;
-  const n = Number(raw);
-  if (!Number.isFinite(n)) return;
-  const clamped = Math.min(500, Math.max(12, Math.floor(n)));
-  opts.value.qrcode_max_attempts = clamped;
-  if (n > 500) (e.target as HTMLInputElement).value = String(clamped);
+function onMaxSegmentInput(e: Event) {
+  const input = e.target as HTMLInputElement;
+  if (input.value === "") return;
+  opts.value.max_segment_pages = Math.min(10000, Math.max(1, positiveInt(input.value)));
 }
 
-function onMaxAttemptsBlur(e: Event) {
-  const raw = (e.target as HTMLInputElement).value;
-  const n = Number(raw);
-  const clamped = Math.min(500, Math.max(12, Math.floor(Number.isFinite(n) && n > 0 ? n : 180)));
-  opts.value.qrcode_max_attempts = clamped;
-  (e.target as HTMLInputElement).value = String(clamped);
+function onFeatureIntInput(e: Event, key: "nfeatures" | "min_matches") {
+  const input = e.target as HTMLInputElement;
+  if (input.value === "") return;
+  const limits = key === "nfeatures" ? [100, 10000] : [1, 1000];
+  opts.value[key] = Math.min(limits[1], Math.max(limits[0], Math.floor(Number(input.value)))) as never;
+}
+
+function onFeatureNumberInput(e: Event, key: "ratio" | "ransac_reproj_threshold" | "min_inlier_ratio") {
+  const input = e.target as HTMLInputElement;
+  if (input.value === "") return;
+  const limits = key === "ratio"
+    ? [0.1, 1.0]
+    : key === "min_inlier_ratio" ? [0.01, 1.0] : [0.1, 50.0];
+  opts.value[key] = boundedNumber(Number(input.value), limits[0], limits[1]) as never;
 }
 
 watch(() => opts.value.dpi, (val) => {
@@ -757,24 +880,17 @@ watch(() => opts.value.dpi, (val) => {
   if (el && el !== document.activeElement) el.value = String(val);
 });
 
-watch(() => opts.value.qrcode_max_attempts, (val) => {
-  const el = maxAttemptsInputRef.value;
-  if (el && el !== document.activeElement) el.value = String(val);
-});
-
 function clampScanOptions() {
   opts.value.dpi = Math.min(300, Math.max(72, Math.floor(Number(opts.value.dpi) || 180)));
   opts.value.qrcode_skip_pages = Math.min(50, nonNegativeInt(opts.value.qrcode_skip_pages));
-  opts.value.qrcode_max_attempts = Math.min(500, Math.max(12, Math.floor(Number(opts.value.qrcode_max_attempts) || 180)));
+  opts.value.qrcode_max_attempts = normalizeQrStrength(opts.value.qrcode_max_attempts);
   opts.value.nfeatures = Math.min(10000, Math.max(100, Math.floor(Number(opts.value.nfeatures) || 1200)));
   opts.value.min_matches = Math.min(1000, Math.max(1, Math.floor(Number(opts.value.min_matches) || 25)));
   opts.value.ratio = boundedNumber(Number(opts.value.ratio), 0.1, 1.0);
   opts.value.ransac_reproj_threshold = boundedNumber(Number(opts.value.ransac_reproj_threshold), 0.1, 50.0);
   opts.value.min_inlier_ratio = boundedNumber(Number(opts.value.min_inlier_ratio), 0.01, 1.0);
   opts.value.max_segment_pages = Math.min(10000, Math.max(1, positiveInt(Number(opts.value.max_segment_pages))));
-  quickScanPageLimit.value = pdfPageCount.value
-    ? Math.min(pdfPageCount.value, positiveInt(Number(quickScanPageLimit.value), 30))
-    : positiveInt(Number(quickScanPageLimit.value), 30);
+  quickScanPageLimit.value = boundedQuickScanPageLimit(quickScanPageLimit.value);
   probePageIndex.value = boundedProbePage(probePageIndex.value);
 }
 
@@ -817,8 +933,8 @@ async function execute() {
       taskId,
     });
     if (res?.queued) markQueued(res.position || 1);
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
     submitting.value = false;
     resetTask();
   }
@@ -851,8 +967,8 @@ async function runProbePage() {
       taskId,
     });
     if (res?.queued) markQueued(res.position || 1);
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
     submitting.value = false;
     resetTask();
   }
@@ -864,6 +980,10 @@ async function runScanOnly() {
     return;
   }
   if (!canRun.value || !window.engine) return;
+  if (quickScanPageLimitExceeded.value) {
+    error.value = quickScanPageLimitHint.value;
+    return;
+  }
   if (needsReference.value && !referenceImage.value) {
     error.value = "当前识别方式需要参考文件";
     return;
@@ -881,12 +1001,12 @@ async function runScanOnly() {
       pdfPath: pdfPath.value,
       referenceImagePath: referenceImage.value,
       options: buildScanOptions(),
-      pageLimit: quickScanPageLimit.value,
+      pageLimit: effectiveQuickScanPageLimit.value,
       taskId,
     });
     if (res?.queued) markQueued(res.position || 1);
-  } catch (e: any) {
-    error.value = formatEngineError(e);
+  } catch (caught) {
+    error.value = formatEngineError(caught);
     submitting.value = false;
     resetTask();
   }
@@ -908,7 +1028,18 @@ function readRoi(value: unknown): [number, number, number, number] | null {
   return roi as [number, number, number, number];
 }
 
+let restoringScanSettings = false;
+
+function normalizeQrStrength(value: unknown) {
+  const effort = Number(value);
+  if (!Number.isFinite(effort) || effort < 24) return 12;
+  if (effort < 72) return 24;
+  if (effort < 144) return 72;
+  return 144;
+}
+
 function loadScanSettings() {
+  restoringScanSettings = true;
   try {
     const raw = sessionStorage.getItem(SCAN_SETTINGS_KEY);
     if (!raw) return;
@@ -941,7 +1072,10 @@ function loadScanSettings() {
       preset.value = data.preset;
     }
     clampScanOptions();
-  } catch {}
+  } catch {
+  } finally {
+    nextTick(() => { restoringScanSettings = false; });
+  }
 }
 
 // ── 设置持久化（仅当前窗口会话）────────────────────────────
@@ -970,7 +1104,6 @@ onMounted(() => loadScanSettings());
 onMounted(() => {
   nextTick(() => {
     if (dpiInputRef.value) dpiInputRef.value.value = String(opts.value.dpi);
-    if (maxAttemptsInputRef.value) maxAttemptsInputRef.value.value = String(opts.value.qrcode_max_attempts);
   });
 });
 
@@ -978,15 +1111,22 @@ onBeforeUnmount(() => {
   if (taskCancellable.value) cancelTask();
   pdfPageCountToken++;
   referencePreviewToken++;
+  roiPreviouslyFocused = null;
 });
 
 const detectionOptions: { key: ScanDetectionMode; label: string }[] = [
-  { key: "auto", label: "自动（二维码/印章/特征点）" },
+  { key: "auto", label: "自动（印章/二维码/特征点）" },
   { key: "qrcode", label: "二维码" },
   { key: "stamp", label: "印章" },
   { key: "feature", label: "特征点匹配" },
 ];
 const detectionSelectOptions = detectionOptions.map((item) => ({ label: item.label, value: item.key }));
+const qrStrengthOptions = [
+  { label: "快速", value: 12 },
+  { label: "标准", value: 24 },
+  { label: "增强", value: 72 },
+  { label: "极强", value: 144 },
+];
 const presetOptions = [
   { label: "自定义", value: "" },
   { label: "预设：均衡", value: "balanced" },
@@ -1005,7 +1145,7 @@ const detectionModeHintText = computed(() => {
   if (opts.value.detection_mode === "qrcode") return "适合用二维码作为分隔标记；可按二维码文字内容筛选。";
   if (opts.value.detection_mode === "stamp") return "适合用红章、盖章页作为分隔标记；不会使用二维码内容筛选。";
   if (opts.value.detection_mode === "feature") return "适合用固定版式或图片作为分隔标记；需要先选择参考文件。";
-  return "推荐默认使用：会先找二维码，再尝试印章和参考特征。";
+  return "推荐默认使用：会先找印章，再尝试二维码和参考特征。";
 });
 const roiStatusText = computed(() => {
   if (!opts.value.qrcode_use_roi) return "未启用 ROI，将全页识别";
@@ -1017,7 +1157,7 @@ const roiOptionTitle = computed(() => {
   if (opts.value.detection_mode === "qrcode") return "只在框选区域内找二维码；适合二维码位置固定的文件";
   if (opts.value.detection_mode === "stamp") return "只在框选区域内找印章；适合盖章位置固定的文件";
   if (opts.value.detection_mode === "feature") return "只使用框选区域的参考特征进行匹配；适合固定版式的局部标记";
-  return "优先在框选区域内识别二维码、印章和参考特征；适合标记位置固定的文件";
+  return "优先在框选区域内识别印章、二维码和参考特征；适合标记位置固定的文件";
 });
 const dpiHintText = computed(() => {
   if (opts.value.detection_mode === "qrcode") return "二维码清晰用 180-200；模糊可调高";
@@ -1063,14 +1203,13 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
 
 <template>
   <div class="scan-shell panel-shell panel-shell-responsive">
-    <!-- 提示 -->
-    <div class="banner panel-header scan-banner" :class="`banner-${scanBannerKind}`">
-      <span class="banner-icon">
-        <AppIcon :name="scanBannerKind === 'warning' ? 'alert' : scanBannerKind === 'success' ? 'check' : 'scan'" />
-      </span>
-      <span class="banner-title">扫描拆分</span>
-      <span class="banner-text">{{ scanBannerMessage }}</span>
-    </div>
+    <PanelBanner
+      class="scan-banner"
+      :kind="scanBannerKind"
+      :icon="scanBannerKind === 'warning' ? 'alert' : scanBannerKind === 'success' ? 'check' : 'scan'"
+      title="扫描拆分"
+      :message="scanBannerMessage"
+    />
 
     <div class="scan-grid panel-grid">
       <!-- 左：参考输入 + 进度日志 -->
@@ -1220,7 +1359,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
               </div>
               <div class="row mt-2 wrap">
                 <label class="checkbox" title="限制每份输出 PDF 的最大页数，用来发现可能漏掉的标记页"><input type="checkbox" v-model="useMaxSegment" />每份最多</label>
-                <input class="input input-num input-num-compact" type="number" min="1" max="10000" :disabled="!useMaxSegment" :value="opts.max_segment_pages" @input="opts.max_segment_pages = Math.min(10000, Math.max(1, positiveInt(Number(($event.target as HTMLInputElement).value))))" title="单份PDF允许的最大页数，包含标记页" />
+                <input class="input input-num input-num-compact" type="number" min="1" max="10000" :disabled="!useMaxSegment" :value="opts.max_segment_pages" @input="onMaxSegmentInput" title="单份PDF允许的最大页数，包含标记页" />
                 <span class="text-muted">页</span>
                 <span class="params-sep">|</span>
                 <label class="checkbox" title="启用 OpenCV 内部多线程；提速取决于图像处理负载"><input type="checkbox" v-model="opts.enable_multithread" />OpenCV 多线程</label>
@@ -1242,8 +1381,8 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
                 </template>
                 <label class="checkbox" :title="roiOptionTitle"><input type="checkbox" v-model="opts.qrcode_use_roi" :disabled="!isRoiSupported" />框选区域(ROI)</label>
                 <span v-if="isQrMode" class="params-sep">|</span>
-                <label v-if="isQrMode" class="label-inline" title="每页最多尝试检测的二维码数量">最多尝试：</label>
-                <input v-if="isQrMode" ref="maxAttemptsInputRef" class="input input-num" type="number" min="12" max="500" :value="opts.qrcode_max_attempts" @input="onMaxAttemptsInput" @blur="onMaxAttemptsBlur" title="每页最多尝试检测的二维码数量（有效范围 12-500）" />
+                <label v-if="isQrMode" class="label-inline" title="控制二维码预处理和兜底识别强度">识别强度：</label>
+                <AppSelect v-if="isQrMode" class="qr-strength-select" :model-value="opts.qrcode_max_attempts" :options="qrStrengthOptions" min-width="110px" @update:model-value="opts.qrcode_max_attempts = Number($event)" />
               </div>
               <div v-if="opts.qrcode_use_roi" class="hint-line params-hint" :class="opts.reference_roi ? '' : 'warn'">{{ roiStatusText }}</div>
             </details>
@@ -1255,12 +1394,12 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
             </summary>
             <p class="advanced-hint">默认参数适合多数扫描件。仅在误检、漏检或速度不理想时调整这些阈值。</p>
             <div class="grid-2 mt-2">
-              <div class="cell"><span class="label-inline">特征点数量：</span><input class="input input-num" type="number" min="100" max="10000" :disabled="!isFeatureMode" :value="opts.nfeatures" @input="opts.nfeatures = Math.min(10000, Math.max(100, Math.floor(Number(($event.target as HTMLInputElement).value) || 1200)))" title="每页提取的ORB特征点上限。值越大越容易匹配到标记，但速度更慢（有效范围 100-10000）" /></div>
-              <div class="cell"><span class="label-inline">最小匹配数：</span><input class="input input-num" type="number" min="1" max="1000" :disabled="!isFeatureMode" :value="opts.min_matches" @input="opts.min_matches = Math.min(1000, Math.max(1, Math.floor(Number(($event.target as HTMLInputElement).value) || 25)))" title="判定为标记页所需的最少有效匹配数量。值越大越严格，误报更少但更易漏检（有效范围 1-1000）" /></div>
-              <div class="cell"><span class="label-inline">比例阈值：</span><input class="input input-num" type="number" step="0.05" min="0.1" max="1.0" :disabled="!isFeatureMode" :value="opts.ratio" @input="opts.ratio = boundedNumber(Number(($event.target as HTMLInputElement).value), 0.1, 1.0)" title="KNN匹配的比例阈值（Lowe ratio test）。越小越严格，误匹配更少但可能漏检（有效范围 0.1-1.0）" /></div>
-              <div class="cell"><span class="label-inline">RANSAC 阈值：</span><input class="input input-num" type="number" step="0.5" min="0.1" max="50.0" :disabled="!isFeatureMode" :value="opts.ransac_reproj_threshold" @input="opts.ransac_reproj_threshold = boundedNumber(Number(($event.target as HTMLInputElement).value), 0.1, 50.0)" title="RANSAC重投影阈值（像素）。越大越宽松，内点可能变多但误报风险增加（有效范围 0.1-50.0）" /></div>
-              <div class="cell"><span class="label-inline">内点比例阈值：</span><input class="input input-num" type="number" step="0.05" min="0.01" max="1.0" :disabled="!isFeatureMode" :value="opts.min_inlier_ratio" @input="opts.min_inlier_ratio = boundedNumber(Number(($event.target as HTMLInputElement).value), 0.01, 1.0)" title="内点比例阈值，用于兜底判定：比例越高越严格（有效范围 0.01-1.0）" /></div>
-              <div class="cell" title="仅影响特征匹配参数；二维码/印章模式不会使用这些特征点参数"><span class="label-inline">参数预设：</span><AppSelect :model-value="preset" :options="presetOptions" :disabled="!isFeatureMode" min-width="130px" @update:model-value="applyPreset($event as any)" /></div>
+              <div class="cell"><span class="label-inline">特征点数量：</span><input class="input input-num" type="number" min="100" max="10000" :disabled="!isFeatureMode" :value="opts.nfeatures" @input="onFeatureIntInput($event, 'nfeatures')" title="每页提取的ORB特征点上限。值越大越容易匹配到标记，但速度更慢（有效范围 100-10000）" /></div>
+              <div class="cell"><span class="label-inline">最小匹配数：</span><input class="input input-num" type="number" min="1" max="1000" :disabled="!isFeatureMode" :value="opts.min_matches" @input="onFeatureIntInput($event, 'min_matches')" title="判定为标记页所需的最少有效匹配数量。值越大越严格，误报更少但更易漏检（有效范围 1-1000）" /></div>
+              <div class="cell"><span class="label-inline">比例阈值：</span><input class="input input-num" type="number" step="0.05" min="0.1" max="1.0" :disabled="!isFeatureMode" :value="opts.ratio" @input="onFeatureNumberInput($event, 'ratio')" title="KNN匹配的比例阈值（Lowe ratio test）。越小越严格，误匹配更少但可能漏检（有效范围 0.1-1.0）" /></div>
+              <div class="cell"><span class="label-inline">RANSAC 阈值：</span><input class="input input-num" type="number" step="0.5" min="0.1" max="50.0" :disabled="!isFeatureMode" :value="opts.ransac_reproj_threshold" @input="onFeatureNumberInput($event, 'ransac_reproj_threshold')" title="RANSAC重投影阈值（像素）。越大越宽松，内点可能变多但误报风险增加（有效范围 0.1-50.0）" /></div>
+              <div class="cell"><span class="label-inline">内点比例阈值：</span><input class="input input-num" type="number" step="0.05" min="0.01" max="1.0" :disabled="!isFeatureMode" :value="opts.min_inlier_ratio" @input="onFeatureNumberInput($event, 'min_inlier_ratio')" title="内点比例阈值，用于兜底判定：比例越高越严格（有效范围 0.01-1.0）" /></div>
+              <div class="cell" title="仅影响特征匹配参数；二维码/印章模式不会使用这些特征点参数"><span class="label-inline">参数预设：</span><AppSelect :model-value="preset" :options="presetOptions" :disabled="!isFeatureMode" min-width="130px" @update:model-value="applyPreset($event as PresetName)" /></div>
             </div>
           </details>
 
@@ -1273,13 +1412,14 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
           <div class="tune-grid">
             <div class="tune-line">
               <label class="label-inline">页码：</label>
-              <input class="input tune-input" type="number" min="1" :max="pdfPageCount || undefined" :value="probePageIndex" @input="probePageIndex = boundedProbePage(Number(($event.target as HTMLInputElement).value))" title="对指定页进行一次识别测试，并输出匹配/内点统计" />
+              <input class="input tune-input" type="number" min="1" :max="pdfPageCount || undefined" :value="probePageIndex" @input="onProbePageInput" @blur="onProbePageBlur" title="对指定页进行一次识别测试，并输出匹配/内点统计" />
               <button class="btn btn-outline tune-btn" :disabled="!canRun" @click="runProbePage" title="对指定页执行一次完整识别流程，查看是否命中标记">测试单页</button>
             </div>
             <div class="tune-line">
               <label class="label-inline">前 N 页：</label>
-              <input class="input tune-input" type="number" min="1" :value="quickScanPageLimit" @input="quickScanPageLimit = positiveInt(Number(($event.target as HTMLInputElement).value), 30)" title="只扫描前N页，便于快速调参" />
-              <button class="btn btn-outline tune-btn" :disabled="!canRun" @click="runScanOnly" title="只扫描前N页查找标记页，不输出文件，便于快速验证参数">快速扫描</button>
+              <input class="input tune-input" :class="{ 'tune-input-warning': quickScanPageLimitExceeded }" type="number" min="1" :max="pdfPageCount || undefined" :value="quickScanPageLimit" :aria-invalid="quickScanPageLimitExceeded" @input="onQuickScanPageLimitInput" @blur="onQuickScanPageLimitBlur" title="只扫描前N页，便于快速调参" />
+              <button class="btn btn-outline tune-btn" :disabled="!canRun || quickScanPageLimitExceeded" @click="runScanOnly" :title="quickScanPageLimitExceeded ? '输入页数不能超过 PDF 总页数' : '只扫描前N页查找标记页，不输出文件，便于快速验证参数'">快速扫描</button>
+              <span v-if="quickScanPageLimitExceeded" class="tune-warning">{{ quickScanPageLimitHint }}</span>
             </div>
           </div>
         </fieldset>
@@ -1300,11 +1440,21 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
       </section>
     </div>
 
-    <div v-if="roiDialogOpen" class="modal-backdrop" @click.self="closeRoiDialog" @keydown.esc="closeRoiDialog" tabindex="-1">
+    <div
+      v-if="roiDialogOpen"
+      ref="roiDialogRef"
+      class="modal-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="roi-dialog-title"
+      @click.self="closeRoiDialog"
+      @keydown="onRoiDialogKeydown"
+      tabindex="-1"
+    >
       <div class="roi-dialog modal-panel modal-panel-lg glass-card">
         <div class="modal-header">
           <div class="roi-dialog-title">
-            <h3>框选区域</h3>
+            <h3 id="roi-dialog-title">框选区域</h3>
             <p>框选模式：拖拽平移 · 选区模式：直接拖拽框选</p>
           </div>
         </div>
@@ -1340,7 +1490,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
             {{ opts.reference_roi ? `区域：x=${opts.reference_roi[0]}，y=${opts.reference_roi[1]}，w=${opts.reference_roi[2]}，h=${opts.reference_roi[3]}` : '未框选区域' }}
           </span>
           <button class="btn btn-outline" @click="closeRoiDialog">取消</button>
-          <button class="btn btn-primary" @click="confirmRoiDialog">确定</button>
+          <button ref="roiConfirmBtnRef" class="btn btn-primary" @click="confirmRoiDialog">确定</button>
         </div>
       </div>
     </div>
@@ -1670,6 +1820,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   white-space: nowrap;
 }
 .detection-select { flex: 0 0 260px; }
+.qr-strength-select { flex: 0 0 110px; }
 .grid-2 {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -1826,6 +1977,16 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
 .tune-input {
   width: 100%;
   min-width: 0;
+}
+.tune-input-warning {
+  border-color: var(--color-warning);
+  box-shadow: 0 0 0 1px var(--color-warning);
+}
+.tune-warning {
+  grid-column: 1 / -1;
+  color: var(--color-warning);
+  font-size: var(--font-sm);
+  line-height: 1.35;
 }
 .tune-btn {
   min-width: 78px;

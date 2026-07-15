@@ -1,26 +1,20 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import type { RenameRule } from "../../../env";
+import type { RenameRule, RenameRuleOf, RenameRulePatch } from "../../../env";
 import AppSelect from "../../common/AppSelect.vue";
+import { findRenameRule, inputPositiveInt, upsertRenameRule } from "../../../utils";
 
 const props = defineProps<{ rules: RenameRule[] }>();
 const emit = defineEmits<{ "update:rules": [rules: RenameRule[]] }>();
 
-function getRule(type: string, defaults: Partial<RenameRule>): RenameRule {
-  const found = props.rules.find((r) => r.type === type);
-  if (found) return found;
-  return { type, ...defaults } as RenameRule;
+type CustomRuleType = "uniform_name" | "insert_number";
+
+function getRule<T extends CustomRuleType>(type: T, defaults: RenameRulePatch<T>): RenameRuleOf<T> {
+  return findRenameRule(props.rules, type, defaults);
 }
 
-function patchRule(type: string, defaults: Partial<RenameRule>, patch: Partial<RenameRule>) {
-  const next = [...props.rules];
-  const idx = next.findIndex((r) => r.type === type);
-  if (idx >= 0) {
-    next[idx] = { ...next[idx], ...patch } as RenameRule;
-  } else {
-    next.push({ type, ...defaults, ...patch } as RenameRule);
-  }
-  emit("update:rules", next);
+function patchRule<T extends CustomRuleType>(type: T, defaults: RenameRulePatch<T>, patch: RenameRulePatch<T>) {
+  emit("update:rules", upsertRenameRule(props.rules, type, defaults, patch));
 }
 
 const uniformName = computed(() => getRule("uniform_name", { base_name: "" }));
@@ -32,7 +26,6 @@ const numberPositionOptions = [
   { label: "首位", value: "前缀" },
 ];
 
-import { positiveInt } from "../../../utils";
 </script>
 
 <template>
@@ -61,7 +54,7 @@ import { positiveInt } from "../../../utils";
             type="number"
             min="1"
             :value="insertNumber.start ?? 1"
-            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { start: positiveInt(($event.target as HTMLInputElement).value) })"
+            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { start: inputPositiveInt(($event.target as HTMLInputElement).value) })"
           />
           <label class="label-inline">位数</label>
           <input
@@ -70,7 +63,7 @@ import { positiveInt } from "../../../utils";
             min="1"
             max="6"
             :value="insertNumber.digits ?? 1"
-            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { digits: positiveInt(($event.target as HTMLInputElement).value) })"
+            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { digits: inputPositiveInt(($event.target as HTMLInputElement).value) })"
           />
           <label class="label-inline">递增量</label>
           <input
@@ -78,10 +71,10 @@ import { positiveInt } from "../../../utils";
             type="number"
             min="1"
             :value="insertNumber.step ?? 1"
-            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { step: positiveInt(($event.target as HTMLInputElement).value) })"
+            @input="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { step: inputPositiveInt(($event.target as HTMLInputElement).value) })"
           />
           <label class="label-inline">位置</label>
-          <AppSelect :model-value="insertNumber.position || '后缀'" :options="numberPositionOptions" @update:model-value="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { position: $event as string })" />
+          <AppSelect :model-value="insertNumber.position || '后缀'" :options="numberPositionOptions" @update:model-value="patchRule('insert_number', { start: 1, step: 1, digits: 1, position: '后缀' }, { position: $event as RenameRuleOf<'insert_number'>['position'] })" />
         </div>
       </details>
     </fieldset>

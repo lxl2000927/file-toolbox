@@ -33,31 +33,27 @@
   --color-border: #e2e8f0;
   --color-border-strong: #cbd5e1;
   --color-hover: #f1f5f9;
-  --color-bg-app: #f0f4ff;
+  --color-bg-app: #eef2f7;
   --color-surface: #ffffff;
   --color-surface-2: #f1f5f9;
   --color-text-primary: #0f172a;
   --color-text-secondary: #475569;
   --color-text-tertiary: #94a3b8;
 
-  /* 背景渐变令牌（body::before 使用） */
-  --bg-gradient-1: rgba(59, 130, 246, 0.20);
-  --bg-gradient-2: rgba(168, 85, 247, 0.16);
-  --bg-gradient-3: rgba(14, 165, 233, 0.18);
-  --bg-gradient-4: rgba(236, 72, 153, 0.10);
-  --bg-gradient-base: linear-gradient(135deg, #eef5ff 0%, #f8fbff 42%, #eef2ff 100%);
+  /* 稳定、低干扰的工作区背景 */
+  --bg-gradient-base: linear-gradient(180deg, #edf2f8 0%, #f7f9fc 46%, #eef2f6 100%);
 
   /* 液态玻璃 (iOS style) */
-  --glass-bg: rgba(255, 255, 255, 0.48);
-  --glass-bg-hover: rgba(255, 255, 255, 0.62);
-  --glass-bg-active: rgba(255, 255, 255, 0.74);
-  --glass-border: rgba(255, 255, 255, 0.62);
-  --glass-border-hover: rgba(255, 255, 255, 0.82);
-  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.68), inset 0 -1px 0 rgba(255, 255, 255, 0.16);
-  --glass-shadow: 0 10px 30px rgba(15, 23, 42, 0.075), 0 2px 8px rgba(15, 23, 42, 0.045);
-  --glass-shadow-soft: 0 4px 16px rgba(15, 23, 42, 0.055), 0 1px 3px rgba(15, 23, 42, 0.035);
-  --glass-blur: 28px;
-  --glass-saturate: saturate(165%);
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  --glass-bg-hover: rgba(255, 255, 255, 0.88);
+  --glass-bg-active: rgba(239, 246, 255, 0.92);
+  --glass-border: rgba(148, 163, 184, 0.28);
+  --glass-border-hover: rgba(100, 116, 139, 0.38);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  --glass-shadow: 0 8px 24px rgba(15, 23, 42, 0.07), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --glass-shadow-soft: 0 2px 8px rgba(15, 23, 42, 0.055), 0 1px 2px rgba(15, 23, 42, 0.035);
+  --glass-blur: 18px;
+  --glass-saturate: saturate(130%);
 
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
   --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08);
@@ -85,9 +81,9 @@
   --font-xl: 18px;
   --font-2xl: 22px;
 
-  --transition-fast: 0.15s ease;
-  --transition: 0.2s ease;
-  --transition-slow: 0.35s ease;
+  --transition-fast: 0.14s ease;
+  --transition: 0.18s ease;
+  --transition-slow: 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 /* ===== 暗色主题覆盖 ===== */
@@ -130,12 +126,7 @@
   --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.38);
   --shadow-lg: 0 12px 28px rgba(0, 0, 0, 0.46);
 
-  /* 深色渐变背景 */
-  --bg-gradient-1: rgba(59, 130, 246, 0.28);
-  --bg-gradient-2: rgba(168, 85, 247, 0.22);
-  --bg-gradient-3: rgba(14, 165, 233, 0.24);
-  --bg-gradient-4: rgba(236, 72, 153, 0.16);
-  --bg-gradient-base: linear-gradient(135deg, #0b1224 0%, #0f172a 42%, #111a31 100%);
+  --bg-gradient-base: linear-gradient(180deg, #0d1524 0%, #111827 48%, #0f172a 100%);
 }
 
 /* ===== Reset ===== */
@@ -157,18 +148,13 @@ html, body {
   user-select: none;
 }
 
-/* 全局渐变背景 —— 让毛玻璃透出层次 */
+/* 全局工作区背景 */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   z-index: -1;
-  background:
-    radial-gradient(circle at 12% 18%, var(--bg-gradient-1), transparent 34%),
-    radial-gradient(circle at 82% 16%, var(--bg-gradient-2), transparent 30%),
-    radial-gradient(circle at 72% 78%, var(--bg-gradient-3), transparent 34%),
-    radial-gradient(circle at 28% 84%, var(--bg-gradient-4), transparent 28%),
-    var(--bg-gradient-base);
+  background: var(--bg-gradient-base);
 }
 
 
@@ -238,7 +224,14 @@ button:disabled {
   border: 1px solid transparent;
   background: var(--color-white);
   color: var(--color-gray-800);
-  transition: all var(--transition-fast);
+  transform: translateY(0) scale(1);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast),
+    opacity var(--transition-fast);
   white-space: nowrap;
 }
 .btn:hover:not(:disabled) {
@@ -250,7 +243,7 @@ button:disabled {
   opacity: 0.45;
 }
 .btn:active:not(:disabled) {
-  transform: scale(0.96);
+  transform: translateY(0) scale(0.98);
   transition: transform 0.08s ease;
 }
 
@@ -451,13 +444,11 @@ button:disabled {
 .glass-card,
 .card {
   position: relative;
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.62), rgba(255, 255, 255, 0.32)),
-    var(--glass-bg);
+  background: var(--glass-bg);
   backdrop-filter: blur(var(--glass-blur)) var(--glass-saturate);
   -webkit-backdrop-filter: blur(var(--glass-blur)) var(--glass-saturate);
   border: 1px solid var(--glass-border);
-  border-radius: var(--radius-xl);
+  border-radius: var(--radius);
   box-shadow: var(--glass-highlight), var(--glass-shadow-soft);
   overflow: hidden;
 }
@@ -468,10 +459,8 @@ button:disabled {
   inset: 0;
   pointer-events: none;
   border-radius: inherit;
-  background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.42), transparent 38%),
-    radial-gradient(circle at 20% 0%, rgba(255, 255, 255, 0.34), transparent 32%);
-  opacity: 0.55;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.26), transparent 72px);
+  opacity: 0.42;
 }
 
 /* ===== 液态玻璃状态横幅 ===== */
@@ -570,9 +559,9 @@ button:disabled {
 }
 .progress > .progress-bar {
   height: 100%;
-  background: linear-gradient(90deg, var(--color-primary), var(--color-purple));
+  background: var(--color-primary);
   border-radius: 999px;
-  transition: width 0.3s linear;
+  transition: width 0.24s ease-out;
 }
 .progress.indeterminate > .progress-bar {
   width: 30% !important;
@@ -642,11 +631,6 @@ button:disabled {
 }
 .empty-state .empty-icon {
   font-size: 36px;
-  animation: float 3s ease-in-out infinite;
-}
-@keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50%      { transform: translateY(-6px); }
 }
 .empty-state .empty-title { font-weight: 600; color: var(--color-gray-600); }
 .empty-state .empty-hint { font-size: var(--font-sm); color: var(--color-gray-500); }
@@ -683,10 +667,10 @@ button:disabled {
   left: 3px;
   width: calc((100% - 6px - (var(--segment-count, 1) - 1) * 4px) / var(--segment-count, 1));
   border-radius: calc(var(--radius-lg) - 4px);
-  background: linear-gradient(135deg, rgba(37, 99, 235, 0.92), rgba(29, 78, 216, 0.88));
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.22);
+  background: var(--color-primary);
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.22);
   transform: translateX(calc(var(--active-index, 0) * (100% + 4px)));
-  transition: transform var(--transition-slow) cubic-bezier(0.34, 1.56, 0.64, 1), width var(--transition-fast);
+  transition: transform var(--transition-slow), width var(--transition-fast);
   will-change: transform;
   pointer-events: none;
 }
@@ -968,18 +952,18 @@ button:disabled {
 
 /* ===== 面板切换动画 ===== */
 .panel-enter-active {
-  animation: panelIn 0.22s ease-out;
+  animation: panelIn 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 .panel-leave-active {
-  animation: panelOut 0.2s ease;
+  animation: panelOut 0.12s ease-in;
 }
 @keyframes panelIn {
-  from { opacity: 0; transform: translateY(14px) scale(0.978); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 @keyframes panelOut {
-  from { opacity: 1; transform: translateY(0) scale(1); }
-  to   { opacity: 0; transform: translateY(-6px) scale(0.99); }
+  from { opacity: 1; transform: translateY(0); }
+  to   { opacity: 0; transform: translateY(-3px); }
 }
 
 /* ===== 子 Tab / 分段切换过渡 ===== */

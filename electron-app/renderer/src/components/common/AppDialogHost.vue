@@ -85,7 +85,7 @@ watch(
       const restore = previouslyFocused;
       previouslyFocused = null;
       await nextTick();
-      restore?.focus?.();
+      if (restore?.isConnected) restore.focus();
     }
   },
 );

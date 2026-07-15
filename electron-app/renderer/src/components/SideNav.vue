@@ -23,6 +23,7 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
         :key="item.key"
         class="nav-btn"
         :class="{ active: active === item.key }"
+        :aria-current="active === item.key ? 'page' : undefined"
         @click="emit('navigate', item.key)"
       >
         <span class="nav-icon"><AppIcon :name="item.icon" /></span>
@@ -36,6 +37,7 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
         :key="item.key"
         class="nav-btn"
         :class="{ active: active === item.key }"
+        :aria-current="active === item.key ? 'page' : undefined"
         @click="emit('navigate', item.key)"
       >
         <span class="nav-icon"><AppIcon :name="item.icon" /></span>
@@ -53,8 +55,8 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
   background: var(--glass-bg);
   backdrop-filter: blur(calc(var(--glass-blur) + 6px));
   -webkit-backdrop-filter: blur(calc(var(--glass-blur) + 6px));
-  border-right: 0.5px solid var(--glass-border);
-  box-shadow: 2px 0 24px rgba(0, 0, 0, 0.04);
+  border-right: 1px solid var(--glass-border);
+  box-shadow: 2px 0 12px rgba(15, 23, 42, 0.035);
   padding: 16px 8px 12px;
   z-index: 2;
 }
@@ -65,6 +67,7 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
   gap: 4px;
 }
 .nav-btn {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -76,36 +79,37 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
   font-size: var(--font-md);
   font-weight: 500;
   text-align: left;
-  transition: all var(--transition-fast);
+  transform: translateX(0);
+  transition:
+    background-color var(--transition-fast),
+    border-color var(--transition-fast),
+    color var(--transition-fast),
+    box-shadow var(--transition-fast),
+    transform var(--transition-fast);
 }
 .nav-btn:hover {
   background: var(--glass-bg-hover);
-  border-color: var(--glass-border-hover);
-  box-shadow: var(--shadow-sm);
+  border-color: var(--glass-border);
+  transform: translateX(1px);
 }
 .nav-btn.active {
-  position: relative;
   background: var(--glass-bg-active);
   color: var(--color-primary-dark);
-  border-color: var(--glass-border-hover);
+  border-color: rgba(37, 99, 235, 0.16);
   font-weight: 600;
-  box-shadow: var(--shadow-sm);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
 }
 .nav-btn.active::before {
   content: "";
   position: absolute;
-  left: -2px;
+  left: -3px;
   top: 50%;
   transform: translateY(-50%);
   width: 3px;
-  height: 22px;
+  height: 20px;
   border-radius: 3px;
   background: var(--color-primary);
-  animation: indicatorIn var(--transition-slow) cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-@keyframes indicatorIn {
-  from { transform: translateY(-50%) scaleY(0); opacity: 0; }
-  to   { transform: translateY(-50%) scaleY(1); opacity: 1; }
+  box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.08);
 }
 .nav-icon {
   display: inline-flex;

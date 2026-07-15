@@ -10,7 +10,6 @@ _RE_LETTERS = re.compile(r"[A-Za-z]")
 _RE_DIGITS = re.compile(r"[0-9]")
 _RE_CHINESE = re.compile(r"[\u4e00-\u9fff]")
 _RE_SYMBOLS = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff]+")
-_RE_WHITESPACE = re.compile(r"\s+")
 _RE_INVALID_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1F]')
 _RE_INVOICE_NO = re.compile(r"(发票号码|发票号码：|发票号码:)\s*([0-9]{8})")
 _RE_INVOICE_CODE = re.compile(r"(发票代码|发票代码：|发票代码:)\s*([0-9]{10,12})")
@@ -561,54 +560,6 @@ class RenameEngine:
             success=success,
             error_message=f"失败 {results['failed']} 个文件" if results["failed"] > 0 else None
         )
-    
-    def undo_last_operation(self) -> Dict[str, Any]:
-        if not self.operation_records:
-            return {"success": False, "message": "没有可撤销的操作"}
-        
-        undo_results = {
-            "total": 0,
-            "successful": 0,
-            "failed": 0,
-            "errors": []
-        }
-        
-        for record in reversed(self.operation_records):
-            if not record.success:
-                continue
-            
-            try:
-                op = str(record.operation_type or "rename")
-                if op == "copy":
-                    if os.path.exists(record.new_path):
-                        os.remove(record.new_path)
-                        undo_results["successful"] += 1
-                    else:
-                        undo_results["failed"] += 1
-                        undo_results["errors"].append(f"文件不存在: {record.new_path}")
-                elif op in ("overwrite", "rename"):
-                    if os.path.exists(record.new_path):
-                        if os.path.exists(record.original_path):
-                            undo_results["failed"] += 1
-                            undo_results["errors"].append(f"原路径已存在，无法撤销: {record.original_path}")
-                        else:
-                            os.rename(record.new_path, record.original_path)
-                            undo_results["successful"] += 1
-                    else:
-                        undo_results["failed"] += 1
-                        undo_results["errors"].append(f"文件不存在: {record.new_path}")
-                else:
-                    undo_results["failed"] += 1
-                    undo_results["errors"].append(f"不支持撤销的操作类型: {op}")
-            except Exception as e:
-                undo_results["failed"] += 1
-                undo_results["errors"].append(f"撤销失败 {record.new_path}: {str(e)}")
-            
-            undo_results["total"] += 1
-        
-        self.operation_records.clear()
-        
-        return undo_results
     
     def validate_filename(self, filename: str) -> Tuple[bool, str]:
         if not isinstance(filename, str) or not filename.strip():

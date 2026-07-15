@@ -6,11 +6,17 @@ directories:
   output: release
   buildResources: build
 
-artifactName: ${productName}-${version}-${arch}.${ext}
+artifactName: File.Toolbox-${version}-${arch}.${ext}
+
+publish:
+  provider: github
+  owner: lxl2000927
+  repo: file-toolbox
+  releaseType: release
 
 files:
   - dist/**/*
-  - "!node_modules"
+  - package.json
 
 extraResources:
   - from: ../engine/dist/
@@ -33,10 +39,12 @@ win:
   icon: ../packaging/app.ico
 
 nsis:
-  artifactName: ${productName}-${version}-${arch}-setup.${ext}
+  artifactName: File.Toolbox-${version}-${arch}-setup.${ext}
   oneClick: false
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
+  differentialPackage: true
+  include: build/installer.nsh
 
 portable:
-  artifactName: ${productName}-${version}-${arch}-portable.${ext}
+  artifactName: File.Toolbox-${version}-${arch}-portable.${ext}

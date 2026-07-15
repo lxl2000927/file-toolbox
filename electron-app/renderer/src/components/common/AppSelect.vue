@@ -34,6 +34,8 @@ const menuRef = ref<HTMLDivElement | null>(null);
 const open = ref(false);
 const activeIndex = ref(-1);
 const menuStyle = ref<Record<string, string>>({});
+const listboxId = `app-select-${Math.random().toString(36).slice(2, 10)}`;
+const activeDescendant = computed(() => open.value && activeIndex.value >= 0 ? `${listboxId}-option-${activeIndex.value}` : undefined);
 
 const selectedOption = computed(() => props.options.find((option) => option.value === props.modelValue));
 const enabledOptions = computed(() => props.options.filter((option) => !option.disabled));
@@ -161,6 +163,9 @@ onBeforeUnmount(() => {
       type="button"
       :disabled="disabled"
       :aria-expanded="open"
+      aria-haspopup="listbox"
+      :aria-controls="listboxId"
+      :aria-activedescendant="activeDescendant"
       @click="toggle"
       @keydown="onKeydown"
     >
@@ -174,7 +179,7 @@ onBeforeUnmount(() => {
 
     <Teleport to="body">
       <Transition name="app-select-pop">
-        <div v-if="open" ref="menuRef" class="app-select-menu" :style="menuStyle" role="listbox">
+        <div v-if="open" :id="listboxId" ref="menuRef" class="app-select-menu" :style="menuStyle" role="listbox">
           <button
             v-for="(option, index) in options"
             :key="String(option.value)"
@@ -185,6 +190,7 @@ onBeforeUnmount(() => {
             ]"
             type="button"
             role="option"
+            :id="`${listboxId}-option-${index}`"
             :aria-selected="option.value === modelValue"
             :disabled="option.disabled"
             :data-index="index"

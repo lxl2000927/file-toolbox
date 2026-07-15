@@ -1,4 +1,13 @@
 import { contextBridge, ipcRenderer, IpcRendererEvent, webUtils } from "electron";
+import type {
+  AppUpdateStatus,
+  ElectronAPI,
+  EngineAPI,
+  EngineNotificationPayload,
+  PdfSplitConfig,
+  RenameRule,
+  ScanSplitOptions,
+} from "../shared/api-types";
 
 type DialogOpenFilesOptions = {
   filters?: { name: string; extensions: string[] }[];
@@ -6,16 +15,16 @@ type DialogOpenFilesOptions = {
   title?: string;
 };
 
-contextBridge.exposeInMainWorld("engine", {
+const engineApi: EngineAPI = {
   status: () => ipcRenderer.invoke("engine:status"),
   ping: () => ipcRenderer.invoke("engine:call", "ping", {}),
 
   rename: {
-    preview: (files: string[], rules: any[]) =>
+    preview: (files: string[], rules: RenameRule[]) =>
       ipcRenderer.invoke("engine:call", "rename.preview", { files, rules }),
     execute: (
       files: string[],
-      rules: any[],
+      rules: RenameRule[],
       saveMethod: "copy" | "overwrite" = "copy",
       outputDir = "",
     ) =>
@@ -32,13 +41,13 @@ contextBridge.exposeInMainWorld("engine", {
   pdfSplit: {
     validate: (pdfPath: string) =>
       ipcRenderer.invoke("engine:call", "pdf_split.validate", { pdf_path: pdfPath }),
-    preview: (pdfPath: string, config: any) =>
+    preview: (pdfPath: string, config: PdfSplitConfig) =>
       ipcRenderer.invoke("engine:call", "pdf_split.preview", { pdf_path: pdfPath, config }),
-    previewMany: (pdfPaths: string[], config: any) =>
+    previewMany: (pdfPaths: string[], config: PdfSplitConfig) =>
       ipcRenderer.invoke("engine:call", "pdf_split.preview_many", { pdf_paths: pdfPaths, config }),
     // [Bug #32] pdf_split.execute 同步路由已下线（server.py ROUTES 已移除），
     // 仅保留 executeAsync 走后台线程 + 取消令牌。
-    executeAsync: (pdfPaths: string[], config: any, taskId?: string) =>
+    executeAsync: (pdfPaths: string[], config: PdfSplitConfig, taskId?: string) =>
       ipcRenderer.invoke("engine:call", "pdf_split.execute_async", {
         pdf_paths: pdfPaths,
         config,
@@ -49,16 +58,16 @@ contextBridge.exposeInMainWorld("engine", {
   scanSplit: {
     previewReference: (referenceImagePath: string, opts?: { nfeatures?: number; roi?: [number, number, number, number] | null }): Promise<{ ok: boolean; data_url?: string; width?: number; height?: number; error?: string; keypoints_total?: number; keypoints_in_roi?: number }> =>
       ipcRenderer.invoke("engine:call", "scan_split.preview_reference", { reference_image_path: referenceImagePath, nfeatures: opts?.nfeatures, roi: opts?.roi }),
-    probePage: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageIndex: number; taskId?: string }) =>
+    probePage: (params: { pdfPath: string; referenceImagePath: string; options: ScanSplitOptions; pageIndex: number; taskId?: string }) =>
       ipcRenderer.invoke("engine:call", "scan_split.probe_page", { pdf_path: params.pdfPath, reference_image_path: params.referenceImagePath, options: params.options, page_index: params.pageIndex, task_id: params.taskId }),
-    scanOnly: (params: { pdfPath: string; referenceImagePath: string; options: Record<string, any>; pageLimit: number; taskId?: string }) =>
+    scanOnly: (params: { pdfPath: string; referenceImagePath: string; options: ScanSplitOptions; pageLimit: number; taskId?: string }) =>
       ipcRenderer.invoke("engine:call", "scan_split.scan_only", { pdf_path: params.pdfPath, reference_image_path: params.referenceImagePath, options: params.options, page_limit: params.pageLimit, task_id: params.taskId }),
     executeAsync: (params: {
       pdfPath: string;
       referenceImagePath: string;
       outputDir?: string;
       prefix?: string;
-      options: Record<string, any>;
+      options: ScanSplitOptions;
       taskId?: string;
     }) =>
       ipcRenderer.invoke("engine:call", "scan_split.execute_async", {
@@ -86,15 +95,17 @@ contextBridge.exposeInMainWorld("engine", {
   },
 
   onNotification: (
-    callback: (payload: { method: string; params: any }) => void,
+    callback: (payload: EngineNotificationPayload) => void,
   ): (() => void) => {
-    const listener = (_event: IpcRendererEvent, payload: any) => callback(payload);
+    const listener = (_event: IpcRendererEvent, payload: EngineNotificationPayload) => callback(payload);
     ipcRenderer.on("engine:notification", listener);
     return () => ipcRenderer.removeListener("engine:notification", listener);
   },
-});
+};
 
-contextBridge.exposeInMainWorld("electronAPI", {
+contextBridge.exposeInMainWorld("engine", engineApi);
+
+const electronApi: ElectronAPI = {
   openFileDialog: (options?: DialogOpenFilesOptions) =>
     ipcRenderer.invoke("dialog:openFiles", options),
   openDirectoryDialog: (options?: { title?: string }) =>
@@ -102,9 +113,19 @@ contextBridge.exposeInMainWorld("electronAPI", {
   statPaths: (paths: string[]) => ipcRenderer.invoke("fs:statPaths", paths),
   readDirFiles: (dirPath: string, exts?: string[]) =>
     ipcRenderer.invoke("fs:readDirFiles", dirPath, exts),
-  readFileAsDataUrl: (filePath: string): Promise<string> =>
-    ipcRenderer.invoke("fs:readFileAsDataUrl", filePath),
-  checkUpdate: () => ipcRenderer.invoke("app:checkUpdate"),
+  getFilePreviewUrl: (filePath: string) =>
+    ipcRenderer.invoke("fs:getFilePreviewUrl", filePath),
+  update: {
+    getStatus: () => ipcRenderer.invoke("app:update:getStatus"),
+    check: () => ipcRenderer.invoke("app:update:check"),
+    download: () => ipcRenderer.invoke("app:update:download"),
+    install: () => ipcRenderer.invoke("app:update:install"),
+    onStatus: (callback: (status: AppUpdateStatus) => void): (() => void) => {
+      const listener = (_event: IpcRendererEvent, status: AppUpdateStatus) => callback(status);
+      ipcRenderer.on("app:update-status", listener);
+      return () => ipcRenderer.removeListener("app:update-status", listener);
+    },
+  },
   openExternal: (url: string) => ipcRenderer.invoke("app:openExternal", url),
   openDataDir: () => ipcRenderer.invoke("app:openDataDir"),
   restartEngine: () => ipcRenderer.invoke("engine:restart"),
@@ -118,4 +139,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
     const authorizedSet = new Set(authorizedPaths);
     return paths.map((path) => (path && authorizedSet.has(path) ? path : ""));
   },
-});
+};
+
+contextBridge.exposeInMainWorld("electronAPI", electronApi);
