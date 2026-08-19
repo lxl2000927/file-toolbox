@@ -59,6 +59,7 @@ const tableViewportHeight = ref(0);
 const RENAME_ROW_HEIGHT = 36;
 const RENAME_ROW_OVERSCAN = 12;
 let tableResizeObserver: ResizeObserver | null = null;
+let unsubscribeNativeDrop: (() => void) | null = null;
 
 function naturalSortKey(name: string): NaturalSortPart[] {
   const stem = name.replace(/\.[^/.]*$/, "");
@@ -319,6 +320,8 @@ function closeSortMenu() {
 }
 
 onBeforeUnmount(() => {
+  unsubscribeNativeDrop?.();
+  unsubscribeNativeDrop = null;
   if (previewTimer.value !== null) {
     clearTimeout(previewTimer.value);
     previewTimer.value = null;
@@ -333,6 +336,9 @@ onBeforeUnmount(() => {
 });
 
 onMounted(() => {
+  unsubscribeNativeDrop = window.electronAPI?.onFileDrop?.((paths) => {
+    if (paths.length) appendFiles(paths);
+  }) ?? null;
   document.addEventListener("click", closeSortMenu);
   syncTableViewport();
   if (typeof ResizeObserver !== "undefined" && tableWrapRef.value) {

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import AppIcon from "./common/AppIcon.vue";
 
-defineProps<{ active: string }>();
+const props = withDefaults(defineProps<{ active: string; disabled?: string[] }>(), {
+  disabled: () => [],
+});
 const emit = defineEmits<{ navigate: [key: string] }>();
 
 type NavItem = { key: string; label: string; icon: "scan" | "pdf" | "rename" | "settings" };
@@ -13,6 +15,14 @@ const topItems: NavItem[] = [
 ];
 
 const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings" }];
+
+function isDisabled(key: string) {
+  return props.disabled.includes(key);
+}
+
+function onNavigate(key: string) {
+  if (!isDisabled(key)) emit("navigate", key);
+}
 </script>
 
 <template>
@@ -24,7 +34,11 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
         class="nav-btn"
         :class="{ active: active === item.key }"
         :aria-current="active === item.key ? 'page' : undefined"
-        @click="emit('navigate', item.key)"
+        :aria-disabled="isDisabled(item.key) ? 'true' : undefined"
+        :data-nav-key="item.key"
+        :disabled="isDisabled(item.key)"
+        :title="isDisabled(item.key) ? 'Tauri 第一阶段尚未迁移此功能' : undefined"
+        @click="onNavigate(item.key)"
       >
         <span class="nav-icon"><AppIcon :name="item.icon" /></span>
         <span class="nav-label">{{ item.label }}</span>
@@ -38,7 +52,11 @@ const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings
         class="nav-btn"
         :class="{ active: active === item.key }"
         :aria-current="active === item.key ? 'page' : undefined"
-        @click="emit('navigate', item.key)"
+        :aria-disabled="isDisabled(item.key) ? 'true' : undefined"
+        :data-nav-key="item.key"
+        :disabled="isDisabled(item.key)"
+        :title="isDisabled(item.key) ? 'Tauri 第一阶段尚未迁移此功能' : undefined"
+        @click="onNavigate(item.key)"
       >
         <span class="nav-icon"><AppIcon :name="item.icon" /></span>
         <span class="nav-label">{{ item.label }}</span>

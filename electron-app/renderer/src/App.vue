@@ -8,8 +8,12 @@ import ScanSplitPanel from "./components/panels/ScanSplitPanel.vue";
 import AboutPanel from "./components/panels/AboutPanel.vue";
 import AppDialogHost from "./components/common/AppDialogHost.vue";
 import ToastHost from "./components/common/ToastHost.vue";
-
-type PanelKey = "rename" | "pdf_split" | "scan_split" | "about";
+import {
+  electronCapabilities,
+  panelIsEnabled,
+  sanitizePanel,
+  type PanelKey,
+} from "./platform/runtime";
 
 const panelMap: Record<PanelKey, any> = {
   rename: RenamePanel,
@@ -22,6 +26,10 @@ const activePanel = ref<PanelKey>("rename");
 const engineStatus = ref<"connecting" | "ready" | "error">("connecting");
 const PANEL_STORAGE_KEY = "file-toolbox.active-panel";
 const APP_STORAGE_PREFIX = "file-toolbox.";
+const desktopCapabilities = window.desktopRuntime?.capabilities ?? electronCapabilities;
+const disabledPanels = (["rename", "pdf_split", "scan_split", "about"] as const).filter(
+  (panel) => !panelIsEnabled(panel, desktopCapabilities),
+);
 
 const panelComponent = computed(() => panelMap[activePanel.value]);
 
@@ -79,10 +87,9 @@ function clearAppStateStorage() {
 
 onMounted(() => {
   clearStorageByPrefix(localStorage);
-  const savedPanel = sessionStorage.getItem(PANEL_STORAGE_KEY) as PanelKey | null;
-  if (["rename", "pdf_split", "scan_split", "about"].includes(savedPanel || "")) {
-    activePanel.value = savedPanel as PanelKey;
-  }
+  const savedPanel = sessionStorage.getItem(PANEL_STORAGE_KEY);
+  activePanel.value = sanitizePanel(savedPanel, desktopCapabilities);
+  sessionStorage.setItem(PANEL_STORAGE_KEY, activePanel.value);
   probeEngine();
   unsubReady = window.engine?.onNotification(({ method, params }) => {
     if (method === "engine.status") {
@@ -102,13 +109,15 @@ onBeforeUnmount(() => {
 });
 
 function onNavigate(key: string) {
-  activePanel.value = key as PanelKey;
+  const panel = sanitizePanel(key, desktopCapabilities);
+  if (panel !== key || !panelIsEnabled(panel, desktopCapabilities)) return;
+  activePanel.value = panel;
 }
 </script>
 
 <template>
   <div class="app-shell">
-    <SideNav :active="activePanel" @navigate="onNavigate" />
+    <SideNav :active="activePanel" :disabled="disabledPanels" @navigate="onNavigate" />
     <main class="app-main">
       <Transition name="panel" mode="out-in">
         <KeepAlive>
