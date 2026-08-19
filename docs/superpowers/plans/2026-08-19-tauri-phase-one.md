@@ -1231,7 +1231,7 @@ git commit -m "feat: gate Tauri phase-one capabilities"
 - Consumes: completed Rust commands, Tauri bridge, shared renderer, real `.venv` Python engine
 - Produces: verified Windows debug build and reproducible developer instructions
 
-- [ ] **Step 1: Run every automated suite from a clean state**
+- [x] **Step 1: Run every automated suite from a clean state**
 
 ```powershell
 Set-Location 'E:\new\file-toolbox\.worktrees\tauri-migration'
@@ -1270,7 +1270,7 @@ Verify in the UI:
 
 If any step fails, capture the exact operation and add a failing automated test before changing production code.
 
-- [ ] **Step 3: Record the first Tauri size baseline**
+- [x] **Step 3: Record the first Tauri size baseline**
 
 ```powershell
 Get-ChildItem -LiteralPath '.\src-tauri\target\debug' -Filter 'file-toolbox*.exe' |
@@ -1279,7 +1279,7 @@ Get-ChildItem -LiteralPath '.\src-tauri\target\debug' -Filter 'file-toolbox*.exe
 
 Record the executable byte size in the README experimental Tauri section without presenting it as the final installer size.
 
-- [ ] **Step 4: Add reproducible README commands**
+- [x] **Step 4: Add reproducible README commands**
 
 Document:
 

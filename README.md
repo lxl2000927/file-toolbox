@@ -111,6 +111,23 @@ npm run dev
 
 开发模式下，Electron 主进程会通过 Python 解释器启动 `engine/server.py`，并通过 stdio JSON-RPC 与 Python 引擎通信。
 
+### 实验性 Tauri 第一阶段（仅 Windows、仅重命名）
+
+Tauri 工作流目前仅用于实验性第一阶段：仅支持 Windows，且仅迁移了批量重命名流程。PDF 拆分、扫描拆分、更新和发布安装包仍不在该流程范围内；上面的 Electron 开发与构建说明保持不变，仍是完整功能的开发路径。
+
+从仓库根目录创建环境并运行 Tauri：
+
+```powershell
+py -3.14 -m venv .venv
+& '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
+Set-Location electron-app
+npm ci
+npm run tauri:dev
+npm run tauri:build:debug
+```
+
+首次 Windows 调试构建基线为 `electron-app/src-tauri/target/debug/app.exe` 的 **14,116,352 bytes**。这是未打包的调试可执行文件大小，不是安装程序或最终发行包大小。
+
 ## 验证命令
 
 发布前建议至少运行以下检查：
