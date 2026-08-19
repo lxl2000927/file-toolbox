@@ -149,6 +149,7 @@ impl EngineManager {
             Arc::downgrade(&self.child),
             Arc::downgrade(&self.pending),
             Arc::downgrade(&self.stdin),
+            Arc::clone(&self.sink),
             process_id,
         );
 
@@ -358,6 +359,7 @@ fn build_command(config: &EngineConfig) -> tokio::process::Command {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_stdout_reader(
     state: std::sync::Weak<Mutex<EngineStatus>>,
     child: std::sync::Weak<Mutex<Option<Child>>>,
@@ -394,7 +396,7 @@ fn spawn_stdout_reader(
             }
         }
 
-        handle_process_exit(state, child, pending, stdin, process_id).await;
+        handle_process_exit(state, child, pending, stdin, sink, process_id).await;
     });
 }
 
@@ -412,6 +414,7 @@ fn spawn_child_watcher(
     child: std::sync::Weak<Mutex<Option<Child>>>,
     pending: std::sync::Weak<Mutex<HashMap<u64, PendingSender>>>,
     stdin: std::sync::Weak<Mutex<Option<ChildStdin>>>,
+    sink: Arc<dyn EngineEventSink>,
     process_id: Option<u32>,
 ) {
     tokio::spawn(async move {
@@ -432,7 +435,7 @@ fn spawn_child_watcher(
             };
 
             if exited {
-                handle_process_exit(state, child, pending, stdin, process_id).await;
+                handle_process_exit(state, child, pending, stdin, sink, process_id).await;
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -445,6 +448,7 @@ async fn handle_process_exit(
     child: std::sync::Weak<Mutex<Option<Child>>>,
     pending: std::sync::Weak<Mutex<HashMap<u64, PendingSender>>>,
     stdin: std::sync::Weak<Mutex<Option<ChildStdin>>>,
+    sink: Arc<dyn EngineEventSink>,
     process_id: Option<u32>,
 ) {
     let Some(child) = child.upgrade() else {
@@ -471,11 +475,22 @@ async fn handle_process_exit(
         .await;
     }
 
+    let mut status_changed = false;
     if let Some(state) = state.upgrade() {
         let mut state = state.lock().await;
         if !matches!(*state, EngineStatus::Stopping | EngineStatus::Stopped) {
             *state = EngineStatus::Failed("引擎进程已退出".into());
+            status_changed = true;
         }
+    }
+    if status_changed {
+        sink.emit(EngineNotification {
+            method: "engine.status".into(),
+            params: serde_json::json!({
+                "status": "error",
+                "error": "引擎进程已退出",
+            }),
+        });
     }
 }
 
@@ -574,7 +589,8 @@ mod tests {
 
     #[tokio::test]
     async fn crash_marks_engine_failed_and_restart_recovers() {
-        let manager = EngineManager::new(fixture_config(), Arc::new(RecordingSink::default()));
+        let sink = Arc::new(RecordingSink::default());
+        let manager = EngineManager::new(fixture_config(), sink.clone());
         manager.start().await.unwrap();
         let error = manager
             .call("crash", json!({}), Duration::from_secs(2))
@@ -582,6 +598,10 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "ENGINE_EXITED");
         wait_for_failed(&manager).await;
+        assert!(sink.0.lock().unwrap().iter().any(|notification| {
+            notification.method == "engine.status"
+                && notification.params == json!({"status": "error", "error": "引擎进程已退出"})
+        }));
         manager.restart().await.unwrap();
         assert_eq!(
             manager
