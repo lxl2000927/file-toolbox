@@ -478,10 +478,7 @@ async fn handle_process_exit(
     let mut status_changed = false;
     if let Some(state) = state.upgrade() {
         let mut state = state.lock().await;
-        if !matches!(*state, EngineStatus::Stopping | EngineStatus::Stopped) {
-            *state = EngineStatus::Failed("引擎进程已退出".into());
-            status_changed = true;
-        }
+        status_changed = mark_engine_failed(&mut state);
     }
     if status_changed {
         sink.emit(EngineNotification {
@@ -491,6 +488,15 @@ async fn handle_process_exit(
                 "error": "引擎进程已退出",
             }),
         });
+    }
+}
+
+fn mark_engine_failed(state: &mut EngineStatus) -> bool {
+    if matches!(*state, EngineStatus::Starting | EngineStatus::Ready) {
+        *state = EngineStatus::Failed("引擎进程已退出".into());
+        true
+    } else {
+        false
     }
 }
 
@@ -598,10 +604,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "ENGINE_EXITED");
         wait_for_failed(&manager).await;
-        assert!(sink.0.lock().unwrap().iter().any(|notification| {
-            notification.method == "engine.status"
-                && notification.params == json!({"status": "error", "error": "引擎进程已退出"})
-        }));
+        let failure_notifications = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|notification| {
+                notification.method == "engine.status"
+                    && notification.params == json!({"status": "error", "error": "引擎进程已退出"})
+            })
+            .count();
+        assert_eq!(failure_notifications, 1);
         manager.restart().await.unwrap();
         assert_eq!(
             manager
@@ -611,6 +624,20 @@ mod tests {
             json!({"pong": true})
         );
         manager.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn failure_transition_records_exactly_one_status_event() {
+        let mut state = EngineStatus::Ready;
+        let mut failure_events = 0;
+        if mark_engine_failed(&mut state) {
+            failure_events += 1;
+        }
+        if mark_engine_failed(&mut state) {
+            failure_events += 1;
+        }
+        assert_eq!(state, EngineStatus::Failed("引擎进程已退出".into()));
+        assert_eq!(failure_events, 1);
     }
 
     #[cfg(windows)]

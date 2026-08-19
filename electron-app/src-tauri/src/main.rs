@@ -5,7 +5,7 @@ mod commands;
 mod engine;
 
 use commands::engine::{
-    engine_call, engine_config, engine_restart, engine_status, AppState, TauriEventSink,
+    engine_call, engine_config, engine_restart, engine_status_command, AppState, TauriEventSink,
 };
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -41,7 +41,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            engine_status,
+            engine_status_command,
             engine_call,
             engine_restart
         ])

@@ -115,11 +115,15 @@ pub async fn emit_status<R: Runtime>(app: &AppHandle<R>, engine: &EngineManager)
     engine_status_notification(app, &engine.status().await);
 }
 
-#[tauri::command]
-pub async fn engine_status(
+pub async fn engine_status(state: State<'_, AppState>) -> EngineStatusResponse {
+    map_engine_status(&state.engine.status().await)
+}
+
+#[tauri::command(rename = "engine_status")]
+pub async fn engine_status_command(
     state: State<'_, AppState>,
 ) -> Result<EngineStatusResponse, DesktopError> {
-    Ok(map_engine_status(&state.engine.status().await))
+    Ok(engine_status(state).await)
 }
 
 #[tauri::command]
