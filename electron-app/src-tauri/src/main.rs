@@ -7,6 +7,7 @@ mod engine;
 use commands::engine::{
     engine_call, engine_config, engine_restart, engine_status_command, AppState, TauriEventSink,
 };
+use commands::files::{open_directory, open_files, stat_paths_command, FileState, PathAuthorizer};
 use std::sync::{
     atomic::{AtomicU8, Ordering},
     Arc,
@@ -21,6 +22,7 @@ fn main() {
 
     let shutdown_state = Arc::new(AtomicU8::new(SHUTDOWN_IDLE));
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let auth_token = Uuid::new_v4().simple().to_string();
             let config =
@@ -31,6 +33,9 @@ fn main() {
             ));
             app.manage(AppState {
                 engine: Arc::clone(&manager),
+            });
+            app.manage(FileState {
+                paths: Arc::new(PathAuthorizer::default()),
             });
             let startup_manager = Arc::clone(&manager);
             let startup_app = app.handle().clone();
@@ -43,12 +48,30 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             engine_status_command,
             engine_call,
-            engine_restart
+            engine_restart,
+            open_files,
+            open_directory,
+            stat_paths_command
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(move |app, event| {
-            if let RunEvent::ExitRequested { api, code, .. } = event {
+        .run(move |app_handle, event| match event {
+            RunEvent::WindowEvent {
+                event: tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }),
+                ..
+            } => {
+                use tauri::{Emitter, Manager};
+                let files = app_handle.state::<FileState>();
+                let authorized = paths
+                    .iter()
+                    .filter_map(|path| files.paths.authorize_file(path).ok())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if !authorized.is_empty() {
+                    let _ = app_handle.emit("desktop-file-drop", authorized);
+                }
+            }
+            RunEvent::ExitRequested { api, code, .. } => {
                 if shutdown_state.load(Ordering::Acquire) == SHUTDOWN_COMPLETE {
                     return;
                 }
@@ -64,8 +87,8 @@ fn main() {
                 {
                     return;
                 }
-                let engine = app.state::<AppState>().engine.clone();
-                let app = app.clone();
+                let engine = app_handle.state::<AppState>().engine.clone();
+                let app = app_handle.clone();
                 let shutdown_state = Arc::clone(&shutdown_state);
                 async_runtime::spawn(async move {
                     let _ = engine.shutdown().await;
@@ -73,5 +96,6 @@ fn main() {
                     app.exit(code.unwrap_or(0));
                 });
             }
+            _ => {}
         })
 }

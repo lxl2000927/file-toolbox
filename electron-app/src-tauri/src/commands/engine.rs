@@ -1,3 +1,4 @@
+use crate::commands::files::{validate_rename_params, FileState};
 use crate::engine::{
     error::DesktopError,
     manager::{EngineConfig, EngineEventSink, EngineManager, EngineNotification, EngineStatus},
@@ -131,10 +132,12 @@ pub async fn engine_call(
     method: String,
     params: serde_json::Value,
     state: State<'_, AppState>,
+    files: State<'_, FileState>,
 ) -> Result<serde_json::Value, DesktopError> {
     if !is_allowed_method(&method) {
         return Err(DesktopError::new("METHOD_NOT_ALLOWED", "引擎方法未获允许"));
     }
+    validate_rename_params(&method, &params, &files.paths)?;
     state
         .engine
         .call(&method, params, method_timeout(&method))
