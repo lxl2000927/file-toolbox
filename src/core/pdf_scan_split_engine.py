@@ -1366,7 +1366,6 @@ class PdfScanSplitEngine:
                     formats=zxingcpp.BarcodeFormat.QRCode,
                     try_rotate=True,
                     try_downscale=True,
-                    try_invert=True,
                 )
             except Exception as exc:
                 _diagnostic(f"ZXing {variant} 解码", exc)

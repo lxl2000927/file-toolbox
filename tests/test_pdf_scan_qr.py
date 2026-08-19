@@ -23,12 +23,8 @@ except ImportError:
 class PdfScanQrTests(unittest.TestCase):
     @staticmethod
     def _barcode_image(fmt, text: str, width: int, height: int):
-        try:
-            barcode = zxingcpp.create_barcode(text, fmt)
-            scale = max(1, min(width, height) // 64)
-            image = zxingcpp.write_barcode_to_image(barcode, scale=scale)
-        except Exception:
-            image = zxingcpp.write_barcode(fmt, text, width, height)
+        barcode = zxingcpp.create_barcode(text, fmt)
+        image = zxingcpp.write_barcode_to_image(barcode, size_hint=max(width, height))
         gray = np.asarray(image, dtype=np.uint8)
         return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
@@ -59,7 +55,7 @@ class PdfScanQrTests(unittest.TestCase):
         qr = self._barcode_image(zxingcpp.BarcodeFormat.QRCode, "cached-marker", 260, 260)
         canvas = np.full((700, 900, 3), 255, dtype=np.uint8)
         qr_h, qr_w = qr.shape[:2]
-        canvas[80 : 80 + qr_h, 560 : 560 + qr_w] = qr
+        canvas[80 : 80 + qr_h, 540 : 540 + qr_w] = qr
         first_details = {}
         self.assertEqual(PdfScanSplitEngine._detect_qrcodes(canvas, details=first_details), ["cached-marker"])
         cache = _QRCodeScanCache(bbox=first_details["bbox"])
