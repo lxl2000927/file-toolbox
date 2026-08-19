@@ -16,6 +16,11 @@
       "@/*": ["./renderer/src/*"]
     }
   },
-  "include": ["main/**/*.ts", "preload/**/*.ts", "renderer/src/**/*.ts", "renderer/src/**/*.vue"],
-  "exclude": ["node_modules", "dist"]
+  "include": [
+    "main/**/*.ts",
+    "preload/**/*.ts",
+    "renderer/src/**/*.ts",
+    "renderer/src/**/*.vue"
+  ],
+  "exclude": ["node_modules", "dist", "src-tauri/target"]
 }
