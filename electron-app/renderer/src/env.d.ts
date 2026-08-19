@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 
 import type { ElectronAPI, EngineAPI } from "../../shared/api-types";
+import type { DesktopCapabilities } from "./platform/runtime";
 
 export type * from "../../shared/api-types";
 export type * from "../../shared/ipc-types";
@@ -15,5 +16,9 @@ declare global {
   interface Window {
     engine?: EngineAPI;
     electronAPI?: ElectronAPI;
+    desktopRuntime?: {
+      kind: "electron" | "tauri";
+      capabilities: DesktopCapabilities;
+    };
   }
 }

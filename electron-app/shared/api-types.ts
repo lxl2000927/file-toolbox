@@ -231,4 +231,5 @@ export interface ElectronAPI {
   saveFile: (options: { content: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ saved: boolean; path?: string }>;
   getPathForFile: (file: File) => string;
   getPathsForFiles: (files: File[]) => Promise<string[]>;
+  onFileDrop?: (callback: (paths: string[]) => void) => () => void;
 }
