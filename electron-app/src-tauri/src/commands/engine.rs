@@ -58,6 +58,19 @@ pub fn packaged_engine_config(resource_dir: &Path, auth_token: impl Into<String>
     }
 }
 
+fn development_root(manifest_dir: &Path) -> Result<PathBuf, DesktopError> {
+    manifest_dir
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .map_err(|error| {
+            DesktopError::new(
+                "ENGINE_NOT_CONFIGURED",
+                format!("无法定位开发仓库根目录: {error}"),
+            )
+        })
+}
+
 pub fn map_engine_status(status: &EngineStatus) -> EngineStatusResponse {
     match status {
         EngineStatus::Starting => EngineStatusResponse {
@@ -160,7 +173,7 @@ pub fn engine_config<R: Runtime>(
 ) -> Result<EngineConfig, DesktopError> {
     if cfg!(debug_assertions) {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let root = manifest_dir.join("..").join("..");
+        let root = development_root(&manifest_dir)?;
         Ok(development_engine_config(&root, auth_token))
     } else {
         let resource_dir = app.path().resource_dir().map_err(|error| {
@@ -177,6 +190,20 @@ pub fn engine_config<R: Runtime>(
 mod tests {
     use super::*;
     use std::{path::PathBuf, time::Duration};
+
+    #[test]
+    fn development_root_is_canonicalized() {
+        let temp = tempfile::tempdir().unwrap();
+        let manifest_dir = temp.path().join("electron-app").join("src-tauri");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+
+        let root = development_root(&manifest_dir).unwrap();
+
+        assert_eq!(root, temp.path().canonicalize().unwrap());
+        assert!(!root
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir)));
+    }
 
     #[test]
     fn phase_one_allowlist_is_exact() {
