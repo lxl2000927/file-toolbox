@@ -166,8 +166,12 @@ ehthumbs.db
 Thumbs.db
 
 # Virtual environment
+.venv/
 venv/
 env/
+
+# Local Git worktrees
+.worktrees/
 
 # Project specific
 *.db
