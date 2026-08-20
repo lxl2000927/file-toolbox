@@ -9,7 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 
 pub const MAX_AUTHORIZED_PATHS: usize = 12_000;
 pub const MAX_GENERIC_INPUT_FILE_SIZE: u64 = 500 * 1024 * 1024;
-pub const MAX_INPUT_PDF_FILE_SIZE: u64 = 1 * 1024 * 1024 * 1024;
+pub const MAX_INPUT_PDF_FILE_SIZE: u64 = 1024_u64.pow(3);
 pub const MAX_REFERENCE_IMAGE_FILE_SIZE: u64 = 15 * 1024 * 1024;
 
 #[derive(Clone)]

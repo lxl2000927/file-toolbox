@@ -124,18 +124,18 @@ py -3.14 -m venv .venv
 & '.\.venv\Scripts\python.exe' -m pip install -r requirements.txt
 Set-Location electron-app
 npm ci
-npm run tauri:dev
 npm run tauri:engine
 npm run tauri:engine:smoke
+npm run tauri:dev
 npm run tauri:build:debug
 npm run tauri:package:nsis
 ```
 
 2026-08-20 的 Windows x64 实测产物大小如下：
 
-- 扫描拆分 Python 引擎 `engine/dist-tauri/engine.exe`：**82,438,870 bytes**（78.619833 MiB）。
+- 扫描拆分 Python 引擎 `engine/dist-tauri/engine.exe`：**82,439,578 bytes**（78.620508 MiB）。
 - Tauri release 应用 `electron-app/src-tauri/target/release/app.exe`：**10,011,648 bytes**（9.547852 MiB）。
-- NSIS 安装程序 `electron-app/src-tauri/target/release/bundle/nsis/File Toolbox_2.5.0_x64-setup.exe`：**84,450,485 bytes**（80.538259 MiB）。
+- NSIS 安装程序 `electron-app/src-tauri/target/release/bundle/nsis/File Toolbox_2.5.0_x64-setup.exe`：**84,449,349 bytes**（80.537175 MiB）。
 
 ## 验证命令
 
