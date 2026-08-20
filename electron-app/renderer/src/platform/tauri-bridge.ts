@@ -14,7 +14,7 @@ import type {
 import type { FileAccessResult, FilePathStat } from "../../../shared/ipc-types";
 import {
   electronCapabilities,
-  tauriPhaseTwoCapabilities,
+  tauriPhaseThreeCapabilities,
 } from "./runtime";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -118,10 +118,37 @@ export function createTauriBridge(deps: {
         ),
     },
     scanSplit: {
-      previewReference: () => notMigratedError(),
-      probePage: () => notMigratedError(),
-      scanOnly: () => notMigratedError(),
-      executeAsync: () => notMigratedError(),
+      previewReference: (referenceImagePath, opts) =>
+        engineCall("scan_split.preview_reference", {
+          reference_image_path: referenceImagePath,
+          nfeatures: opts?.nfeatures,
+          roi: opts?.roi,
+        }),
+      probePage: (params) =>
+        engineCall("scan_split.probe_page", {
+          pdf_path: params.pdfPath,
+          reference_image_path: params.referenceImagePath,
+          options: params.options,
+          page_index: params.pageIndex,
+          task_id: params.taskId,
+        }),
+      scanOnly: (params) =>
+        engineCall("scan_split.scan_only", {
+          pdf_path: params.pdfPath,
+          reference_image_path: params.referenceImagePath,
+          options: params.options,
+          page_limit: params.pageLimit,
+          task_id: params.taskId,
+        }),
+      executeAsync: (params) =>
+        engineCall("scan_split.execute_async", {
+          pdf_path: params.pdfPath,
+          reference_image_path: params.referenceImagePath,
+          output_dir: params.outputDir ?? "",
+          prefix: params.prefix ?? "",
+          options: params.options,
+          task_id: params.taskId,
+        }),
     },
     cancelTask: (taskId) =>
       engineCall<{ cancelled: boolean; task_id: string }>("task.cancel", { task_id: taskId }),
@@ -192,5 +219,5 @@ export async function installDesktopBridge(): Promise<void> {
   });
   window.engine = bridge.engine;
   window.electronAPI = bridge.electron;
-  window.desktopRuntime = { kind: "tauri", capabilities: tauriPhaseTwoCapabilities };
+  window.desktopRuntime = { kind: "tauri", capabilities: tauriPhaseThreeCapabilities };
 }

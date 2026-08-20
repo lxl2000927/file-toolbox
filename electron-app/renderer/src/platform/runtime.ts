@@ -14,10 +14,10 @@ export const electronCapabilities: DesktopCapabilities = {
   update: true,
 };
 
-export const tauriPhaseTwoCapabilities: DesktopCapabilities = {
+export const tauriPhaseThreeCapabilities: DesktopCapabilities = {
   rename: true,
   pdfSplit: true,
-  scanSplit: false,
+  scanSplit: true,
   update: false,
 };
 

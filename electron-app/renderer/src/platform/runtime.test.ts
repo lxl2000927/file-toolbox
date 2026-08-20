@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { panelIsEnabled, sanitizePanel, tauriPhaseTwoCapabilities } from "./runtime";
+import { panelIsEnabled, sanitizePanel, tauriPhaseThreeCapabilities } from "./runtime";
 
-describe("phase-two capabilities", () => {
-  it("enables rename and ordinary PDF split only", () => {
-    expect(panelIsEnabled("rename", tauriPhaseTwoCapabilities)).toBe(true);
-    expect(panelIsEnabled("pdf_split", tauriPhaseTwoCapabilities)).toBe(true);
-    expect(panelIsEnabled("scan_split", tauriPhaseTwoCapabilities)).toBe(false);
-    expect(panelIsEnabled("about", tauriPhaseTwoCapabilities)).toBe(true);
+describe("phase-three capabilities", () => {
+  it("enables rename, ordinary PDF split, and scan split without updates", () => {
+    expect(panelIsEnabled("rename", tauriPhaseThreeCapabilities)).toBe(true);
+    expect(panelIsEnabled("pdf_split", tauriPhaseThreeCapabilities)).toBe(true);
+    expect(panelIsEnabled("scan_split", tauriPhaseThreeCapabilities)).toBe(true);
+    expect(panelIsEnabled("about", tauriPhaseThreeCapabilities)).toBe(true);
   });
 
-  it("keeps an available saved PDF panel", () => {
-    expect(sanitizePanel("pdf_split", tauriPhaseTwoCapabilities)).toBe("pdf_split");
-    expect(sanitizePanel("scan_split", tauriPhaseTwoCapabilities)).toBe("rename");
+  it("keeps available saved PDF and scan panels", () => {
+    expect(sanitizePanel("pdf_split", tauriPhaseThreeCapabilities)).toBe("pdf_split");
+    expect(sanitizePanel("scan_split", tauriPhaseThreeCapabilities)).toBe("scan_split");
   });
 });

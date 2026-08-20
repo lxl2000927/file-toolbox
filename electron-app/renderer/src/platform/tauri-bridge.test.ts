@@ -5,7 +5,7 @@ import {
 } from "./tauri-bridge";
 import {
   electronCapabilities,
-  tauriPhaseTwoCapabilities,
+  tauriPhaseThreeCapabilities,
 } from "./runtime";
 
 const tauriCore = vi.hoisted(() => ({
@@ -176,32 +176,80 @@ describe("Tauri compatibility bridge", () => {
     expect(unlisten).toHaveBeenCalledOnce();
   });
 
-  it("rejects every unsupported engine operation with NOT_MIGRATED", async () => {
-    const bridge = createTauriBridge({ invoke: vi.fn(), listen: vi.fn() });
-    const calls = [
-      bridge.engine.scanSplit.previewReference("reference.png"),
-      bridge.engine.scanSplit.probePage({
-        pdfPath: "a.pdf",
-        referenceImagePath: "reference.png",
-        options: {},
-        pageIndex: 0,
-      }),
-      bridge.engine.scanSplit.scanOnly({
-        pdfPath: "a.pdf",
-        referenceImagePath: "reference.png",
-        options: {},
-        pageLimit: 1,
-      }),
-      bridge.engine.scanSplit.executeAsync({
-        pdfPath: "a.pdf",
-        referenceImagePath: "reference.png",
-        options: {},
-      }),
-    ];
+  it("translates scan split calls exactly", async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    const bridge = createTauriBridge({ invoke, listen: vi.fn() });
+    const options = { detection_mode: "feature" as const, dpi: 220 };
+    const roi: [number, number, number, number] = [10, 20, 30, 40];
 
-    for (const call of calls) {
-      await expect(call).rejects.toEqual(notMigrated);
-    }
+    await bridge.engine.scanSplit.previewReference("reference.png", {
+      nfeatures: 123,
+      roi,
+    });
+    await bridge.engine.scanSplit.probePage({
+      pdfPath: "a.pdf",
+      referenceImagePath: "reference.png",
+      options,
+      pageIndex: 4,
+      taskId: "probe-task",
+    });
+    await bridge.engine.scanSplit.scanOnly({
+      pdfPath: "a.pdf",
+      referenceImagePath: "reference.png",
+      options,
+      pageLimit: 7,
+      taskId: "scan-task",
+    });
+    await bridge.engine.scanSplit.executeAsync({
+      pdfPath: "a.pdf",
+      referenceImagePath: "reference.png",
+      outputDir: "C:\\out",
+      prefix: "scan-",
+      options,
+      taskId: "execute-task",
+    });
+
+    expect(invoke.mock.calls).toEqual([
+      ["engine_call", {
+        method: "scan_split.preview_reference",
+        params: {
+          reference_image_path: "reference.png",
+          nfeatures: 123,
+          roi,
+        },
+      }],
+      ["engine_call", {
+        method: "scan_split.probe_page",
+        params: {
+          pdf_path: "a.pdf",
+          reference_image_path: "reference.png",
+          options,
+          page_index: 4,
+          task_id: "probe-task",
+        },
+      }],
+      ["engine_call", {
+        method: "scan_split.scan_only",
+        params: {
+          pdf_path: "a.pdf",
+          reference_image_path: "reference.png",
+          options,
+          page_limit: 7,
+          task_id: "scan-task",
+        },
+      }],
+      ["engine_call", {
+        method: "scan_split.execute_async",
+        params: {
+          pdf_path: "a.pdf",
+          reference_image_path: "reference.png",
+          output_dir: "C:\\out",
+          prefix: "scan-",
+          options,
+          task_id: "execute-task",
+        },
+      }],
+    ]);
   });
 
   it("returns non-throwing history fallbacks", async () => {
@@ -293,7 +341,7 @@ describe("desktop bridge installation", () => {
     expect(tauriEvent.listen).not.toHaveBeenCalled();
   });
 
-  it("installs injected Tauri APIs and phase-two capabilities in Tauri", async () => {
+  it("installs injected Tauri APIs and phase-three capabilities in Tauri", async () => {
     tauriCore.isTauri.mockReturnValue(true);
     tauriCore.invoke.mockResolvedValue({ pong: true });
     tauriEvent.listen.mockResolvedValue(vi.fn());
@@ -308,7 +356,7 @@ describe("desktop bridge installation", () => {
     expect(window.electronAPI).toBeDefined();
     expect(window.desktopRuntime).toEqual({
       kind: "tauri",
-      capabilities: tauriPhaseTwoCapabilities,
+      capabilities: tauriPhaseThreeCapabilities,
     });
   });
 });
