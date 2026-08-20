@@ -1,4 +1,4 @@
-use crate::commands::files::{validate_rename_params, FileState, PathAuthorizer};
+use crate::commands::files::{validate_engine_params, FileState, PathAuthorizer};
 use crate::engine::{
     error::DesktopError,
     manager::{EngineConfig, EngineEventSink, EngineManager, EngineNotification, EngineStatus},
@@ -26,15 +26,23 @@ pub struct EngineStatusResponse {
 pub fn is_allowed_method(method: &str) -> bool {
     matches!(
         method,
-        "ping" | "rename.preview" | "rename.execute" | "rename.undo"
+        "ping"
+            | "rename.preview"
+            | "rename.execute"
+            | "rename.undo"
+            | "pdf_split.validate"
+            | "pdf_split.preview"
+            | "pdf_split.preview_many"
+            | "pdf_split.execute_async"
+            | "task.cancel"
     )
 }
 
 pub fn method_timeout(method: &str) -> Duration {
-    if method == "rename.execute" {
-        Duration::from_secs(300)
-    } else {
-        Duration::from_secs(120)
+    match method {
+        "task.cancel" => Duration::from_secs(10),
+        "rename.execute" => Duration::from_secs(300),
+        _ => Duration::from_secs(120),
     }
 }
 
@@ -177,7 +185,7 @@ pub async fn engine_call(
     if !is_allowed_method(&method) {
         return Err(DesktopError::new("METHOD_NOT_ALLOWED", "引擎方法未获允许"));
     }
-    validate_rename_params(&method, &params, &files.paths)?;
+    validate_engine_params(&method, &params, &files.paths)?;
     let result = state
         .engine
         .call(&method, params, method_timeout(&method))
@@ -235,24 +243,39 @@ mod tests {
     }
 
     #[test]
-    fn phase_one_allowlist_is_exact() {
-        for method in ["ping", "rename.preview", "rename.execute", "rename.undo"] {
-            assert!(is_allowed_method(method));
+    fn phase_two_allowlist_is_exact() {
+        for method in [
+            "ping",
+            "rename.preview",
+            "rename.execute",
+            "rename.undo",
+            "pdf_split.validate",
+            "pdf_split.preview",
+            "pdf_split.preview_many",
+            "pdf_split.execute_async",
+            "task.cancel",
+        ] {
+            assert!(is_allowed_method(method), "{method}");
         }
         for method in [
-            "shutdown",
-            "pdf_split.preview",
+            "pdf_split.execute",
             "scan_split.execute_async",
-            "history.clear",
+            "scan_split.preview_reference",
+            "history.get",
+            "shutdown",
         ] {
             assert!(!is_allowed_method(method));
         }
     }
 
     #[test]
-    fn rename_execute_uses_long_timeout() {
+    fn task_cancel_uses_short_timeout() {
+        assert_eq!(method_timeout("task.cancel"), Duration::from_secs(10));
+        assert_eq!(
+            method_timeout("pdf_split.execute_async"),
+            Duration::from_secs(120)
+        );
         assert_eq!(method_timeout("rename.execute"), Duration::from_secs(300));
-        assert_eq!(method_timeout("ping"), Duration::from_secs(120));
     }
 
     #[test]

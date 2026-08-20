@@ -9,6 +9,7 @@ use tauri_plugin_dialog::DialogExt;
 
 pub const MAX_AUTHORIZED_PATHS: usize = 12_000;
 pub const MAX_GENERIC_INPUT_FILE_SIZE: u64 = 500 * 1024 * 1024;
+pub const MAX_INPUT_PDF_FILE_SIZE: u64 = 200 * 1024 * 1024;
 
 #[derive(Clone)]
 enum AuthorizedPathKind {
@@ -178,6 +179,101 @@ pub fn validate_rename_params(
         return Err(DesktopError::new("PATH_NOT_AUTHORIZED", "输出目录格式无效"));
     }
     Ok(())
+}
+
+pub fn validate_engine_params(
+    method: &str,
+    params: &serde_json::Value,
+    authorizer: &PathAuthorizer,
+) -> Result<(), DesktopError> {
+    validate_rename_params(method, params, authorizer)?;
+    validate_pdf_split_params(method, params, authorizer)
+}
+
+fn validate_pdf_split_params(
+    method: &str,
+    params: &serde_json::Value,
+    authorizer: &PathAuthorizer,
+) -> Result<(), DesktopError> {
+    let pdf_paths = match method {
+        "pdf_split.validate" | "pdf_split.preview" => {
+            vec![required_string(params, "pdf_path")?]
+        }
+        "pdf_split.preview_many" | "pdf_split.execute_async" => {
+            required_string_array(params, "pdf_paths")?
+        }
+        _ => return Ok(()),
+    };
+
+    for path in pdf_paths {
+        validate_authorized_pdf(Path::new(&path), authorizer)?;
+    }
+
+    if let Some(config) = params.get("config") {
+        let config = config
+            .as_object()
+            .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "配置格式无效"))?;
+        if let Some(output_dir) = config.get("output_dir") {
+            let output_dir = output_dir
+                .as_str()
+                .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "输出目录格式无效"))?;
+            if !output_dir.trim().is_empty() {
+                validate_authorized_directory(Path::new(output_dir), authorizer)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn required_string(params: &serde_json::Value, key: &str) -> Result<String, DesktopError> {
+    params
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "文件路径格式无效"))
+}
+
+fn required_string_array(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Vec<String>, DesktopError> {
+    let values = params
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .filter(|values| !values.is_empty())
+        .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "文件列表格式无效"))?;
+
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|path| !path.trim().is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "文件路径格式无效"))
+        })
+        .collect()
+}
+
+fn validate_authorized_pdf(
+    path: &Path,
+    authorizer: &PathAuthorizer,
+) -> Result<PathBuf, DesktopError> {
+    let canonical = validate_authorized_file(path, authorizer)?;
+    let extension_is_pdf = canonical
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+    let metadata = fs::metadata(&canonical).map_err(|error| path_io_error(&canonical, error))?;
+    if !extension_is_pdf || metadata.len() > MAX_INPUT_PDF_FILE_SIZE {
+        return Err(DesktopError::new(
+            "PATH_NOT_AUTHORIZED",
+            "文件不是可处理的 PDF 文件",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn validate_authorized_file(
@@ -618,6 +714,127 @@ mod tests {
         );
 
         assert!(error.is_ok());
+    }
+
+    #[test]
+    fn pdf_validation_accepts_authorized_pdf_and_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.pdf");
+        let output = temp.path().join("out");
+        std::fs::write(&source, b"%PDF-1.4\n").unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let auth = PathAuthorizer::default();
+        auth.authorize_file(&source).unwrap();
+        auth.authorize_directory(&output).unwrap();
+
+        assert!(validate_engine_params(
+            "pdf_split.execute_async",
+            &json!({"pdf_paths":[source],"config":{"output_dir":output}}),
+            &auth,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn pdf_validation_rejects_unauthorized_wrong_type_and_oversized_inputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let unauthorized = temp.path().join("unauthorized.pdf");
+        let wrong_type = temp.path().join("source.txt");
+        let oversized = temp.path().join("large.pdf");
+        std::fs::write(&unauthorized, b"%PDF").unwrap();
+        std::fs::write(&wrong_type, b"%PDF").unwrap();
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_INPUT_PDF_FILE_SIZE + 1)
+            .unwrap();
+        let auth = PathAuthorizer::default();
+        auth.authorize_file(&wrong_type).unwrap();
+        auth.authorize_file(&oversized).unwrap();
+
+        for params in [
+            json!({"pdf_path":unauthorized}),
+            json!({"pdf_path":wrong_type}),
+            json!({"pdf_path":oversized}),
+        ] {
+            assert_eq!(
+                validate_engine_params("pdf_split.validate", &params, &auth)
+                    .unwrap_err()
+                    .code,
+                "PATH_NOT_AUTHORIZED",
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_validation_rejects_empty_lists_and_unauthorized_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.pdf");
+        let output = temp.path().join("out");
+        std::fs::write(&source, b"%PDF").unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let auth = PathAuthorizer::default();
+        auth.authorize_file(&source).unwrap();
+
+        assert_eq!(
+            validate_engine_params(
+                "pdf_split.preview_many",
+                &json!({"pdf_paths":[],"config":{}}),
+                &auth,
+            )
+            .unwrap_err()
+            .code,
+            "PATH_NOT_AUTHORIZED",
+        );
+        assert_eq!(
+            validate_engine_params(
+                "pdf_split.execute_async",
+                &json!({"pdf_paths":[source],"config":{"output_dir":output}}),
+                &auth,
+            )
+            .unwrap_err()
+            .code,
+            "PATH_NOT_AUTHORIZED",
+        );
+    }
+
+    #[test]
+    fn cancel_and_non_path_methods_ignore_filesystem_validation() {
+        let auth = PathAuthorizer::default();
+        assert!(validate_engine_params("task.cancel", &json!({"task_id":"task-1"}), &auth).is_ok());
+        assert!(validate_engine_params("ping", &json!({}), &auth).is_ok());
+    }
+
+    #[test]
+    fn pdf_validation_accepts_empty_output_directory_and_rejects_malformed_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.pdf");
+        let directory_source = temp.path().join("directory.pdf");
+        std::fs::write(&source, b"%PDF").unwrap();
+        std::fs::create_dir(&directory_source).unwrap();
+        let auth = PathAuthorizer::default();
+        auth.authorize_file(&source).unwrap();
+        auth.authorize_directory(&directory_source).unwrap();
+
+        assert!(validate_engine_params(
+            "pdf_split.preview",
+            &json!({"pdf_path":source,"config":{"output_dir":""}}),
+            &auth,
+        )
+        .is_ok());
+
+        for params in [
+            json!({"pdf_path":directory_source}),
+            json!({"pdf_path":42}),
+            json!({"pdf_path":source,"config":[]}),
+            json!({"pdf_path":source,"config":{"output_dir":42}}),
+        ] {
+            assert_eq!(
+                validate_engine_params("pdf_split.preview", &params, &auth)
+                    .unwrap_err()
+                    .code,
+                "PATH_NOT_AUTHORIZED",
+            );
+        }
     }
 
     #[test]
