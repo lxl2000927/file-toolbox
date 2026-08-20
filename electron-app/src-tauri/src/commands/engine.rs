@@ -34,6 +34,10 @@ pub fn is_allowed_method(method: &str) -> bool {
             | "pdf_split.preview"
             | "pdf_split.preview_many"
             | "pdf_split.execute_async"
+            | "scan_split.preview_reference"
+            | "scan_split.probe_page"
+            | "scan_split.scan_only"
+            | "scan_split.execute_async"
             | "task.cancel"
     )
 }
@@ -253,15 +257,18 @@ mod tests {
             "pdf_split.preview",
             "pdf_split.preview_many",
             "pdf_split.execute_async",
+            "scan_split.preview_reference",
+            "scan_split.probe_page",
+            "scan_split.scan_only",
+            "scan_split.execute_async",
             "task.cancel",
         ] {
             assert!(is_allowed_method(method), "{method}");
         }
         for method in [
             "pdf_split.execute",
-            "scan_split.execute_async",
-            "scan_split.preview_reference",
             "history.get",
+            "history.clear",
             "shutdown",
         ] {
             assert!(!is_allowed_method(method));
@@ -273,6 +280,10 @@ mod tests {
         assert_eq!(method_timeout("task.cancel"), Duration::from_secs(10));
         assert_eq!(
             method_timeout("pdf_split.execute_async"),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            method_timeout("scan_split.execute_async"),
             Duration::from_secs(120)
         );
         assert_eq!(method_timeout("rename.execute"), Duration::from_secs(300));
