@@ -5,7 +5,7 @@ import {
 } from "./tauri-bridge";
 import {
   electronCapabilities,
-  tauriPhaseOneCapabilities,
+  tauriPhaseTwoCapabilities,
 } from "./runtime";
 
 const tauriCore = vi.hoisted(() => ({
@@ -87,6 +87,26 @@ describe("Tauri compatibility bridge", () => {
     });
   });
 
+  it("translates PDF split and cancellation calls exactly", async () => {
+    const invoke = vi.fn().mockResolvedValue({});
+    const bridge = createTauriBridge({ invoke, listen: vi.fn() });
+    const config = { mode: "by_page_count" as const, page_count: 2, output_dir: "C:\\out" };
+
+    await bridge.engine.pdfSplit.validate("C:\\a.pdf");
+    await bridge.engine.pdfSplit.preview("C:\\a.pdf", config);
+    await bridge.engine.pdfSplit.previewMany(["C:\\a.pdf"], config);
+    await bridge.engine.pdfSplit.executeAsync(["C:\\a.pdf"], config, "pdf-task-1");
+    await bridge.engine.cancelTask("pdf-task-1");
+
+    expect(invoke.mock.calls).toEqual([
+      ["engine_call", { method: "pdf_split.validate", params: { pdf_path: "C:\\a.pdf" } }],
+      ["engine_call", { method: "pdf_split.preview", params: { pdf_path: "C:\\a.pdf", config } }],
+      ["engine_call", { method: "pdf_split.preview_many", params: { pdf_paths: ["C:\\a.pdf"], config } }],
+      ["engine_call", { method: "pdf_split.execute_async", params: { pdf_paths: ["C:\\a.pdf"], config, task_id: "pdf-task-1" } }],
+      ["engine_call", { method: "task.cancel", params: { task_id: "pdf-task-1" } }],
+    ]);
+  });
+
   it("maps file commands and restart to their Rust parameter shapes", async () => {
     const invoke = vi.fn().mockResolvedValue([]);
     const bridge = createTauriBridge({ invoke, listen: vi.fn() });
@@ -159,10 +179,6 @@ describe("Tauri compatibility bridge", () => {
   it("rejects every unsupported engine operation with NOT_MIGRATED", async () => {
     const bridge = createTauriBridge({ invoke: vi.fn(), listen: vi.fn() });
     const calls = [
-      bridge.engine.pdfSplit.validate("a.pdf"),
-      bridge.engine.pdfSplit.preview("a.pdf", { mode: "by_page_count" }),
-      bridge.engine.pdfSplit.previewMany(["a.pdf"], { mode: "by_page_count" }),
-      bridge.engine.pdfSplit.executeAsync(["a.pdf"], { mode: "by_page_count" }),
       bridge.engine.scanSplit.previewReference("reference.png"),
       bridge.engine.scanSplit.probePage({
         pdfPath: "a.pdf",
@@ -181,7 +197,6 @@ describe("Tauri compatibility bridge", () => {
         referenceImagePath: "reference.png",
         options: {},
       }),
-      bridge.engine.cancelTask("task-1"),
     ];
 
     for (const call of calls) {
@@ -278,7 +293,7 @@ describe("desktop bridge installation", () => {
     expect(tauriEvent.listen).not.toHaveBeenCalled();
   });
 
-  it("installs injected Tauri APIs and phase-one capabilities in Tauri", async () => {
+  it("installs injected Tauri APIs and phase-two capabilities in Tauri", async () => {
     tauriCore.isTauri.mockReturnValue(true);
     tauriCore.invoke.mockResolvedValue({ pong: true });
     tauriEvent.listen.mockResolvedValue(vi.fn());
@@ -293,7 +308,7 @@ describe("desktop bridge installation", () => {
     expect(window.electronAPI).toBeDefined();
     expect(window.desktopRuntime).toEqual({
       kind: "tauri",
-      capabilities: tauriPhaseOneCapabilities,
+      capabilities: tauriPhaseTwoCapabilities,
     });
   });
 });

@@ -4,6 +4,9 @@ import type {
   EngineAPI,
   EngineNotificationPayload,
   ExecuteSummary,
+  PdfSplitConfig,
+  PdfSplitPlan,
+  PdfSplitPreviewMany,
   RenamePreviewItem,
   RenameRule,
   UndoResult,
@@ -11,7 +14,7 @@ import type {
 import type { FileAccessResult, FilePathStat } from "../../../shared/ipc-types";
 import {
   electronCapabilities,
-  tauriPhaseOneCapabilities,
+  tauriPhaseTwoCapabilities,
 } from "./runtime";
 
 type InvokeFn = <T>(command: string, args?: Record<string, unknown>) => Promise<T>;
@@ -95,10 +98,24 @@ export function createTauriBridge(deps: {
         engineCall<UndoResult>("rename.undo", { undo_token: undoToken }),
     },
     pdfSplit: {
-      validate: () => notMigratedError(),
-      preview: () => notMigratedError(),
-      previewMany: () => notMigratedError(),
-      executeAsync: () => notMigratedError(),
+      validate: (pdfPath) =>
+        engineCall<{ valid: boolean; message: string; page_count: number | null }>(
+          "pdf_split.validate",
+          { pdf_path: pdfPath },
+        ),
+      preview: (pdfPath, config: PdfSplitConfig) =>
+        engineCall<PdfSplitPlan>("pdf_split.preview", { pdf_path: pdfPath, config }),
+      previewMany: (pdfPaths, config: PdfSplitConfig) =>
+        engineCall<PdfSplitPreviewMany>("pdf_split.preview_many", { pdf_paths: pdfPaths, config }),
+      executeAsync: (pdfPaths, config: PdfSplitConfig, taskId) =>
+        engineCall<{ task_id: string; queued?: boolean; position?: number }>(
+          "pdf_split.execute_async",
+          {
+            pdf_paths: pdfPaths,
+            config,
+            task_id: taskId,
+          },
+        ),
     },
     scanSplit: {
       previewReference: () => notMigratedError(),
@@ -106,7 +123,8 @@ export function createTauriBridge(deps: {
       scanOnly: () => notMigratedError(),
       executeAsync: () => notMigratedError(),
     },
-    cancelTask: () => notMigratedError(),
+    cancelTask: (taskId) =>
+      engineCall<{ cancelled: boolean; task_id: string }>("task.cancel", { task_id: taskId }),
     history: {
       get: async () => ({ records: [], session_id: "" }),
       clear: async () => ({
@@ -174,5 +192,5 @@ export async function installDesktopBridge(): Promise<void> {
   });
   window.engine = bridge.engine;
   window.electronAPI = bridge.electron;
-  window.desktopRuntime = { kind: "tauri", capabilities: tauriPhaseOneCapabilities };
+  window.desktopRuntime = { kind: "tauri", capabilities: tauriPhaseTwoCapabilities };
 }

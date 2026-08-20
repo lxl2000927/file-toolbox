@@ -14,9 +14,9 @@ export const electronCapabilities: DesktopCapabilities = {
   update: true,
 };
 
-export const tauriPhaseOneCapabilities: DesktopCapabilities = {
+export const tauriPhaseTwoCapabilities: DesktopCapabilities = {
   rename: true,
-  pdfSplit: false,
+  pdfSplit: true,
   scanSplit: false,
   update: false,
 };
