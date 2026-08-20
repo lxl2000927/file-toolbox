@@ -133,9 +133,9 @@ npm run tauri:package:nsis
 
 2026-08-20 的 Windows x64 实测产物大小如下：
 
-- 扫描拆分 Python 引擎 `engine/dist-tauri/engine.exe`：**82,439,578 bytes**（78.620508 MiB）。
+- 扫描拆分 Python 引擎 `engine/dist-tauri/engine.exe`：**82,439,450 bytes**（78.620386 MiB）。
 - Tauri release 应用 `electron-app/src-tauri/target/release/app.exe`：**10,011,648 bytes**（9.547852 MiB）。
-- NSIS 安装程序 `electron-app/src-tauri/target/release/bundle/nsis/File Toolbox_2.5.0_x64-setup.exe`：**84,449,349 bytes**（80.537175 MiB）。
+- NSIS 安装程序 `electron-app/src-tauri/target/release/bundle/nsis/File Toolbox_2.5.0_x64-setup.exe`：**84,451,236 bytes**（80.538975 MiB）。
 
 ## 验证命令
 
