@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onBeforeUnmount, onMounted } from "vue";
 import type { PdfSplitConfig, PdfSplitMode, PdfSplitPlan, ExecuteSummary } from "../../env";
 import { useEngineTask, generateTaskId } from "../../composables/useEngineTask";
 import { useToast } from "../../composables/useToast";
@@ -33,13 +33,23 @@ const previewing = ref(false);
 let previewToken = 0;
 const previewTimer = ref<number | null>(null);
 const composing = ref(false);
+let unsubscribeNativeDrop: (() => void) | null = null;
 
 onBeforeUnmount(() => {
+  unsubscribeNativeDrop?.();
+  unsubscribeNativeDrop = null;
   previewToken++;
   if (previewTimer.value !== null) {
     window.clearTimeout(previewTimer.value);
     previewTimer.value = null;
   }
+});
+
+onMounted(() => {
+  unsubscribeNativeDrop = window.electronAPI?.onFileDrop?.((paths) => {
+    const pdfPaths = Array.from(new Set(paths.filter((path) => /\.pdf$/i.test(path))));
+    if (pdfPaths.length) void appendFiles(pdfPaths);
+  }) ?? null;
 });
 
 function schedulePreview() {
