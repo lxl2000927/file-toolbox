@@ -103,6 +103,39 @@ def _drain(stream: TextIO | None) -> None:
             pass
 
 
+def cleanup_process(process: subprocess.Popen[str] | None) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+                try:
+                    process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    finally:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+
 def _engine_path() -> Path:
     if len(sys.argv) != 2:
         raise SystemExit("usage: smoke_tauri_engine.py <engine.exe>")
@@ -167,9 +200,7 @@ def main() -> None:
                 "page_count": 1,
             }, separators=(",", ":")))
     finally:
-        if process is not None and process.poll() is None:
-            process.terminate()
-            process.wait(timeout=SHUTDOWN_TIMEOUT_SECONDS)
+        cleanup_process(process)
 
 
 if __name__ == "__main__":
