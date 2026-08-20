@@ -194,3 +194,6 @@ engine/build/
 engine/dist/
 engine/*.spec
 !engine/engine.spec
+!engine/engine-tauri.spec
+engine/dist-tauri/
+engine/build-tauri/

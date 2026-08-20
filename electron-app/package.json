@@ -22,7 +22,9 @@
     "test:renderer": "vitest run",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build:debug": "tauri build --debug --no-bundle"
+    "tauri:build:debug": "tauri build --debug --no-bundle",
+    "tauri:engine": "..\\.venv\\Scripts\\python.exe -m PyInstaller ..\\engine\\engine-tauri.spec --clean --noconfirm --distpath ..\\engine\\dist-tauri --workpath ..\\engine\\build-tauri",
+    "tauri:engine:smoke": "..\\.venv\\Scripts\\python.exe ..\\engine\\smoke_tauri_engine.py ..\\engine\\dist-tauri\\engine.exe"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.4",
