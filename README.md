@@ -111,11 +111,13 @@ npm run dev
 
 开发模式下，Electron 主进程会通过 Python 解释器启动 `engine/server.py`，并通过 stdio JSON-RPC 与 Python 引擎通信。
 
-### 实验性 Tauri 第一阶段（仅 Windows、仅重命名）
+### 实验性 Tauri 第三阶段（Windows、重命名 + 普通 PDF 拆分 + 扫描拆分）
 
-Tauri 工作流目前仅用于实验性第一阶段：仅支持 Windows，且仅迁移了批量重命名流程。PDF 拆分、扫描拆分、更新和发布安装包仍不在该流程范围内；上面的 Electron 开发与构建说明保持不变，仍是完整功能的开发路径。
+Tauri 工作流目前仅用于实验性第三阶段：仅支持 Windows，支持批量重命名、普通 PDF 拆分和扫描拆分。更新器、签名和非 Windows 目标仍不在该流程范围内；上面的 Electron 开发与构建说明保持不变，仍是完整功能的开发路径。
 
-从仓库根目录创建环境并运行 Tauri：
+普通 PDF 和扫描 PDF 输入都会在到达 Python 引擎前显式授权，且都限制为 **1 GiB**；扫描拆分的参考图像仍限制为 **15 MiB**，参考 PDF 使用同一 **1 GiB** PDF 限制。
+
+从仓库根目录创建环境后运行 Tauri：
 
 ```powershell
 py -3.14 -m venv .venv
@@ -123,10 +125,17 @@ py -3.14 -m venv .venv
 Set-Location electron-app
 npm ci
 npm run tauri:dev
+npm run tauri:engine
+npm run tauri:engine:smoke
 npm run tauri:build:debug
+npm run tauri:package:nsis
 ```
 
-首次 Windows 调试构建基线为 `electron-app/src-tauri/target/debug/app.exe` 的 **14,116,352 bytes**。这是未打包的调试可执行文件大小，不是安装程序或最终发行包大小。
+2026-08-20 的 Windows x64 实测产物大小如下：
+
+- 扫描拆分 Python 引擎 `engine/dist-tauri/engine.exe`：**82,438,870 bytes**（78.619833 MiB）。
+- Tauri release 应用 `electron-app/src-tauri/target/release/app.exe`：**10,011,648 bytes**（9.547852 MiB）。
+- NSIS 安装程序 `electron-app/src-tauri/target/release/bundle/nsis/File Toolbox_2.5.0_x64-setup.exe`：**84,450,485 bytes**（80.538259 MiB）。
 
 ## 验证命令
 
