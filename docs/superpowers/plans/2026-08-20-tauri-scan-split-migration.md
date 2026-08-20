@@ -531,7 +531,7 @@ git commit -m "build: package Tauri scan split engine"
 Run from the worktree root and electron-app:
 
 ~~~powershell
-..\.venv\Scripts\python.exe -m pytest
+.\.venv\Scripts\python.exe -m pytest
 npm run test:renderer
 npm run typecheck
 npm run build
