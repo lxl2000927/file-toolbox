@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(SPECPATH).resolve()))
-from tauri_package_profile import EXCLUDES, HIDDEN_IMPORTS, NATIVE_BINARIES
+from tauri_package_profile import EXCLUDES, HIDDEN_IMPORTS, NATIVE_BINARIES, PYMUPDF_RUNTIME_HOOK
 
 
 engine_dir = Path(SPECPATH).resolve()
@@ -16,7 +16,7 @@ a = Analysis(
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(PYMUPDF_RUNTIME_HOOK)],
     excludes=EXCLUDES,
     noarchive=False,
     optimize=0,

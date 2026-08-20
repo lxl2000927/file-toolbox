@@ -1,4 +1,9 @@
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_dynamic_libs, collect_submodules
+
+
+PYMUPDF_RUNTIME_HOOK = Path(__file__).with_name("pyi_rth_pymupdf_stdio.py")
 
 
 HIDDEN_IMPORTS = [

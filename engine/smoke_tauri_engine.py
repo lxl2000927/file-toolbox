@@ -15,8 +15,8 @@ from pathlib import Path
 from typing import Any, TextIO
 
 import cv2
-import fitz
 import numpy as np
+import pymupdf as fitz
 import zxingcpp
 from pypdf import PdfWriter
 

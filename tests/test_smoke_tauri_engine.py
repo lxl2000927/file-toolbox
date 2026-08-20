@@ -1,8 +1,9 @@
 import io
 import queue
 import subprocess
+from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 import pytest
 
 from engine.smoke_tauri_engine import EngineProtocol, _create_scan_fixture, cleanup_process
@@ -100,3 +101,10 @@ def test_create_scan_fixture_generates_qr_and_four_page_pdf(tmp_path):
     assert output_directory.is_dir()
     with fitz.open(pdf_path) as document:
         assert len(document) == 4
+
+
+def test_smoke_fixture_uses_pymupdf_alias_without_the_deprecated_fitz_import():
+    smoke_source = Path(__file__).parents[1].joinpath("engine", "smoke_tauri_engine.py").read_text(encoding="utf-8")
+
+    assert "import pymupdf as fitz" in smoke_source
+    assert "\nimport fitz\n" not in smoke_source
