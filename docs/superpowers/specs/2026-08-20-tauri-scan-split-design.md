@@ -33,15 +33,16 @@ algorithm remain out of scope.
   than narrowly required protocol or packaging compatibility fixes.
 - Scan PDF inputs must be authorized through the Tauri `PathAuthorizer` before
   reaching the Python engine.
-- Scan PDF inputs use a dedicated 1 GiB boundary instead of the ordinary PDF
-  split 200 MiB boundary. The boundary is a Rust constant and can be changed
-  independently if operational evidence requires a different value.
-- Reference images remain limited to 15 MiB; reference PDFs use the dedicated
-  1 GiB scan-PDF boundary.
+- Ordinary PDF split and scan PDF inputs use the same 1 GiB boundary. The
+  boundary is a shared Rust constant and can be changed independently if
+  operational evidence requires a different value.
+- Reference images remain limited to 15 MiB; reference PDFs use the same 1 GiB
+  PDF boundary.
 - An output directory, when supplied, must be an explicitly authorized
   existing directory. An empty output directory remains valid and preserves
   the current Python default-output behavior.
-- The existing Electron path and behavior must remain unchanged.
+- The existing Electron path and behavior must remain unchanged except that
+  its PDF input boundary is raised from 200 MiB to the same 1 GiB boundary.
 
 ## Architecture
 
@@ -173,4 +174,3 @@ automated gate, the installed scan-inclusive NSIS build passes the focused
 scan smoke test, the existing scan core files are unchanged, the capability
 state exposes scan split, and the documented scope explicitly excludes
 non-Windows, updater, and signing work.
-
