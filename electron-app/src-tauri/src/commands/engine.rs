@@ -1,4 +1,4 @@
-use crate::commands::files::{validate_rename_params, FileState};
+use crate::commands::files::{validate_rename_params, FileState, PathAuthorizer};
 use crate::engine::{
     error::DesktopError,
     manager::{EngineConfig, EngineEventSink, EngineManager, EngineNotification, EngineStatus},
@@ -35,6 +35,33 @@ pub fn method_timeout(method: &str) -> Duration {
         Duration::from_secs(300)
     } else {
         Duration::from_secs(120)
+    }
+}
+
+fn authorize_rename_outputs(method: &str, result: &serde_json::Value, authorizer: &PathAuthorizer) {
+    if method != "rename.execute" {
+        return;
+    }
+    let Some(operations) = result
+        .get("operations")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for operation in operations {
+        if operation
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            continue;
+        }
+        if let Some(path) = operation
+            .get("new_path")
+            .and_then(serde_json::Value::as_str)
+        {
+            let _ = authorizer.authorize_file(path);
+        }
     }
 }
 
@@ -151,10 +178,12 @@ pub async fn engine_call(
         return Err(DesktopError::new("METHOD_NOT_ALLOWED", "引擎方法未获允许"));
     }
     validate_rename_params(&method, &params, &files.paths)?;
-    state
+    let result = state
         .engine
         .call(&method, params, method_timeout(&method))
-        .await
+        .await?;
+    authorize_rename_outputs(&method, &result, &files.paths);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -245,6 +274,24 @@ mod tests {
         assert!(config.args.is_empty());
         assert_eq!(config.cwd, resource_dir);
         assert!(!config.debug_errors);
+    }
+
+    #[test]
+    fn rename_execute_authorizes_successful_output_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let renamed = temp.path().join("renamed.txt");
+        std::fs::write(&renamed, b"renamed").unwrap();
+        let authorizer = crate::commands::files::PathAuthorizer::default();
+        let result = serde_json::json!({
+            "operations": [{
+                "success": true,
+                "new_path": renamed,
+            }]
+        });
+
+        assert!(!authorizer.is_authorized(&renamed));
+        authorize_rename_outputs("rename.execute", &result, &authorizer);
+        assert!(authorizer.is_authorized(&renamed));
     }
 
     #[test]

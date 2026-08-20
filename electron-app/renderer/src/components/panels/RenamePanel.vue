@@ -88,6 +88,13 @@ function compareNaturalNames(a: string, b: string) {
   return 0;
 }
 
+function formatFileSize(size: number | undefined) {
+  if (size === undefined || !Number.isFinite(size) || size < 0) return "";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 const insertionIndex = computed(() => new Map(files.value.map((file, index) => [file, index])));
 
 const sortedFiles = computed(() => {
@@ -591,6 +598,7 @@ async function undo() {
       }
       files.value = files.value.map((p) => restoreMap.get(p) || p);
       selected.value = new Set(files.value);
+      updateFileSizes(files.value, true);
     }
     // failed 的文件保持当前路径不变
     lastOperations.value = [];
@@ -757,6 +765,7 @@ function onColUp() {
                       @change="toggleOne(f, ($event.target as HTMLInputElement).checked)"
                     />
                     <span class="truncate selectable" :title="f" :class="{ 'diff-old': previewMap.get(f) && previewMap.get(f) !== fileBasename(f) }">{{ fileBasename(f) }}</span>
+                    <span v-if="fileSizes.has(f)" class="file-size">{{ formatFileSize(fileSizes.get(f)) }}</span>
                   </label>
                 </td>
                 <td class="col-name truncate selectable" :title="previewMap.get(f) || ''">
@@ -882,6 +891,12 @@ function onColUp() {
   table-layout: fixed;
   width: 100%;
   min-width: calc(var(--col-check-min-width) + var(--col-name-min-width) + var(--col-ops-width));
+}
+.file-size {
+  flex: 0 0 auto;
+  color: var(--color-gray-500);
+  font-size: var(--font-xs);
+  font-variant-numeric: tabular-nums;
 }
 .rename-table .col-check-def {
   width: var(--col-check-width, 300px);
