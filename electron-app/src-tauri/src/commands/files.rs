@@ -217,7 +217,7 @@ fn validate_pdf_split_params(
             let output_dir = output_dir
                 .as_str()
                 .ok_or_else(|| DesktopError::new("PATH_NOT_AUTHORIZED", "输出目录格式无效"))?;
-            if !output_dir.trim().is_empty() {
+            if !output_dir.is_empty() {
                 validate_authorized_directory(Path::new(output_dir), authorizer)?;
             }
         }
@@ -835,6 +835,26 @@ mod tests {
                 "PATH_NOT_AUTHORIZED",
             );
         }
+    }
+
+    #[test]
+    fn pdf_validation_rejects_whitespace_only_output_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.pdf");
+        std::fs::write(&source, b"%PDF").unwrap();
+        let auth = PathAuthorizer::default();
+        auth.authorize_file(&source).unwrap();
+
+        assert_eq!(
+            validate_engine_params(
+                "pdf_split.preview",
+                &json!({"pdf_path":source,"config":{"output_dir":"   "}}),
+                &auth,
+            )
+            .unwrap_err()
+            .code,
+            "PATH_NOT_AUTHORIZED",
+        );
     }
 
     #[test]
