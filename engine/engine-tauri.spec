@@ -2,7 +2,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(SPECPATH).resolve()))
-from tauri_package_profile import EXCLUDES, HIDDEN_IMPORTS
+from tauri_package_profile import EXCLUDES, HIDDEN_IMPORTS, NATIVE_BINARIES
 
 
 engine_dir = Path(SPECPATH).resolve()
@@ -11,7 +11,7 @@ project_root = str(engine_dir.parent)
 a = Analysis(
     [str(engine_dir / "server.py")],
     pathex=[project_root, str(engine_dir)],
-    binaries=[],
+    binaries=NATIVE_BINARIES,
     datas=[],
     hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],

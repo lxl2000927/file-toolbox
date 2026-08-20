@@ -1,9 +1,11 @@
 import io
+import queue
 import subprocess
 
+import fitz
 import pytest
 
-from engine.smoke_tauri_engine import cleanup_process
+from engine.smoke_tauri_engine import EngineProtocol, _create_scan_fixture, cleanup_process
 
 
 class FakeProcess:
@@ -59,3 +61,42 @@ def test_cleanup_process_only_closes_streams_for_already_exited_process():
     assert process.stdin.closed
     assert process.stdout.closed
     assert process.stderr.closed
+
+
+class FakeProtocolProcess:
+    def __init__(self) -> None:
+        self.stdin = io.StringIO()
+
+    def poll(self) -> None:
+        return None
+
+
+def test_wait_for_task_uses_out_of_order_completion_preserved_by_request_backlog():
+    protocol = EngineProtocol.__new__(EngineProtocol)
+    protocol.process = FakeProtocolProcess()
+    protocol.token = "test-token"
+    protocol.next_request_id = 1
+    protocol.messages = queue.Queue()
+    protocol.backlog = []
+    protocol.messages.put({
+        "jsonrpc": "2.0",
+        "method": "task.complete",
+        "params": {"task_id": "probe-1", "ok": True, "result": {"marked": True}},
+    })
+    protocol.messages.put({"jsonrpc": "2.0", "id": 1, "result": {"task_id": "probe-1"}})
+
+    response = protocol.request("scan_split.probe_page", {"pdf_path": "fixture.pdf"})
+    completion = protocol.wait_for_task(response["task_id"])
+
+    assert completion["ok"] is True
+    assert completion["result"]["marked"] is True
+    assert protocol.backlog == []
+
+
+def test_create_scan_fixture_generates_qr_and_four_page_pdf(tmp_path):
+    qr_path, pdf_path, output_directory = _create_scan_fixture(tmp_path)
+
+    assert qr_path.is_file()
+    assert output_directory.is_dir()
+    with fitz.open(pdf_path) as document:
+        assert len(document) == 4
