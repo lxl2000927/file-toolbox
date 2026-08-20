@@ -1,6 +1,6 @@
 # Tauri Scan Split Migration Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (\`- [ ]\`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Enable the existing PDF scan-split workflow in the Windows Tauri application while leaving the Python scan algorithm unchanged and raising the PDF input limit to 1 GiB in both Electron and Tauri.
 
@@ -620,4 +620,3 @@ git commit -m "docs: record Tauri scan split verification"
 - [ ] Debug Tauri scan workflow passes.
 - [ ] Scan-inclusive NSIS workflow passes focused installed-app smoke.
 - [ ] Non-Windows, updater, and signing remain explicitly out of scope.
-
