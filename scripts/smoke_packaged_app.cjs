@@ -12,14 +12,15 @@ const option = (name, fallback) => { const i = args.indexOf(name); return i < 0 
 const executable = path.resolve(option('--exe', path.join(root, 'electron-app/release/win-unpacked/File Toolbox.exe')));
 const expectedType = option('--type', 'archive');
 const report = path.resolve(option('--report', path.join(root, 'acceptance-samples/packaged-app.json')));
-const version = require('../electron-app/package.json').version;
+const version = option('--version', require('../electron-app/package.json').version);
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function main() {
   const server = net.createServer();
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port; await new Promise(resolve => server.close(resolve));
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'toolbox-package-smoke-'));
+  const profile = option('--profile', '') ? path.resolve(option('--profile', '')) : fs.mkdtempSync(path.join(os.tmpdir(), 'toolbox-package-smoke-'));
+  fs.mkdirSync(profile, { recursive: true });
   const environment = { ...process.env, APPDATA: profile, LOCALAPPDATA: profile };
   delete environment.ELECTRON_RUN_AS_NODE; delete environment.NODE_OPTIONS; delete environment.PYTHONPATH; delete environment.PYTHONHOME;
   const child = cp.spawn(executable, [`--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1',
@@ -45,13 +46,13 @@ async function main() {
       if (message.method === 'Runtime.exceptionThrown') failures.push(message.params.exceptionDetails.text);
       if (message.id) { const request = waiting.get(message.id); if (!request) return; waiting.delete(message.id); clearTimeout(request.timer); message.error ? request.reject(Error(JSON.stringify(message.error))) : request.resolve(message.result); }
     });
-    const call = (method, params = {}) => new Promise((resolve, reject) => {
+    const call = (method, params = {}, timeout = 15000) => new Promise((resolve, reject) => {
       const id = ++next;
-      const timer = setTimeout(() => { waiting.delete(id); reject(Error(`DevTools timeout: ${method}`)); }, 15000);
+      const timer = setTimeout(() => { waiting.delete(id); reject(Error(`DevTools timeout: ${method}`)); }, timeout);
       waiting.set(id, { resolve, reject, timer }); socket.send(JSON.stringify({ id, method, params }));
     });
-    const evaluate = async expression => {
-      const result = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
+    const evaluate = async (expression, timeout) => {
+      const result = await call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, timeout);
       if (result.exceptionDetails) throw Error(JSON.stringify(result.exceptionDetails));
       return result.result.value;
     };
@@ -64,7 +65,24 @@ async function main() {
     const status = await evaluate('window.electronAPI.update.getStatus()');
     assert.equal(status.current, version); assert.equal(status.packageType, expectedType);
     assert.equal((await evaluate('window.engine.ping()')).pong, true);
-    for (const name of ['PDF 工作台', '扫描拆分', '普通拆分', '重命名', '设置']) {
+    let publicUpdate = null;
+    if (option('--update-version', '')) {
+      publicUpdate = await evaluate('window.electronAPI.update.check()', 120000);
+      assert.equal(publicUpdate.state, 'available', JSON.stringify(publicUpdate));
+      assert.equal(publicUpdate.latest.replace(/^v/, ''), option('--update-version', ''));
+      if (args.includes('--download-update')) {
+        publicUpdate = await evaluate('window.electronAPI.update.download()', 600000);
+        assert.equal(publicUpdate.state, 'downloaded', JSON.stringify(publicUpdate));
+        assert.equal(publicUpdate.percent, 100);
+      }
+    }
+    if (args.includes('--expect-collapsed')) assert.equal(await evaluate("document.querySelector('.nav-toggle').getAttribute('aria-expanded')"), 'false', 'upgrade must retain the navigation preference');
+    if (args.includes('--set-collapsed') && await evaluate("document.querySelector('.nav-toggle').getAttribute('aria-expanded')") !== 'false') {
+      await evaluate("document.querySelector('.nav-toggle').click()"); await pause(350);
+    }
+    const navigation = ['PDF 工作台', '扫描拆分', '普通拆分', '重命名', '设置'];
+    if (!args.includes('--legacy-navigation')) navigation.push('任务中心');
+    for (const name of navigation) {
       await evaluate(`(() => { const e=[...document.querySelectorAll('.nav-btn')].find(e=>e.textContent.trim()===${JSON.stringify(name)} || e.getAttribute('aria-label')===${JSON.stringify(name)}); if(!e) throw Error('Missing navigation'); e.click(); })()`);
       await pause(450);
       assert.equal(await evaluate("Boolean(document.querySelector('.app-main')) && !document.querySelector('vite-error-overlay')"), true);
@@ -74,8 +92,8 @@ async function main() {
     fs.mkdirSync(path.dirname(report), { recursive: true });
     const capture = await call('Page.captureScreenshot', { format: 'png' });
     fs.writeFileSync(report.replace(/\.json$/, '.png'), Buffer.from(capture.data, 'base64'));
-    fs.writeFileSync(report, JSON.stringify({ passed: true, executable, version, packageType: status.packageType,
-      checks: ['packaged file renderer', 'bundled engine ready and ping', 'version and distribution type', 'all five navigation destinations', 'no horizontal overflow or renderer exceptions'], rendererErrors: failures }, null, 2));
+    fs.writeFileSync(report, JSON.stringify({ passed: true, executable, version, packageType: status.packageType, publicUpdate,
+      checks: ['packaged file renderer', 'bundled engine ready and ping', 'version and distribution type', `${navigation.length} navigation destinations`, 'no horizontal overflow or renderer exceptions', ...(args.includes('--expect-collapsed') ? ['upgrade retains navigation preference'] : [])], rendererErrors: failures }, null, 2));
     console.log(`PASS packaged ${expectedType} ${version}: ${report}`);
     // Browser.close terminates this isolated application, including its engine.
     const browser = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();

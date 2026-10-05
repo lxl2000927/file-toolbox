@@ -7,6 +7,10 @@ import { randomBytes } from "crypto";
 import { execFileSync } from "child_process";
 import { pathToFileURL } from "url";
 import { PythonBridge } from "./python-bridge";
+import { PreviewEngine } from './preview-engine';
+import { WorkspaceStore } from './workspace-store';
+import { captureDocument, captureIdentity, verifyIdentity, relocateDocument, type SavedIdentity } from './restored-access';
+import type { WorkspaceScope, WorkspaceSource } from '../shared/workspace-types';
 import type { FileAccessError, FileAccessErrorCode, FileAccessResult, FilePathStat } from "../shared/ipc-types";
 
 // 进程级未捕获异常处理，避免崩溃时无日志
@@ -53,6 +57,18 @@ let engineStatus: "starting" | "ready" | "error" = "starting";
 let engineError = "";
 let ipcReady = false;
 let startEnginePromise: Promise<void> | null = null;
+let workspaceStore: WorkspaceStore | null = null;
+let allowWindowClose = false, closePending = false;
+const workspaceFlushes = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
+const previewEngine = new PreviewEngine(async () => {
+  const worker = new PythonBridge();
+  const enginePath = isDev ? join(PROJECT_ROOT, 'engine', 'server.py') : join(process.resourcesPath, 'engine', 'engine.exe');
+  try { await worker.start(enginePath, isDev, isDev ? findPython() : 'python', ENGINE_AUTH_TOKEN, { FILE_TOOLBOX_PREVIEW_ENGINE: '1' }); }
+  catch (error) { await worker.shutdown(); throw error; }
+  return worker;
+}, (method, params) => {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('engine:notification', { method, params });
+});
 
 const isDev = !app.isPackaged;
 const PROJECT_ROOT = isDev ? join(__dirname, "../../..") : process.resourcesPath;
@@ -71,6 +87,7 @@ const ENGINE_AUTH_TOKEN = randomBytes(32).toString("hex");
 const ENGINE_METHODS = new Set(["ping", "rename.preview", "rename.execute", "rename.undo", "pdf_split.validate", "pdf_split.preview", "pdf_split.preview_many", "pdf_split.execute_async", "scan_split.execute_async", "scan_split.preview_reference", "scan_split.probe_page", "scan_split.scan_only", "task.cancel", "history.get", "history.clear"]);
 const MAX_SAVE_FILE_CONTENT_SIZE = 20 * 1024 * 1024;
 for (const method of ["pdf_tools.run", "presets.list", "presets.save", "presets.delete"]) ENGINE_METHODS.add(method);
+for (const method of ['tasks.list', 'tasks.retry', 'tasks.reveal', 'task.pause', 'task.resume']) ENGINE_METHODS.add(method);
 const REFERENCE_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif"]);
 // MuPDF can preserve JPEG2000/JBIG2/portable-map encodings when extracting
 // embedded images; these are valid outputs even though they aren't import types.
@@ -104,6 +121,86 @@ function fileAccessError(error: unknown, pathValue?: string): FileAccessError {
 
 function failedFileAccess<T>(error: unknown, pathValue?: string): FileAccessResult<T> {
   return { ok: false, error: fileAccessError(error, pathValue) };
+}
+
+function sourceByteLimit(source: WorkspaceSource) { return source.kind === 'pdf' ? MAX_INPUT_PDF_FILE_SIZE : MAX_REFERENCE_IMAGE_FILE_SIZE; }
+function grantSaved(path: string, saved: SavedIdentity, kind: 'file' | 'directory') {
+  rememberAuthorizedPath(resolve(path), { kind, canonical: saved.canonical, identity: saved });
+  rememberAuthorizedPath(saved.canonical, { kind, canonical: saved.canonical, identity: saved });
+}
+function getWorkspaceStore(): WorkspaceStore {
+  if (workspaceStore) return workspaceStore;
+  workspaceStore = new WorkspaceStore(join(process.env.APPDATA || app.getPath('appData'), 'FileToolbox', 'workspaces'), {
+    async capture(source) {
+      if (!await isAuthorizedPath(source.path)) throw new Error('工作区来源尚未授权');
+      const identity = await captureDocument(source.path, sourceByteLimit(source));
+      if (!await isAuthorizedPath(source.path) || source.signature && identity.sha256 !== source.signature) throw new Error('源文件已变化，请重新导入');
+      return identity;
+    },
+    async verify(source, identity) {
+      try {
+        await verifyIdentity(source.path, identity, 'file');
+        if (source.signature && source.signature !== identity.sha256) throw new Error('来源签名与工作区不一致');
+        grantSaved(source.path, identity, 'file');
+        return { status: 'ready' };
+      } catch (error) {
+        return { status: (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : 'changed', message: String(error) };
+      }
+    },
+    async relocate(source, identity, path) {
+      if (!await isAuthorizedPath(path)) throw new Error('请通过文件选择框重新定位');
+      await validateInputFile(path, source.kind === 'pdf' ? new Set(['pdf']) : REFERENCE_IMAGE_EXTENSIONS, sourceByteLimit(source));
+      const replacement = await relocateDocument(path, identity, sourceByteLimit(source));
+      grantSaved(path, replacement, 'file');
+      return { source: { ...source, path, name: basename(path), signature: replacement.sha256, size: Number(replacement.size) }, identity: replacement };
+    },
+  });
+  return workspaceStore;
+}
+
+async function flushWorkspaceBeforeClose(): Promise<void> {
+  if (mainWindow && !mainWindow.isDestroyed() && typeof mainWindow.webContents.isLoadingMainFrame === 'function' && !mainWindow.webContents.isLoadingMainFrame()) {
+    const token = randomBytes(16).toString('hex');
+    await new Promise<void>((resolvePromise, reject) => {
+      const timer = setTimeout(() => { workspaceFlushes.delete(token); reject(new Error('等待工作区保存超时，请稍后再试')); }, 30000);
+      workspaceFlushes.set(token, { resolve: () => { clearTimeout(timer); resolvePromise(); }, reject: error => { clearTimeout(timer); reject(error); } });
+      mainWindow!.webContents.send('workspace:flush-requested', token);
+    });
+  }
+  await workspaceStore?.flush();
+}
+
+async function restoreTaskAccess(event: Electron.IpcMainInvokeEvent, method: string, params: any) {
+  const id = params?.task_id;
+  if (typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) throw new Error('任务标识无效');
+  const currentBridge = bridge!;
+  if (method === 'tasks.reveal') {
+    const spec = await currentBridge.call('tasks.output_spec', { task_id: id });
+    const output = spec.output_files?.[0];
+    assertPathString(output);
+    await validateInputFile(output, RESULT_DOCUMENT_EXTENSIONS, Infinity);
+    if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
+    await authorizePath(output);
+    shell.showItemInFolder(await documentPath(event, output));
+    return;
+  }
+  const spec = await currentBridge.call('tasks.retry_spec', { task_id: id });
+  if (!['pdf_tools.run', 'pdf_split.execute_async', 'scan_split.execute_async', 'scan_split.scan_only', 'scan_split.probe_page'].includes(spec.method)) throw new Error('该任务不支持续做');
+  const regrant = async (entries: Record<string, SavedIdentity>, kind: 'file' | 'directory') => {
+    if (!entries || typeof entries !== 'object' || Array.isArray(entries) || Object.keys(entries).length > 5000) throw new Error('任务文件身份无效');
+    for (const [path, identity] of Object.entries(entries)) {
+      assertPathString(path); await verifyIdentity(path, identity, kind); grantSaved(path, identity, kind);
+    }
+  };
+  await regrant(spec.input_identities, 'file');
+  await regrant(spec.output_identities || {}, 'directory');
+  const checked = await validateEngineParamPaths(spec.method, spec.params);
+  for (const path of Object.keys(checked._input_identities)) {
+    if (!spec.input_identities[path]) throw new Error('任务来源身份缺失');
+    await verifyIdentity(path, spec.input_identities[path], 'file');
+  }
+  if (!isMainSender(event) || bridge !== currentBridge) throw new Error('引擎已重启，请重试');
+  return currentBridge.call(spec.method, { ...checked, task_id: `retry_${randomBytes(12).toString('hex')}`, _resume_task_id: id });
 }
 
 type AppUpdateState = "idle" | "checking" | "available" | "downloading" | "downloaded" | "installing" | "up-to-date" | "unsupported" | "error";
@@ -263,7 +360,7 @@ async function validateInputFile(pathValue: string, allowedExts: Set<string>, ma
 
 async function validateEngineParamPaths(method: string, params: any): Promise<any> {
   if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("参数必须是对象");
-  const checked = { ...params, _input_identities: {} as Record<string, FileIdentity> };
+  const checked = { ...params, _input_identities: {} as Record<string, FileIdentity>, _output_identities: {} as Record<string, FileIdentity> };
   const inputs: Array<{ path: string; kind: "pdf" | "reference" | "file" }> = [];
   const outputs: string[] = [];
   const input = (value: unknown, kind: "pdf" | "reference" | "file", optional = false) => {
@@ -304,6 +401,12 @@ async function validateEngineParamPaths(method: string, params: any): Promise<an
   }
   for (const pathValue of outputs) {
     if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
+    // Remember the selected existing ancestor for outputs that will be created.
+    const canonical = await canonicalOutputPath(pathValue);
+    let ancestor = canonical;
+    while (!existsSync(ancestor) && dirname(ancestor) !== ancestor) ancestor = dirname(ancestor);
+    if (!(await isAuthorizedPath(ancestor))) throw new Error('输出目录尚未授权');
+    checked._output_identities[ancestor] = await captureIdentity(ancestor, 'directory');
   }
   for (const { path: pathValue, kind } of inputs) {
     if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
@@ -443,6 +546,7 @@ function canRunPython(exePath: string): boolean {
 }
 
 function createWindow() {
+  allowWindowClose = false;
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -459,6 +563,15 @@ function createWindow() {
   });
 
   mainWindow.setMinimumSize(MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT);
+  mainWindow.on('close', event => {
+    if (allowWindowClose) return;
+    event.preventDefault();
+    if (closePending) return;
+    closePending = true;
+    flushWorkspaceBeforeClose().then(() => { allowWindowClose = true; mainWindow?.close(); })
+      .catch(error => { void dialog.showMessageBox(mainWindow!, { type: 'error', title: '工作区未保存', message: '关闭已取消，请检查保存状态后重试。', detail: String(error) }); })
+      .finally(() => { closePending = false; });
+  });
   mainWindow.on("closed", () => {
     mainWindow = null;
     authorizedPaths.clear();
@@ -510,14 +623,45 @@ function setupIPC() {
   if (ipcReady) return;
   ipcReady = true;
 
+  for (const operation of ['load', 'save', 'clear'] as const) {
+    ipcMain.handle(`workspace:${operation}`, async (event, scope: WorkspaceScope, state: unknown) => {
+      if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
+      const store = getWorkspaceStore();
+      if (operation === 'save') return store.save(scope, state);
+      return store[operation](scope);
+    });
+  }
+  ipcMain.handle('workspace:flush', async event => { if (!isMainSender(event)) throw new Error('IPC 调用来源无效'); await getWorkspaceStore().flush(); });
+  ipcMain.handle('workspace:flushed', async (event, token: string, error?: string) => {
+    if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
+    const pending = workspaceFlushes.get(token);
+    if (pending) { workspaceFlushes.delete(token); error ? pending.reject(new Error(String(error))) : pending.resolve(); }
+  });
+  ipcMain.handle('workspace:relocate', async (event, scope: WorkspaceScope, sourceIndex: number) => {
+    if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
+    const saved = await getWorkspaceStore().load(scope), source = saved.state?.sources[sourceIndex];
+    if (!source || !Number.isSafeInteger(sourceIndex)) throw new Error('请选择有效的来源文件');
+    const picked = await dialog.showOpenDialog(mainWindow!, { title: `重新定位 ${source.name}`, properties: ['openFile'], filters: [{ name: '原始文档', extensions: source.kind === 'pdf' ? ['pdf'] : [...REFERENCE_IMAGE_EXTENSIONS] }] });
+    if (picked.canceled || !picked.filePaths[0]) return null;
+    if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
+    await authorizePath(picked.filePaths[0]);
+    return getWorkspaceStore().relocate(scope, sourceIndex, picked.filePaths[0]);
+  });
+
   ipcMain.handle("engine:call", async (event, method: string, params: any) => {
     if (!isMainSender(event)) throw new Error("Invalid IPC sender");
     if (!ENGINE_METHODS.has(String(method || ""))) throw new Error("Engine method is not allowed");
     if (!bridge || engineStatus !== "ready") {
       throw new Error(engineStatus === "error" ? `Python 引擎启动失败：${engineError || "未知错误"}` : "Python 引擎启动中，请稍候");
     }
-    const checked = await validateEngineParamPaths(method, params);
+    if (method === 'tasks.retry' || method === 'tasks.reveal') return restoreTaskAccess(event, method, params);
+    if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('参数必须是对象');
+    // Resume metadata is fetched from our own journal, never supplied by UI.
+    const publicParams = Object.fromEntries(Object.entries(params).filter(([key]) => !key.startsWith('_')));
+    const checked = await validateEngineParamPaths(method, publicParams);
     if (!isMainSender(event)) throw new Error("Invalid IPC sender");
+    if (method === 'task.cancel' && previewEngine.owns(checked.task_id)) return previewEngine.cancel(checked.task_id);
+    if (method === 'scan_split.preview_reference' || method === 'pdf_tools.run' && ['inspect', 'thumbnails'].includes(checked.action)) return previewEngine.call(method, checked);
     return bridge.call(method, checked);
   });
 
@@ -677,6 +821,7 @@ async function startEngine(): Promise<void> {
   if (startEnginePromise) return startEnginePromise;
 
   const attempt = (async () => {
+    await previewEngine.shutdown();
     engineStatus = "starting";
     engineError = "";
     publishEngineStatus();
@@ -944,6 +1089,8 @@ ipcMain.handle("app:update:install", async (event) => {
   if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
   if (!isUpdateSupported()) return { accepted: false, status: unsupportedUpdateStatus() };
   if (updateStatus.state !== "downloaded") throw new Error("更新尚未下载完成");
+  await flushWorkspaceBeforeClose();
+  await previewEngine.shutdown();
   publishUpdateStatus({ state: "installing", error: undefined });
   const currentBridge = bridge;
   bridge = null;
@@ -1083,12 +1230,15 @@ app.on("activate", () => {
 
 let shutdownBeforeQuitStarted = false;
 app.on("before-quit", (event) => {
-  if (shutdownBeforeQuitStarted || !bridge) return;
+  if (shutdownBeforeQuitStarted) return;
   event.preventDefault();
   shutdownBeforeQuitStarted = true;
-  const currentBridge = bridge;
-  bridge = null;
-  currentBridge.shutdown()
-    .catch((error) => console.error("[main] 引擎关闭失败:", error))
-    .finally(() => app.quit());
+  (allowWindowClose ? Promise.resolve() : flushWorkspaceBeforeClose()).then(async () => {
+    const currentBridge = bridge; bridge = null;
+    await Promise.allSettled([currentBridge?.shutdown(), previewEngine.shutdown()]);
+    allowWindowClose = true; app.quit();
+  }).catch(error => {
+    shutdownBeforeQuitStarted = false;
+    if (mainWindow) void dialog.showMessageBox(mainWindow, { type: 'error', title: '工作区未保存', message: '退出已取消，请检查保存状态后重试。', detail: String(error) });
+  });
 });

@@ -12,6 +12,9 @@ import AppIcon from "../common/AppIcon.vue";
 import ScanReview from "./ScanReview.vue";
 import ProcessingPresets from "../common/ProcessingPresets.vue";
 import { normalizeScanSplitResult, scanCompletionNotice, scanPhaseLabel, type ScanSplitTaskResult } from "../../scan-results";
+import { useWorkspacePersistence } from '../../composables/useWorkspacePersistence';
+import type { WorkspaceState, WorkspaceSource } from '../../../../shared/workspace-types';
+import { reviewSegments } from '../../pdf-workbench';
 
 type TuneResult = { title: string; lines: string[] };
 type PresetName = "" | "balanced" | "strict" | "loose" | "high_recall";
@@ -25,7 +28,10 @@ const prefix = ref("");
 const error = ref("");
 const result = ref<ScanSplitTaskResult | null>(null);
 const tuneResult = ref<TuneResult | null>(null);
-const review = ref<{ pdfPath: string; signature: string; total: number; markers: number[]; options: ScanSplitOptions } | null>(null);
+const review = ref<{ pdfPath: string; signature: string; total: number; markers: number[]; segments?: number[][]; options: ScanSplitOptions } | null>(null);
+let restoringWorkspace = false;
+const outputNeedsSelection = ref(false);
+const restoredSourceMetadata = new Map<string, WorkspaceSource>();
 const reviewBusy = ref(false);
 const reviewExpanded = ref(true);
 const reviewInvalidated = ref(false);
@@ -216,7 +222,7 @@ const { state: taskState, logs, busy: scanTaskBusy, cancellable: taskCancellable
   },
 });
 
-const taskBusy = computed(() => scanTaskBusy.value || reviewBusy.value);
+const taskBusy = computed(() => scanTaskBusy.value || reviewBusy.value || workspace.restoring.value);
 const savedScanSettings = computed(() => ({ options: buildScanOptions(), prefix: prefix.value,
   useMaxSegment: useMaxSegment.value, compression: scanOutputCompression.value, ocr: scanOutputOcr.value }));
 function applySavedScan(settings: Record<string, unknown>) {
@@ -325,7 +331,11 @@ async function pickPdf() {
     multi: false,
     filters: [{ name: "PDF 文件", extensions: ["pdf"] }],
   });
-  if (paths?.[0]) pdfPath.value = paths[0];
+  if (paths?.[0]) {
+    restoredSourceMetadata.delete(paths[0]); review.value = null;
+    workspace.statuses.value = workspace.statuses.value.filter(item => item.path !== paths[0]);
+    pdfPath.value = paths[0]; await updatePdfPageCount();
+  }
 }
 
 async function pickReference() {
@@ -335,10 +345,15 @@ async function pickReference() {
       { name: "图像 / PDF", extensions: ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif", "pdf"] },
     ],
   });
-  if (paths?.[0]) referenceImage.value = paths[0];
+  if (paths?.[0]) {
+    restoredSourceMetadata.delete(paths[0]); review.value = null;
+    workspace.statuses.value = workspace.statuses.value.filter(item => item.path !== paths[0]);
+    referenceImage.value = paths[0]; loadReferencePreview();
+  }
 }
 
 watch(referenceImage, () => {
+  if (restoringWorkspace) return;
   opts.value.reference_roi = null;
   selectionDraft.value = null;
   previewZoom.value = 0.5;
@@ -346,17 +361,19 @@ watch(referenceImage, () => {
 });
 
 watch(() => opts.value.nfeatures, () => {
+  if (restoringWorkspace) return;
   if (referenceImage.value) loadReferencePreview();
 });
 
 watch(pdfPath, () => {
+  if (restoringWorkspace) return;
   updatePdfPageCount();
 });
 
 watch(
   () => opts.value.detection_mode,
   (mode) => {
-    if (restoringScanSettings) return;
+    if (restoringScanSettings || restoringWorkspace) return;
     opts.value.dpi = scanDpiForMode(mode);
     if (!isQrMode.value) {
       opts.value.qrcode_no_decode = false;
@@ -825,7 +842,7 @@ const scanBannerMessage = computed(() => {
 
 async function pickOutputDir() {
   const dir = await window.electronAPI?.openDirectoryDialog({ title: "选择输出目录" });
-  if (dir) outputDir.value = dir;
+  if (dir) { outputDir.value = dir; outputNeedsSelection.value = false; }
 }
 
 let _applyingPreset = false;
@@ -1037,6 +1054,7 @@ function validateRoiSelection() {
 }
 
 async function execute() {
+  if (sourceProblems.value.length) { error.value = '请先重新定位缺失或已变化的来源。'; return; }
   if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
@@ -1076,6 +1094,7 @@ async function execute() {
 }
 
 async function runProbePage() {
+  if (sourceProblems.value.length) { error.value = '请先重新定位缺失或已变化的来源。'; return; }
   if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
@@ -1112,6 +1131,7 @@ async function runProbePage() {
 }
 
 async function runScanOnly() {
+  if (sourceProblems.value.length) { error.value = '请先重新定位缺失或已变化的来源。'; return; }
   if (submitting.value || taskBusy.value) {
     error.value = "已有任务正在执行，请等待完成后再试。";
     return;
@@ -1352,6 +1372,7 @@ function buildScanOptions(extra: Partial<ScanSplitOptions> = {}): ScanSplitOptio
   };
 }
 watch(() => reviewConfiguration(), () => {
+  if (restoringWorkspace) return;
   if (!review.value) return;
   if (reviewBusy.value) { reviewInvalidated.value = true; return; }
   review.value = null; error.value = '输入或识别参数已变化，请重新扫描后复核。';
@@ -1362,6 +1383,52 @@ watch(reviewBusy, busy => {
     error.value = '输入或识别参数已变化，本次输出采用原复核快照；再次输出前请重新扫描。';
   }
 });
+function snapshotScanWorkspace(): WorkspaceState {
+  const sources: WorkspaceSource[] = [];
+  if (pdfPath.value) {
+    const known = restoredSourceMetadata.get(pdfPath.value);
+    sources.push({ path: pdfPath.value, name: fileBasename(pdfPath.value), kind: 'pdf', role: 'document', size: known?.size || 0,
+      signature: review.value?.pdfPath === pdfPath.value ? review.value.signature : known?.signature || '', page_count: review.value?.pdfPath === pdfPath.value ? review.value.total : pdfPageCount.value || known?.page_count || 0 });
+  }
+  if (referenceImage.value) {
+    const known = restoredSourceMetadata.get(referenceImage.value);
+    sources.push({ path: referenceImage.value, name: fileBasename(referenceImage.value), kind: /\.pdf$/i.test(referenceImage.value) ? 'pdf' : 'image', role: 'reference', size: known?.size || 0, signature: known?.signature || '', page_count: 0 });
+  }
+  const state: WorkspaceState = { version: 1, sources, pages: [], settings: { ...savedScanSettings.value, options: { ...opts.value }, outputDir: outputDir.value, preset: preset.value, probePageIndex: probePageIndex.value, quickScanPageLimit: quickScanPageLimit.value } };
+  if (review.value && review.value.pdfPath === pdfPath.value) state.review = { source: 0, total: review.value.total, markers: [...review.value.markers],
+    segments: review.value.segments?.map(group => [...group]) || reviewSegments(review.value.total, review.value.markers, review.value.options.marker_as_first_page !== false, Boolean(review.value.options.exclude_marker_page)),
+    options: { ...review.value.options }, expanded: reviewExpanded.value };
+  return state;
+}
+const workspace = useWorkspacePersistence('scan', snapshotScanWorkspace, async saved => {
+  restoringWorkspace = true;
+  try {
+    restoredSourceMetadata.clear(); saved.sources.forEach(source => restoredSourceMetadata.set(source.path, source));
+    const document = saved.sources.find(s => s.role !== 'reference'), reference = saved.sources.find(s => s.role === 'reference');
+    pdfPath.value = document?.path || ''; referenceImage.value = reference?.path || ''; pdfPageCount.value = document?.page_count || null;
+    applySavedScan(saved.settings); clampScanOptions();
+    outputDir.value = String(saved.settings.outputDir || ''); outputNeedsSelection.value = Boolean(outputDir.value);
+    if (['', 'balanced', 'strict', 'loose', 'high_recall'].includes(String(saved.settings.preset))) preset.value = saved.settings.preset as PresetName;
+    probePageIndex.value = boundedProbePage(Number(saved.settings.probePageIndex) || 1);
+    quickScanPageLimit.value = boundedQuickScanPageLimit(Number(saved.settings.quickScanPageLimit) || 30);
+    const r = saved.review, source = r ? saved.sources[r.source] : null;
+    review.value = r && source ? { pdfPath: source.path, signature: source.signature, total: r.total, markers: [...r.markers], segments: r.segments.map(group => [...group]), options: r.options as ScanSplitOptions } : null;
+    reviewExpanded.value = r?.expanded !== false;
+    if (review.value) activityTab.value = 'results';
+    await nextTick();
+  } finally { restoringWorkspace = false; }
+});
+const sourceProblems = computed(() => workspace.statuses.value.filter(item => item.status !== 'ready' && (item.path === pdfPath.value || item.path === referenceImage.value)));
+const documentUnavailable = computed(() => sourceProblems.value.some(item => item.path === pdfPath.value));
+watch(workspace.restoring, restoring => {
+  if (restoring) return;
+  if (!documentUnavailable.value) void updatePdfPageCount();
+  if (!sourceProblems.value.some(item => item.path === referenceImage.value)) loadReferencePreview();
+});
+function saveReviewEdits(value: { markers: number[]; segments: number[][] }) {
+  if (review.value) review.value = { ...review.value, markers: value.markers, segments: value.segments };
+}
+function reviewOutputSelected(path: string) { outputDir.value = path; outputNeedsSelection.value = false; }
 </script>
 
 <template>
@@ -1373,9 +1440,10 @@ watch(reviewBusy, busy => {
       title="扫描拆分"
       :message="scanBannerMessage"
     />
+    <div class="workspace-restore-status" role="status">{{ workspace.label.value }}<span v-if="workspace.error.value"> · {{ workspace.error.value }} <button class="btn btn-sm" @click="workspace.flush">重试保存</button></span><div v-for="item in sourceProblems" :key="item.path">{{ fileBasename(item.path) }}：{{ item.status === 'missing' ? '来源缺失' : '来源已变化' }}，复核标记已保留。<button class="btn btn-sm" :disabled="taskBusy" @click="workspace.relocate(item.index)">重新定位相同内容</button></div></div>
 
     <div v-show="review && reviewExpanded" class="scan-review-page glass-card">
-      <ScanReview v-if="review" :key="review.signature + JSON.stringify(review.options)" :pdf-path="review.pdfPath" :signature="review.signature" :total="review.total" :initial-markers="review.markers" :options="review.options" :output-dir="outputDir" :prefix="prefix" v-model:compression="scanOutputCompression" v-model:ocr="scanOutputOcr" @busy="reviewBusy = $event" @back="reviewExpanded = false" />
+      <ScanReview v-if="review" :key="review.pdfPath + review.signature + JSON.stringify(review.options)" :pdf-path="review.pdfPath" :signature="review.signature" :total="review.total" :initial-markers="review.markers" :initial-segments="review.segments" :options="review.options" :output-dir="outputDir" :prefix="prefix" :unavailable="documentUnavailable" :output-needs-selection="outputNeedsSelection" v-model:compression="scanOutputCompression" v-model:ocr="scanOutputOcr" @change="saveReviewEdits" @output-selected="reviewOutputSelected" @busy="reviewBusy = $event" @back="reviewExpanded = false" />
     </div>
     <div v-show="!review || !reviewExpanded" class="scan-grid panel-grid">
       <!-- 左：参考输入 + 进度日志 -->
@@ -1693,6 +1761,8 @@ watch(reviewBusy, busy => {
 </template>
 
 <style scoped>
+.workspace-restore-status { padding: 0 4px 6px; flex-shrink: 0; font-size: 11px; color: var(--color-text-secondary); }
+.workspace-restore-status>div { color: #b45309; padding-top: 4px; }.workspace-restore-status .btn { margin-left: 8px; }
 .scan-review-page { flex: 1; min-height: 0; padding: 18px 22px; border: 1px solid var(--color-border); border-radius: 14px; overflow: hidden; }
 .scan-review-page { animation: surfaceReveal var(--motion-scene) var(--motion-out); }
 .scan-review-page :deep(.review-summary) { animation: surfaceReveal 280ms var(--motion-out) 45ms both; }

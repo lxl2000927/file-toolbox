@@ -62,6 +62,7 @@ from src.utils.history_manager import HistoryManager
 from src.utils.input_guard import input_context
 from src.utils.rpc_validation import validate_path_params
 from src.utils.preview_dispatcher import LatestPreviewWorker, PreviewCancelled
+from src.utils.task_store import TaskStore, output_identity, verify_outputs
 
 _REFERENCE_PREVIEWS = LatestPreviewWorker()
 
@@ -73,15 +74,20 @@ def _task_inputs(runner):
         # each queued job's own captured identities through all deferred opens.
         identities = params.get("_input_identities", {} if ENGINE_AUTH_TOKEN else None)
         with input_context(identities):
+            if isinstance(cancel_flag, TaskControl):
+                cancel_flag.mark_started()
+                cancel_flag.check()
             return runner(task_id, params, cancel_flag)
     return bound
 
 _HISTORY_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "FileToolbox")
 _HISTORY_PATH = os.path.join(_HISTORY_DIR, "history.json")
 from src.utils.preset_store import PresetStore
-_PRESETS = PresetStore(os.path.join(_HISTORY_DIR, 'presets.json'))
+_PREVIEW_ENGINE = os.getenv('FILE_TOOLBOX_PREVIEW_ENGINE') == '1'
+_PRESETS = None if _PREVIEW_ENGINE else PresetStore(os.path.join(_HISTORY_DIR, 'presets.json'))
+_TASK_STORE = None if _PREVIEW_ENGINE else TaskStore(os.path.join(_HISTORY_DIR, 'tasks.json'))
 try:
-    _HISTORY_MANAGER = HistoryManager(storage_path=_HISTORY_PATH)
+    _HISTORY_MANAGER = None if _PREVIEW_ENGINE else HistoryManager(storage_path=_HISTORY_PATH)
 except OSError:
     traceback.print_exc(file=sys.stderr)
     _HISTORY_MANAGER = None  # type: ignore[assignment]
@@ -153,6 +159,84 @@ _TASK_QUEUE: deque[tuple[str, Any, dict, threading.Event]] = deque()
 _CONSECUTIVE_THREAD_FAILURES = 0
 
 
+def _set_task_state(task_id, state):
+    if _TASK_STORE is not None:
+        try:
+            record = _TASK_STORE.transition(task_id, state)
+        except (OSError, ValueError, RuntimeError) as exc:
+            send({'jsonrpc': '2.0', 'method': 'task.warning', 'params': {
+                'task_id': task_id, 'message': f'任务记录保存失败：{exc}'}})
+            return
+        if record:
+            send({'jsonrpc': '2.0', 'method': 'task.state', 'params': {
+                'task_id': task_id, 'state': record['state']}})
+
+
+class TaskControl:
+    """Pause only at engine cancellation checks, never while serializing stdout."""
+    def __init__(self, task_id, *, queued=False):
+        self.task_id = task_id
+        self.cancelled = threading.Event()
+        self.pause_requested = threading.Event()
+        self.finished = threading.Event()
+        self.condition = threading.Condition()
+        self.queued = queued
+
+    def is_set(self):
+        return self.cancelled.is_set()
+
+    def set(self):
+        with self.condition:
+            self.cancelled.set()
+            self.pause_requested.clear()
+            self.condition.notify_all()
+
+    def mark_started(self):
+        with self.condition:
+            self.queued = False
+            if not self.pause_requested.is_set() and not self.is_set():
+                _set_task_state(self.task_id, 'running')
+
+    def check(self):
+        with self.condition:
+            if self.pause_requested.is_set() and not self.is_set():
+                _set_task_state(self.task_id, 'paused')
+            while self.pause_requested.is_set() and not self.is_set():
+                self.condition.wait()
+            return self.is_set()
+
+    def pause(self):
+        with self.condition:
+            if self.is_set() or self.finished.is_set():
+                return False
+            if self.pause_requested.is_set():
+                return True
+            self.pause_requested.set()
+            _set_task_state(self.task_id, 'paused' if self.queued else 'pausing')
+            return True
+
+    def resume(self):
+        with self.condition:
+            if self.is_set() or self.finished.is_set() or not self.pause_requested.is_set():
+                return False
+            self.pause_requested.clear()
+            _set_task_state(self.task_id, 'queued' if self.queued else 'running')
+            self.condition.notify_all()
+            return True
+
+
+def _cancel_check(flag):
+    return flag.check() if isinstance(flag, TaskControl) else flag.is_set()
+
+
+def _checkpoint(task_id, value=None):
+    if _TASK_STORE is None:
+        return None
+    if value is not None:
+        return _TASK_STORE.checkpoint(task_id, value)
+    return _TASK_STORE.get_checkpoint(task_id)
+
+
 def _new_task_id(prefix: str) -> str:
     return f"{prefix}_{os.urandom(8).hex()}"
 
@@ -168,27 +252,22 @@ def _reserve_task(task_id: str, method: str, params: dict, runner: Any) -> tuple
     with _CANCEL_LOCK:
         if task_id in _CANCEL_FLAGS:
             raise RuntimeError(f"任务ID已存在: {task_id}")
-
-    acquired = _TASK_SEMAPHORE.acquire(blocking=False)
-    if acquired:
-        flag = threading.Event()
-        with _CANCEL_LOCK:
-            if task_id in _CANCEL_FLAGS:
-                _TASK_SEMAPHORE.release()
-                raise RuntimeError(f"任务ID已存在: {task_id}")
-            _CANCEL_FLAGS[task_id] = flag
-        return (flag, False, 0)
-
-    flag = threading.Event()
-    with _CANCEL_LOCK:
-        if task_id in _CANCEL_FLAGS:
-            raise RuntimeError(f"任务ID已存在: {task_id}")
-        if len(_TASK_QUEUE) >= _MAX_QUEUED_TASKS:
+        acquired = _TASK_SEMAPHORE.acquire(blocking=False)
+        if not acquired and len(_TASK_QUEUE) >= _MAX_QUEUED_TASKS:
             raise RuntimeError(f"等待队列已满（最多{_MAX_QUEUED_TASKS}个），请稍后再试")
+        tracked = not (method == 'pdf_tools.run' and params.get('action') in ('inspect', 'thumbnails'))
+        try:
+            if tracked and _TASK_STORE is not None:
+                _TASK_STORE.create(task_id, method, params, state='running' if acquired else 'queued')
+        except Exception:
+            if acquired:
+                _TASK_SEMAPHORE.release()
+            raise
+        flag = TaskControl(task_id, queued=not acquired)
         _CANCEL_FLAGS[task_id] = flag
-        _TASK_QUEUE.append((task_id, runner, params, flag))
-        position = len(_TASK_QUEUE)
-    return (flag, True, position)
+        if not acquired:
+            _TASK_QUEUE.append((task_id, runner, params, flag))
+        return flag, not acquired, 0 if acquired else len(_TASK_QUEUE)
 
 
 def _release_task(task_id: str, *, reserved: bool = True) -> None:
@@ -205,7 +284,12 @@ def _try_start_queued() -> None:
         with _CANCEL_LOCK:
             if not _TASK_QUEUE:
                 return
-            task_id, runner, params, flag = _TASK_QUEUE.popleft()
+            entry = next((item for item in _TASK_QUEUE if not isinstance(item[3], TaskControl)
+                          or not item[3].pause_requested.is_set()), None)
+            if entry is None:
+                return
+            _TASK_QUEUE.remove(entry)
+            task_id, runner, params, flag = entry
 
         acquired = _TASK_SEMAPHORE.acquire(blocking=False)
         if not acquired:
@@ -213,6 +297,8 @@ def _try_start_queued() -> None:
                 _TASK_QUEUE.appendleft((task_id, runner, params, flag))
             return
 
+        notify_cancelled = False
+        skipped = False
         with _CANCEL_LOCK:
             if flag.is_set() or task_id not in _CANCEL_FLAGS:
                 _TASK_SEMAPHORE.release()
@@ -224,13 +310,12 @@ def _try_start_queued() -> None:
                 # flag 未 set 却发 cancelled:True 会让正常任务收到错误通知。
                 if flag.is_set() and task_id in _CANCEL_FLAGS:
                     _CANCEL_FLAGS.pop(task_id, None)
-                    send_notification("task.complete", {
-                        "task_id": task_id,
-                        "ok": False,
-                        "cancelled": True,
-                        "error": "已取消",
-                    })
-                continue
+                    notify_cancelled = True
+                skipped = True
+        if notify_cancelled:
+            send_notification('task.complete', {'task_id': task_id, 'ok': False, 'cancelled': True, 'error': '已取消'})
+        if skipped:
+            continue
 
         # [P1 #10] task.queued 通知必须在 thread.start() 之前发送，
         # 否则线程内可能先于本通知发出 task.complete，前端状态错乱。
@@ -289,9 +374,10 @@ def _cancel_task(task_id: str) -> bool:
                     _CANCEL_FLAGS.pop(task_id, None)
                     removed_queued = True
                     break
-    if flag is None:
+    if flag is None or isinstance(flag, TaskControl) and flag.finished.is_set():
         return False
     flag.set()
+    _set_task_state(task_id, 'cancelling')
     if removed_queued:
         send_notification("task.complete", {
             "task_id": task_id,
@@ -345,6 +431,20 @@ def send(data: dict) -> None:
 
 
 def send_notification(method: str, params: dict) -> None:
+    if method == 'task.complete':
+        with _CANCEL_LOCK:
+            control = _CANCEL_FLAGS.get(params.get('task_id'))
+        if isinstance(control, TaskControl):
+            control.finished.set()
+    if _TASK_STORE is not None and params.get('task_id'):
+        try:
+            if method == 'task.progress':
+                _TASK_STORE.progress(params['task_id'], params)
+            elif method == 'task.complete':
+                _TASK_STORE.finish(params['task_id'], params)
+        except (OSError, ValueError, RuntimeError) as exc:
+            send({'jsonrpc': '2.0', 'method': 'task.warning', 'params': {
+                'task_id': params['task_id'], 'message': f'任务记录保存失败：{exc}'}})
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
 
@@ -560,7 +660,8 @@ def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Even
             "task_id": task_id, "phase": "start", "current": 0, "total": len(pdf_paths),
         })
         engine = _make_pdf_split_engine()
-        results = engine.execute_split(pdf_paths, config, cancel_check=lambda: cancel_flag.is_set())
+        results = engine.execute_split(pdf_paths, config, cancel_check=lambda: _cancel_check(cancel_flag),
+                                       checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value))
         cancelled = cancel_flag.is_set()
         if cancelled and "已取消" not in results.get("errors", []):
             results.setdefault("errors", []).append("已取消")
@@ -570,16 +671,16 @@ def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Even
 
         send_notification("task.progress", {
             "task_id": task_id, "phase": "done",
-            "current": len(pdf_paths), "total": len(pdf_paths),
+            "current": results.get('successful', 0), "total": len(pdf_paths),
         })
         send_notification("task.complete", {
             "task_id": task_id,
-            "ok": not cancelled,
+            "ok": not cancelled and not results.get('errors'),
             "task_type": "pdf_split",
             "elapsed_ms": elapsed_ms,
             "cancelled": cancelled,
             "result": results,
-            **({"error": "已取消"} if cancelled else {}),
+            **({"error": "已取消" if cancelled else '; '.join(results['errors'])} if cancelled or results.get('errors') else {}),
         })
     except Exception as exc:
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
@@ -605,6 +706,7 @@ def handle_pdf_split_execute_async(params: dict) -> dict:
         thread = threading.Thread(target=_run_pdf_split_async, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
     except Exception as exc:
+        send_notification("task.complete", {"task_id": task_id, "ok": False, "error": f"无法启动后台线程: {exc}"})
         _release_task(task_id)
         raise RuntimeError(f"无法启动后台线程: {exc}") from exc
     return {"task_id": task_id}
@@ -712,7 +814,7 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
             send_notification("task.log", {"task_id": task_id, "message": message})
 
         def cancel_check() -> bool:
-            return cancel_flag.is_set()
+            return _cancel_check(cancel_flag)
 
         send_notification("task.progress", {"task_id": task_id, "phase": "start", "current": 0, "total": 0})
 
@@ -728,6 +830,7 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
             phase_progress=lambda phase, current, total: send_notification("task.progress", {
                 "task_id": task_id, "phase": phase, "current": current, "total": total,
             }),
+            checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value),
         )
 
         serialized = _serialize_scan_result(result)
@@ -811,6 +914,7 @@ def handle_scan_split_execute_async(params: dict) -> dict:
         thread = threading.Thread(target=_run_scan_split_async, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
     except Exception as exc:
+        send_notification("task.complete", {"task_id": task_id, "ok": False, "error": f"无法启动后台线程: {exc}"})
         _release_task(task_id)
         raise RuntimeError(f"无法启动后台线程: {exc}") from exc
     return {"task_id": task_id}
@@ -841,7 +945,7 @@ def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) ->
             params.get("reference_image_path", ""),
             options,
             page_index=page_index,
-            cancel_check=lambda: cancel_flag.is_set(),
+            cancel_check=lambda: _cancel_check(cancel_flag),
         )
         for line in _format_probe_log_lines(result, options):
             task_log(line)
@@ -887,6 +991,7 @@ def handle_scan_probe_page(params: dict) -> dict:
         thread = threading.Thread(target=_run_probe_page, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
     except Exception as exc:
+        send_notification("task.complete", {"task_id": task_id, "ok": False, "error": f"无法启动后台线程: {exc}"})
         _release_task(task_id)
         raise RuntimeError(f"无法启动后台线程: {exc}") from exc
     return {"task_id": task_id}
@@ -925,7 +1030,7 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             page_limit=page_limit,
             progress=progress,
             log=log,
-            cancel_check=lambda: cancel_flag.is_set(),
+            cancel_check=lambda: _cancel_check(cancel_flag),
         )
         serialized = _serialize_scan_result(result)
         if not cancel_flag.is_set() and page_limit == 0:
@@ -975,6 +1080,7 @@ def handle_scan_only(params: dict) -> dict:
         thread = threading.Thread(target=_run_scan_only, args=(task_id, params, cancel_flag), daemon=True)
         thread.start()
     except Exception as exc:
+        send_notification("task.complete", {"task_id": task_id, "ok": False, "error": f"无法启动后台线程: {exc}"})
         _release_task(task_id)
         raise RuntimeError(f"无法启动后台线程: {exc}") from exc
     return {"task_id": task_id}
@@ -1055,6 +1161,42 @@ def handle_task_cancel(params: dict) -> dict:
     return {"cancelled": _cancel_task(task_id), "task_id": task_id}
 
 
+def handle_tasks_list(params):
+    if _TASK_STORE is None:
+        return {'tasks': []}
+    try:
+        limit = int(params.get('limit', 100))
+    except (ValueError, TypeError):
+        limit = 100
+    return {'tasks': _TASK_STORE.list(limit), **({'storage_error': _TASK_STORE.last_error} if _TASK_STORE.last_error else {})}
+
+
+def handle_task_pause(params):
+    task_id = str(params.get('task_id') or '')
+    with _CANCEL_LOCK:
+        flag = _CANCEL_FLAGS.get(task_id)
+    paused = isinstance(flag, TaskControl) and flag.pause()
+    state = next((task['state'] for task in _TASK_STORE.list(200) if task['task_id'] == task_id), '') if _TASK_STORE else ''
+    return {'task_id': task_id, 'paused': paused, 'state': state}
+
+
+def handle_task_resume(params):
+    task_id = str(params.get('task_id') or '')
+    with _CANCEL_LOCK:
+        flag = _CANCEL_FLAGS.get(task_id)
+    resumed = isinstance(flag, TaskControl) and flag.resume()
+    if resumed:
+        _try_start_queued()
+    state = next((task['state'] for task in _TASK_STORE.list(200) if task['task_id'] == task_id), '') if _TASK_STORE else ''
+    return {'task_id': task_id, 'resumed': resumed, 'state': state}
+
+
+def handle_tasks_retry_spec(params):
+    if _TASK_STORE is None:
+        raise RuntimeError('任务日志不可用')
+    return _TASK_STORE.retry_spec(str(params.get('task_id') or ''))
+
+
 # ── 历史记录查询 ──────────────────────────────────────────
 
 def handle_history_get(params: dict) -> dict:
@@ -1125,9 +1267,16 @@ def _run_pdf_tools(task_id, params, cancel_flag):
     action = params.get('action')
     try:
         results = run_pdf_tool(action, params.get('files'), params.get('options'),
-                               cancel_check=cancel_flag.is_set,
+                               cancel_check=lambda: _cancel_check(cancel_flag),
                                progress=lambda phase, current, total: send_notification('task.progress', {
-                                   'task_id': task_id, 'phase': phase, 'current': current, 'total': total}))
+                                   'task_id': task_id, 'phase': phase, 'current': current, 'total': total}),
+                               checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value))
+        final_checkpoint = results.pop('checkpoint', None)
+        if final_checkpoint is not None:
+            try:
+                _checkpoint(task_id, final_checkpoint)
+            except (OSError, ValueError, RuntimeError) as exc:
+                results.setdefault('errors', []).append(f'任务检查点保存失败：{exc}')
         cancelled = results.get('cancelled', False)
         errors = results.get('errors', [])
         ok = not cancelled and not errors
@@ -1155,7 +1304,8 @@ def handle_pdf_tools(params):
     if not queued:
         try:
             threading.Thread(target=_run_pdf_tools, args=(task_id, params, flag), daemon=True).start()
-        except Exception:
+        except Exception as exc:
+            send_notification("task.complete", {"task_id": task_id, "ok": False, "error": f"无法启动后台线程: {exc}"})
             _release_task(task_id)
             raise
     return {'task_id': task_id, 'queued': queued, 'position': position}
@@ -1163,6 +1313,11 @@ def handle_pdf_tools(params):
 
 ROUTES: Dict[str, Callable] = {
     'pdf_tools.run':              handle_pdf_tools,
+    'tasks.list':                handle_tasks_list,
+    'task.pause':                handle_task_pause,
+    'task.resume':               handle_task_resume,
+    'tasks.retry_spec':           handle_tasks_retry_spec,
+    'tasks.output_spec':          lambda p: _TASK_STORE.output_spec(str(p.get('task_id') or '')) if _TASK_STORE else {},
     'presets.list':               lambda p: _PRESETS.list(p.get('scope')),
     'presets.save':               lambda p: _PRESETS.save(p.get('scope'), p.get('name'), p.get('settings')),
     'presets.delete':             lambda p: _PRESETS.delete(p.get('scope'), p.get('id')),

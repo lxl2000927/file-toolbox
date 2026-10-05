@@ -6,12 +6,17 @@ import { usePdfTools } from "../../composables/usePdfTools";
 import PdfPageGrid from "../common/PdfPageGrid.vue";
 import { pinLeavingItem, clearPinnedItem } from "../../motion";
 
-const props = defineProps<{ pdfPath: string; signature: string; total: number; initialMarkers: number[]; options: ScanSplitOptions; outputDir: string; prefix: string; compression: 'none' | 'lossless'; ocr: boolean }>();
-const emit = defineEmits<{ back: []; busy: [busy: boolean]; complete: [result: PdfToolResult]; 'update:compression': [value: 'none' | 'lossless']; 'update:ocr': [value: boolean] }>();
+const props = defineProps<{ pdfPath: string; signature: string; total: number; initialMarkers: number[]; initialSegments?: number[][]; options: ScanSplitOptions; outputDir: string; prefix: string; compression: 'none' | 'lossless'; ocr: boolean; unavailable?: boolean; outputNeedsSelection?: boolean }>();
+const emit = defineEmits<{ back: []; busy: [busy: boolean]; complete: [result: PdfToolResult]; 'update:compression': [value: 'none' | 'lossless']; 'update:ocr': [value: boolean]; change: [state: { markers: number[]; segments: number[][] }]; outputSelected: [path: string] }>();
 const markers = ref([...props.initialMarkers]);
-const segments = ref(reviewSegments(props.total, markers.value, props.options.marker_as_first_page !== false, Boolean(props.options.exclude_marker_page)));
+const segments = ref(props.initialSegments?.map(group => [...group]) || reviewSegments(props.total, markers.value, props.options.marker_as_first_page !== false, Boolean(props.options.exclude_marker_page)));
+watch([markers, segments], () => emit('change', { markers: [...markers.value], segments: segments.value.map(group => [...group]) }), { deep: true, flush: 'sync' });
 const past = ref<{ markers: number[]; segments: number[][] }[]>([]);
 const focusSegment = ref(-1);
+const segmentListPage = ref(1);
+const segmentListPages = computed(() => Math.max(1, Math.ceil(segments.value.length / 40)));
+const visibleSegments = computed(() => segments.value.slice((segmentListPage.value - 1) * 40, segmentListPage.value * 40).map((group, offset) => ({ group, index: (segmentListPage.value - 1) * 40 + offset })));
+watch(segmentListPages, count => { segmentListPage.value = Math.min(segmentListPage.value, count); });
 const message = ref('');
 const outcome = ref<PdfToolResult | null>(null);
 const task = usePdfTools();
@@ -32,11 +37,11 @@ function toggleMarker(index: number) {
 function merge(index: number) { if (busy.value || !segments.value[index + 1]) return; remember(); segments.value.splice(index, 2, [...segments.value[index], ...segments.value[index + 1]]); focusSegment.value = -1; }
 function undo() { const previous = past.value.pop(); if (previous) { markers.value = previous.markers; segments.value = previous.segments; focusSegment.value = -1; outcome.value = null; } }
 async function exportSegments() {
-  if (busy.value || !segments.value.length) return;
+  if (busy.value || !segments.value.length || props.unavailable) return;
   message.value = '';
   try {
     let directory = props.outputDir;
-    if (!directory) directory = await window.electronAPI?.openDirectoryDialog({ title: '选择复核结果输出文件夹' }) || '';
+    if (!directory || props.outputNeedsSelection) { directory = await window.electronAPI?.openDirectoryDialog({ title: '选择复核结果输出文件夹' }) || ''; if (directory) emit('outputSelected', directory); }
     if (!directory) return;
     const result = await task.run('segments', [props.pdfPath], { signatures: [props.signature], segments: segments.value.map(group => [...group]), output_dir: directory,
       filename: props.prefix || '扫描拆分', compression: props.compression, ocr: props.ocr, language: 'chi_sim+eng', dpi: 200 });
@@ -53,11 +58,12 @@ async function exportSegments() {
     <p class="review-help">点击页面放大查看，用下方按钮补充或移除标记；相邻分段可以合并。{{ options.marker_as_first_page !== false ? '标记归下一份。' : '标记归上一份。' }}</p>
     <div class="review-summary"><strong><Transition name="count" mode="out-in"><span :key="segments.length" class="review-count">{{ segments.length }}</span></Transition> 份</strong><span>输出 {{ outputPages }} / {{ total }} 页</span><span v-if="total > outputPages" class="excluded">排除 {{ total - outputPages }} 个标记页</span><button class="btn" :aria-pressed="focusSegment === -1" @click="focusSegment = -1">查看所有页</button></div>
     <div class="review-scroll">
-    <TransitionGroup name="segment" tag="div" class="segment-list" @before-leave="pinLeavingItem" @before-enter="clearPinnedItem" @leave-cancelled="clearPinnedItem"><div v-for="(group, index) in segments" :key="group[0]" class="segment-item"><button class="segment-label" :class="{ active: focusSegment === index }" @click="focusSegment = index"><b>{{ String(index + 1).padStart(2, '0') }}</b><span>第 {{ group[0] + 1 }}–{{ group[group.length - 1] + 1 }} 页<small>{{ group.length }} 页{{ options.max_segment_pages && group.length > options.max_segment_pages ? ' · 疑似漏检' : '' }}</small></span></button><button v-if="index < segments.length - 1" class="merge-segments" :disabled="busy" :aria-label="`合并第 ${index + 1} 份和下一份`" @click="merge(index)">合并下一份</button></div></TransitionGroup>
-    <PdfPageGrid :sources="source" :pages="pages" :badges="badges" :selectable="false" :disabled="busy"><template #action="{ page }"><button class="marker-toggle" :disabled="busy" :aria-pressed="markers.includes(page.index)" @click="toggleMarker(page.index)">{{ markers.includes(page.index) ? '移除分隔标记' : '设为分隔标记' }}</button></template></PdfPageGrid>
+    <div v-if="segmentListPages > 1" class="segment-pagination"><button class="btn" :disabled="segmentListPage <= 1" @click="segmentListPage--">上一组分段</button><label>第 <input v-model.number="segmentListPage" type="number" min="1" :max="segmentListPages" aria-label="分段导航组" @change="segmentListPage = Math.max(1, Math.min(segmentListPages, Number(segmentListPage) || 1))" /> / {{ segmentListPages }} 组</label><button class="btn" :disabled="segmentListPage >= segmentListPages" @click="segmentListPage++">下一组分段</button></div>
+    <TransitionGroup name="segment" tag="div" class="segment-list" @before-leave="pinLeavingItem" @before-enter="clearPinnedItem" @leave-cancelled="clearPinnedItem"><div v-for="{ group, index } in visibleSegments" :key="group[0]" class="segment-item"><button class="segment-label" :class="{ active: focusSegment === index }" @click="focusSegment = index"><b>{{ String(index + 1).padStart(2, '0') }}</b><span>第 {{ group[0] + 1 }}–{{ group[group.length - 1] + 1 }} 页<small>{{ group.length }} 页{{ options.max_segment_pages && group.length > options.max_segment_pages ? ' · 疑似漏检' : '' }}</small></span></button><button v-if="index < segments.length - 1" class="merge-segments" :disabled="busy" :aria-label="`合并第 ${index + 1} 份和下一份`" @click="merge(index)">合并下一份</button></div></TransitionGroup>
+    <PdfPageGrid :sources="source" :pages="pages" :badges="badges" :selectable="false" :disabled="busy" :unavailable-sources="unavailable ? [0] : []"><template #action="{ page }"><button class="marker-toggle" :disabled="busy" :aria-pressed="markers.includes(page.index)" @click="toggleMarker(page.index)">{{ markers.includes(page.index) ? '移除分隔标记' : '设为分隔标记' }}</button></template></PdfPageGrid>
     <ol v-if="outcome?.output_files.length" class="review-files"><li v-for="file in outcome.output_files" :key="file">{{ file }}</li></ol>
     </div>
-    <div class="review-export"><label><input type="checkbox" :checked="compression === 'lossless'" :disabled="busy" @change="emit('update:compression', ($event.target as HTMLInputElement).checked ? 'lossless' : 'none')" /> 结构优化</label><label><input type="checkbox" :checked="ocr" :disabled="busy" @change="emit('update:ocr', ($event.target as HTMLInputElement).checked)" /> 中英文离线 OCR</label><span class="export-spacer" /><button v-if="busy" class="btn" @click="task.cancel">取消输出</button><button v-else class="btn btn-primary" :disabled="!segments.length || !signature" @click="exportSegments">确认导出 {{ segments.length }} 份</button></div>
+    <div class="review-export"><label><input type="checkbox" :checked="compression === 'lossless'" :disabled="busy" @change="emit('update:compression', ($event.target as HTMLInputElement).checked ? 'lossless' : 'none')" /> 结构优化</label><label><input type="checkbox" :checked="ocr" :disabled="busy" @change="emit('update:ocr', ($event.target as HTMLInputElement).checked)" /> 中英文离线 OCR</label><span class="export-spacer" /><button v-if="busy" class="btn" @click="task.cancel">取消输出</button><button v-else class="btn btn-primary" :disabled="!segments.length || !signature || unavailable" @click="exportSegments">确认导出 {{ segments.length }} 份</button></div>
     <p v-if="busy" class="review-message" role="status">{{ state.phase }} · {{ state.current }} / {{ state.total }}（OCR 在当前页识别结束后响应取消）</p>
     <p v-if="message" class="review-message" role="status">{{ message }}</p>
 
@@ -76,6 +82,7 @@ h3 { font-size: 19px; margin: 5px 0 0; }
 .review-summary strong { font-size: 20px; }.review-summary .btn { margin-left: auto; font-size: 11px; }
 .excluded { color: #b45309; }
 .segment-list { position: relative; display: grid; grid-template-columns: repeat(auto-fill,minmax(170px,1fr)); gap: 8px; margin: 14px 0 18px; max-height: 180px; overflow: auto; }
+.segment-pagination { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 10px; font-size: 11px; }.segment-pagination input { width: 60px; padding: 4px; color: inherit; background: var(--color-surface); border: 1px solid var(--color-border); border-radius: 5px; }.segment-pagination .btn { font-size: 11px; padding: 4px 8px; }
 .segment-item { border: 1px solid var(--color-border); border-radius: 8px; overflow: hidden; background: var(--color-surface); }
 .segment-enter-active, .segment-move { transition: transform 300ms var(--motion-spring), opacity 180ms ease; }
 .segment-leave-active { position: absolute; pointer-events: none; transition: transform 180ms var(--motion-out), opacity 140ms ease; }

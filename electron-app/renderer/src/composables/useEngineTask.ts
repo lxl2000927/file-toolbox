@@ -85,7 +85,10 @@ export function useEngineTask(opts: {
         state.value.current = Number.isFinite(Number(params.current)) ? Number(params.current) : 0;
         state.value.total = Number.isFinite(Number(params.total)) ? Number(params.total) : 0;
         if (params.file) state.value.file = String(params.file);
-      } else if (method === "task.log") {
+      } else if (method === 'task.state') {
+        const labels: Record<string, string> = { pausing: '等待当前处理结束后暂停', paused: '已暂停，可在任务中心继续', running: '已继续处理', queued: '排队中', cancelling: '正在取消' };
+        if (params.state && labels[params.state]) state.value.phase = labels[params.state];
+      } else if (method === "task.log" || method === 'task.warning') {
         const msg = String(params.message || "");
         logs.value.push(msg);
         if (logs.value.length > MAX_LOG_LINES) {

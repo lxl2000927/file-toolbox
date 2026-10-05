@@ -1,6 +1,6 @@
 <script setup lang="ts">
 type IconName =
-  | "scan" | "pdf" | "rename" | "settings"
+  | "scan" | "pdf" | "rename" | "settings" | "tasks"
   | "alert" | "check" | "package"
   | "insert" | "replace" | "delete"
   | "close" | "info" | "success" | "warning"
@@ -30,7 +30,10 @@ withDefaults(defineProps<{
     aria-hidden="true"
     focusable="false"
   >
-    <template v-if="name === 'scan'">
+    <template v-if="name === 'tasks'">
+      <rect x="5" y="3" width="14" height="18" rx="2" /><path d="m8 9 1 1 2-2M13 9h3m-8 6 1 1 2-2m2 1h3" />
+    </template>
+    <template v-else-if="name === 'scan'">
       <path d="M4 7V5a2 2 0 0 1 2-2h2" />
       <path d="M16 3h2a2 2 0 0 1 2 2v2" />
       <path d="M20 17v2a2 2 0 0 1-2 2h-2" />

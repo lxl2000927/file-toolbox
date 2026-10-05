@@ -20,6 +20,8 @@ function mainHarness() {
   let confirmations = 0;
   let lookups = 0;
   const actions = [];
+  const engineCalls = [];
+  let responder = async (_method, params) => params;
   let savePath;
   const promises = new Proxy(fs.promises, {
     get(target, key) {
@@ -37,7 +39,7 @@ function mainHarness() {
   };
   const input = fs.readFileSync(path.join(__dirname, '../main/index.ts'), 'utf8');
   const code = buildSync({
-    stdin: { contents: input + '\nexport const harness = { setupIPC, authorizePath, isAuthorizedPath, isAllowedAppUrl, init(w,b) { mainWindow=w; bridge=b; engineStatus="ready"; } };', resolveDir: path.join(__dirname, '../main'), loader: 'ts' },
+    stdin: { contents: input + '\nexport const harness = { setupIPC, authorizePath, isAuthorizedPath, isAllowedAppUrl, init(w,b) { mainWindow=w; bridge=b; engineStatus="ready"; previewEngine.call=b.call.bind(b); } };', resolveDir: path.join(__dirname, '../main'), loader: 'ts' },
     bundle: true, platform: 'node', format: 'cjs', write: false,
     external: ['electron', 'electron-updater'],
   }).outputFiles[0].text;
@@ -48,10 +50,11 @@ function mainHarness() {
     require: (name) => name === 'electron' ? electron : name === 'electron-updater' ? { autoUpdater: {} } : name === 'fs' ? { ...fs, promises } : require(name),
   });
   const api = module.exports.harness;
-  api.init(window, { call: async (_method, params) => params });
+  api.init(window, { call: async (method, params) => { engineCalls.push([method, params]); return responder(method, params); } });
   api.setupIPC();
   return {
     ...api, appUrl, event,
+    engineCalls, respond: fn => { responder = fn; },
     actions, saveTo: p => { savePath = p; },
     invoke: (channel, arg, sender = event) => handlers.get(channel)(sender, arg),
     call: (method, params, sender = event) => handlers.get('engine:call')(sender, method, params),
@@ -207,4 +210,27 @@ test('renderer cannot supply the input identities used by deferred jobs', async 
   assert.equal(result._input_identities.forged, undefined);
   assert.equal(result._input_identities[file].ino, String((await fs.promises.stat(file, { bigint: true })).ino));
   assert.equal(result._input_identities[file].canonical, await fs.promises.realpath(file));
+}));
+
+test('renderer cannot inject resume metadata or call private journal readers', async () => fixture(async root => {
+  const h = mainHarness(), file = path.join(root, 'document.pdf');
+  fs.writeFileSync(file, 'document'); await h.authorizePath(file);
+  const result = await h.call('pdf_split.execute_async', { pdf_paths: [file], config: {}, _resume_task_id: 'forged', _output_identities: { forged: {} } });
+  assert.equal(result._resume_task_id, undefined); assert.equal(result._output_identities.forged, undefined);
+  for (const method of ['tasks.retry_spec', 'tasks.output_spec']) await assert.rejects(h.call(method, { task_id: 'old' }), /not allowed/);
+}));
+
+test('retry uses journal params and rejects changed original inputs before dispatch', async () => fixture(async root => {
+  const h = mainHarness(), file = path.join(root, 'original.pdf'); fs.writeFileSync(file, 'original content');
+  const stat = await fs.promises.stat(file, { bigint: true });
+  const identity = { canonical: await fs.promises.realpath(file), dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size), mtime_ns: String(stat.mtimeNs) };
+  h.respond(async (method, params) => method === 'tasks.retry_spec' ? {
+    method: 'pdf_split.execute_async', params: { pdf_paths: [file], config: {} }, input_identities: { [file]: identity }, output_identities: {},
+  } : params);
+  const result = await h.call('tasks.retry', { task_id: 'original_task', pdf_paths: ['C:\\private.pdf'] });
+  assert.equal(result.pdf_paths[0], file); assert.equal(result._resume_task_id, 'original_task'); assert.match(result.task_id, /^retry_/);
+  fs.writeFileSync(file, 'different content');
+  const before = h.engineCalls.filter(c => c[0] === 'pdf_split.execute_async').length;
+  await assert.rejects(h.call('tasks.retry', { task_id: 'original_task' }), /变化/);
+  assert.equal(h.engineCalls.filter(c => c[0] === 'pdf_split.execute_async').length, before);
 }));

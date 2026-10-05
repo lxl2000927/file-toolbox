@@ -398,6 +398,9 @@ class PdfSplitEngine:
         used_paths: Optional[set[str]] = None,
         cancel_check: Optional[CancelCheck] = None,
         on_output=None,
+        checkpoint=None,
+        on_checkpoint=None,
+        checkpoint_namespace='',
     ) -> list[str]:
         if not outputs:
             return []
@@ -409,6 +412,11 @@ class PdfSplitEngine:
             start, end = planned.page_range
             jobs.append(PdfOutputJob(planned.filename, range(int(start) - 1, int(end))))
 
+        if checkpoint is not None:
+            from src.utils.task_store import write_checkpointed_jobs
+            return write_checkpointed_jobs(pdf_path, output_dir=output_dir, jobs=jobs,
+                used_paths=used_paths, cancel_check=cancel_check, on_output=on_output,
+                checkpoint=checkpoint, on_checkpoint=on_checkpoint, namespace=checkpoint_namespace)
         return write_pdf_output_jobs(
             pdf_path,
             output_dir=output_dir,
@@ -497,7 +505,8 @@ class PdfSplitEngine:
 
         return bookmarks
     
-    def execute_split(self, pdf_paths: List[str], config_dict: Dict[str, Any], cancel_check: Optional[CancelCheck] = None) -> Dict[str, Any]:
+    def execute_split(self, pdf_paths: List[str], config_dict: Dict[str, Any], cancel_check: Optional[CancelCheck] = None,
+                      checkpoint=None, on_checkpoint=None) -> Dict[str, Any]:
         # 输入校验
         if not isinstance(pdf_paths, (list, tuple)):
             pdf_paths = [pdf_paths] if pdf_paths else []
@@ -530,6 +539,9 @@ class PdfSplitEngine:
                     seen.add(norm)
                     unique_paths.append(p)  # Bug4 Fix: append original path, not normcase'd norm
         pdf_paths = unique_paths
+        if checkpoint is not None or on_checkpoint is not None:
+            from src.utils.task_store import prepare_checkpoint
+            checkpoint = prepare_checkpoint('pdf_split', pdf_paths, config_dict, checkpoint)
 
         if not pdf_paths:
             results["errors"].append("没有需要处理的PDF文件")
@@ -550,8 +562,18 @@ class PdfSplitEngine:
             except Exception:
                 return False
         
-        for pdf_path in pdf_paths:
+        for input_index, pdf_path in enumerate(pdf_paths):
             record = SplitOperationRecord(pdf_path, [], "split")
+            previous = checkpoint.get('completed_inputs', {}).get(str(input_index)) if checkpoint is not None else None
+            if isinstance(previous, dict):
+                from src.utils.task_store import verify_outputs
+                artifacts = [unit['files']['pdf'] for key, unit in checkpoint['units'].items()
+                             if key.startswith(f'{input_index}:')]
+                verify_outputs(artifacts)
+                results['successful'] += 1
+                results['output_files'].extend(artifact['path'] for artifact in artifacts)
+                results['operations'].append(previous)
+                continue
              
             try:
                 if cancelled():
@@ -577,6 +599,8 @@ class PdfSplitEngine:
                     used_paths=used_paths,
                     cancel_check=cancel_check,
                     on_output=completed_output,
+                    checkpoint=checkpoint, on_checkpoint=on_checkpoint,
+                    checkpoint_namespace=f'{input_index}:',
                 )
 
                 if cancelled():
@@ -596,6 +620,10 @@ class PdfSplitEngine:
                 _op["output_files"] = _op["output_files"][:100]
                 _op["output_files_truncated"] = True
             results["operations"].append(_op)
+            if checkpoint is not None and record.success:
+                checkpoint['completed_inputs'][str(input_index)] = dict(_op)
+                if on_checkpoint:
+                    on_checkpoint(checkpoint)
         
         self._record_to_history(results)
         

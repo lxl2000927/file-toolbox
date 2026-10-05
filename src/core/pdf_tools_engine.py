@@ -18,6 +18,8 @@ from src.utils.atomic_output import write_new_output
 from src.utils.input_guard import read_input_bytes
 from src.utils.path_utils import _safe_output_name
 from src.utils.pdf_native_lock import PDF_NATIVE_LOCK
+from src.utils.output_resources import (OutputCheckpoint, check_disk, check_memory,
+                                        checked_writer, memory_budget, MIB)
 from src.core.pdf_sources import PdfSources
 from src.core.pdf_text import OcrTextCapture, PREVIEW_PAGES, PREVIEW_CHARS
 
@@ -111,7 +113,7 @@ def _open_source(path, data, stack):
     return doc, kind
 
 
-def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
+def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, checkpoint=None, on_checkpoint=None):
     if action not in ACTIONS:
         raise ValueError('未知 PDF 操作')
     if not isinstance(files, list) or not 1 <= len(files) <= MAX_FILES or any(not isinstance(p, str) or not os.path.isabs(p) for p in files):
@@ -205,21 +207,44 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
             compression = options.get('compression', 'lossless' if action == 'compress' else 'none')
             if compression not in ('none', 'lossless', 'raster'):
                 raise ValueError('未知压缩模式')
+            output_mode = options.get('output_mode', 'single')
+            if output_mode not in ('single', 'source', 'chunks'):
+                raise ValueError('未知输出方式，请选择单文件、按来源或按页数分卷')
+            chunk_pages = integer(options.get('chunk_pages', 200), 1, 10000, '每卷页数')
+            wants_ocr = bool(options.get('ocr') or action == 'ocr')
+            wants_text = wants_ocr and options.get('ocr_text') is True
+            journal = OutputCheckpoint(action, options,
+                [docs.info[i] for i in sorted(docs.info)], output_dir, checkpoint, on_checkpoint, check, result)
+            result['checkpoint'] = journal.state
 
-            def publish(filename, data, total):
+            def include(record, kind='pdf'):
+                field = 'text_files' if kind == 'text' else 'output_files'
+                paths = result.setdefault(field, [])
+                if record['path'] not in paths:
+                    paths.append(record['path'])
+                    if kind != 'text':
+                        result['bytes_after'] += record['size']
+
+            def publish(filename, data, total, unit):
+                reused = journal.get(unit, 'image')
+                if reused:
+                    include(reused, 'image')
+                    notify('已复用输出', len(result['output_files']), total)
+                    return
                 check()
-                path = write_new_output(output_dir, filename, lambda f: f.write(data), cancel_check)
-                result['output_files'].append(path)
-                result['bytes_after'] += len(data)
+                check_disk(output_dir, len(data))
+                path = write_new_output(output_dir, filename,
+                    checked_writer(output_dir, lambda f: f.write(data)), cancel_check)
+                include({'path': path, 'size': os.path.getsize(path)}, 'image')
+                journal.commit(unit, 'image', path, True)
                 notify('已输出', len(result['output_files']), total)
 
-            def finish_pdf(doc, filename, total):
+            def finish_pdf(doc, filename, total, unit, estimate):
                 with ExitStack() as processing_stack:
                     check()
                     processed = doc
                     capture = processing_stack.enter_context(OcrTextCapture(options.get('ocr_text') is True,
                         PREVIEW_PAGES - len(result.get('ocr_pages', []))))
-                    wants_ocr = options.get('ocr') or action == 'ocr'
                     def recognize(document):
                         from src.core.pdf_ocr import searchable_pdf
                         recognized, _ = searchable_pdf(document, options.get('language', 'chi_sim+eng'), dpi, check, notify,
@@ -242,19 +267,34 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                         processed = raster
                     # Write directly to the atomic output stream; avoid holding
                     # a second, serialized copy of a large merged PDF in RAM.
-                    path = write_new_output(output_dir, filename + '.pdf',
-                        lambda stream: processed.save(_PdfOutputStream(stream), garbage=4 if compression != 'none' else 2, deflate=True), cancel_check)
-                    result['output_files'].append(path)
-                    result['bytes_after'] += os.path.getsize(path)
+                    reused = journal.get(unit, 'pdf')
+                    if reused:
+                        path = reused['path']
+                        include(reused)
+                    else:
+                        check_disk(output_dir, estimate)
+                        path = write_new_output(output_dir, filename + '.pdf', checked_writer(output_dir,
+                            lambda stream: processed.save(_PdfOutputStream(stream), garbage=4 if compression != 'none' else 2, deflate=True)), cancel_check)
+                        include({'path': path, 'size': os.path.getsize(path)})
+                        journal.commit(unit, 'pdf', path, not wants_text)
                     if wants_ocr:
                         result.setdefault('ocr_pages', []).extend({**page, 'output_file': path} for page in capture.pages)
                         result.setdefault('recognized_text', []).extend(page['text'] for page in capture.pages)
                         result['ocr_total_pages'] = result.get('ocr_total_pages', 0) + capture.total
                         result.update(ocr_preview_limit=PREVIEW_PAGES, ocr_preview_chars=PREVIEW_CHARS)
                         if capture.stream:
-                            text_name = os.path.splitext(os.path.basename(path))[0] + '_文字.txt'
-                            text_path = write_new_output(output_dir, text_name, lambda stream: capture.write_to(stream, check), cancel_check)
-                            result.setdefault('text_files', []).append(text_path)
+                            reused_text = journal.get(unit, 'text')
+                            if reused_text:
+                                include(reused_text, 'text')
+                            else:
+                                check()
+                                text_name = os.path.splitext(os.path.basename(path))[0] + '_文字.txt'
+                                text_size = capture.stream.seek(0, 2)
+                                check_disk(output_dir, text_size)
+                                text_path = write_new_output(output_dir, text_name,
+                                    checked_writer(output_dir, lambda stream: capture.write_to(stream, check)), cancel_check)
+                                include({'path': text_path, 'size': os.path.getsize(text_path)}, 'text')
+                                journal.commit(unit, 'text', text_path, True)
                     notify('已输出', len(result['output_files']), total)
 
             if action == 'export_images':
@@ -263,7 +303,16 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                     raise ValueError('图片格式须为 PNG 或 JPEG')
                 for n, ref in enumerate(refs):
                     check()
+                    unit = f'page:{n}'
+                    reused = journal.get(unit, 'image')
+                    if reused:
+                        include(reused, 'image')
+                        notify('已复用输出', n + 1, len(refs))
+                        continue
                     page = docs[ref['source']][ref['index']]
+                    pixels = min(MAX_RENDER_PIXELS, page.rect.width * page.rect.height * (dpi / 72) ** 2)
+                    check_memory(int(pixels * 12 + docs.info[ref['source']]['size'] * 2 + 16 * MIB))
+                    check_disk(output_dir, int(pixels * 4))
                     old_rotation = page.rotation
                     try:
                         page.set_rotation((old_rotation + ref['rotation']) % 360)
@@ -271,7 +320,7 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                     finally:
                         page.set_rotation(old_rotation)
                     data = pix.tobytes('jpeg', jpg_quality=quality) if image_format == 'jpeg' else pix.tobytes('png')
-                    publish(f'{name}_{n + 1:04d}.{"jpg" if image_format == "jpeg" else "png"}', data, len(refs))
+                    publish(f'{name}_{n + 1:04d}.{"jpg" if image_format == "jpeg" else "png"}', data, len(refs), unit)
             elif action == 'extract_images':
                 seen = set()
                 for n, ref in enumerate(refs):
@@ -283,9 +332,17 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                         if key in seen:
                             continue
                         seen.add(key)
+                        unit = f'image:{ref["source"]}:{info[0]}'
+                        reused = journal.get(unit, 'image')
+                        if reused:
+                            include(reused, 'image')
+                            continue
+                        pixels = info[2] * info[3]
+                        check_memory(int(pixels * 8 + docs.info[ref['source']]['size'] * 2 + 16 * MIB))
+                        check_disk(output_dir, int(pixels * 4))
                         extracted = doc.extract_image(info[0])
                         if extracted:
-                            publish(f'{name}_s{ref["source"] + 1}_p{ref["index"] + 1}_{info[0]}.{extracted["ext"]}', extracted['image'], len(refs))
+                            publish(f'{name}_s{ref["source"] + 1}_p{ref["index"] + 1}_{info[0]}.{extracted["ext"]}', extracted['image'], len(refs), unit)
                     notify('提取原始图片', n + 1, len(refs))
                 if not result['output_files']:
                     result['warnings'] = ['所选页面没有嵌入图片；矢量内容请使用“导出页面图片”。']
@@ -311,8 +368,78 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                     all_indexes = [r['index'] for g in groups for r in g]
                     if len(all_indexes) != len(set(all_indexes)):
                         raise ValueError('分段页码重复，请重新复核')
+                if action != 'segments':
+                    ordered = groups[0]
+                    if output_mode == 'source':
+                        by_source = {}
+                        for ref in ordered:
+                            by_source.setdefault(ref['source'], []).append(ref)
+                        groups = list(by_source.values())
+                    elif output_mode == 'chunks':
+                        groups = [ordered[i:i + chunk_pages] for i in range(0, len(ordered), chunk_pages)]
+
+                # Estimate complete output units before constructing any merged
+                # document. Source span bytes include temporary pages copied to
+                # preserve links; raster/OCR include encoded output and scratch.
+                pixels_by_page = {}
+                if compression == 'raster' or wants_ocr:
+                    indexes_by_source = {}
+                    for group in groups:
+                        for ref in group:
+                            indexes_by_source.setdefault(ref['source'], set()).add(ref['index'])
+                    render_dpi = max(150, dpi) if wants_ocr else dpi
+                    for source_id, indexes in indexes_by_source.items():
+                        check()
+                        source = docs[source_id]
+                        for index in indexes:
+                            check()
+                            rect = source[index].rect
+                            pixels_by_page[(source_id, index)] = min(MAX_RENDER_PIXELS, rect.width * rect.height * (render_dpi / 72) ** 2)
+                estimates = []
+                pending_disk = 0
+                budget = memory_budget()
+                for n, group in enumerate(groups):
+                    unit = f'pdf:{n}'
+                    reused = journal.get(unit, 'pdf')
+                    reused_text = journal.get(unit, 'text') if wants_text else None
+                    if reused and (not wants_text or reused_text):
+                        estimates.append((0, 0, True))
+                        continue
+                    spans = {}
+                    for ref in group:
+                        spans.setdefault(ref['source'], []).append(ref['index'])
+                    copy_counts = {i: max(pages) - min(pages) + 1 + len(pages) - len(set(pages))
+                                   for i, pages in spans.items()}
+                    source_bytes = sum(docs.info[i]['size'] * copy_counts[i] / docs.info[i]['page_count']
+                                       for i, pages in spans.items())
+                    source_peak = max(docs.info[i]['size'] for i in spans) * 2
+                    copied_pages = sum(copy_counts.values())
+                    encoded_pixels = sum(pixels_by_page.get((r['source'], r['index']), 0) for r in group)
+                    peak_pixels = max((pixels_by_page.get((r['source'], r['index']), 0) for r in group), default=0)
+                    estimate = int(max(source_bytes * 2, encoded_pixels * 0.75) + len(group) * 8192)
+                    required = int(16 * MIB + source_peak + source_bytes * 3 + copied_pages * 65536
+                                   + encoded_pixels * 0.75 + peak_pixels * 12)
+                    check_memory(required, budget)
+                    estimates.append((estimate, required, False))
+                    pending_disk += estimate if not reused else len(group) * 65536
+                if pending_disk:
+                    check_disk(output_dir, pending_disk)
                 for n, group in enumerate(groups):
                     check()
+                    unit = f'pdf:{n}'
+                    estimate, required, complete = estimates[n]
+                    reused = journal.get(unit, 'pdf')
+                    if reused:
+                        include(reused)
+                    if complete:
+                        if wants_text:
+                            include(journal.get(unit, 'text'), 'text')
+                        if wants_ocr:
+                            result['ocr_total_pages'] = result.get('ocr_total_pages', 0) + len(group)
+                        notify('已复用输出单元', n + 1, len(groups))
+                        continue
+                    check_memory(required)
+                    notify('处理输出单元', n, len(groups))
                     with fitz.open() as output:
                         # Copy whole source page trees first so internal links
                         # and form relationships survive. select() remaps page
@@ -332,6 +459,16 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                             output.insert_pdf(source, from_page=first_page, to_page=last_page, links=True, annots=True, widgets=True)
                             notify('合并来源文件', len(offsets), len(source_indexes))
                         chosen = [offsets[ref['source']] + ref['index'] for ref in group]
+                        # select() may alias repeated page objects. Independent
+                        # copies keep each chosen occurrence's rotation intact.
+                        seen_pages = set()
+                        for i, page_index in enumerate(chosen):
+                            if page_index in seen_pages:
+                                check()
+                                output.fullcopy_page(page_index)
+                                chosen[i] = len(output) - 1
+                            else:
+                                seen_pages.add(page_index)
                         if chosen != list(range(len(output))):
                             output.select(chosen)
                         for i, ref in enumerate(group):
@@ -352,7 +489,9 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None):
                                     bookmarks.append([level, title, new_page])
                         if bookmarks:
                             output.set_toc(bookmarks)
-                        finish_pdf(output, f'{name}_{n + 1:03d}' if action == 'segments' else name, len(groups))
+                        filename = f'{name}_{n + 1:03d}' if action == 'segments' or output_mode != 'single' else name
+                        finish_pdf(output, filename, len(groups), unit, estimate)
+                    notify('已完成输出单元', n + 1, len(groups))
             check()
             return result
     except InterruptedError:

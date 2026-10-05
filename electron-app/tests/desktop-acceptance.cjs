@@ -9,7 +9,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '../..');
 const samples = path.join(root, 'acceptance-samples');
 const evidence = path.join(samples, 'desktop-evidence');
-const profile = path.join(samples, 'desktop-profile');
+const profile = fs.mkdtempSync(path.join(samples, 'desktop-profile-'));
 fs.mkdirSync(path.join(samples, 'desktop-results'), { recursive: true });
 fs.mkdirSync(evidence, { recursive: true }); fs.mkdirSync(profile, { recursive: true });
 process.env.APPDATA = profile;

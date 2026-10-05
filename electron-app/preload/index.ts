@@ -16,6 +16,13 @@ type DialogOpenFilesOptions = {
 };
 
 const engineApi: EngineAPI = {
+  tasks: {
+    list: () => ipcRenderer.invoke('engine:call', 'tasks.list', {}),
+    pause: task_id => ipcRenderer.invoke('engine:call', 'task.pause', { task_id }),
+    resume: task_id => ipcRenderer.invoke('engine:call', 'task.resume', { task_id }),
+    retry: task_id => ipcRenderer.invoke('engine:call', 'tasks.retry', { task_id }),
+    reveal: task_id => ipcRenderer.invoke('engine:call', 'tasks.reveal', { task_id }),
+  },
   pdfTools: {
     run: (action, files, options, taskId) => ipcRenderer.invoke("engine:call", "pdf_tools.run", { action, files, options, task_id: taskId }),
   },
@@ -114,6 +121,19 @@ const engineApi: EngineAPI = {
 contextBridge.exposeInMainWorld("engine", engineApi);
 
 const electronApi: ElectronAPI = {
+  workspace: {
+    load: scope => ipcRenderer.invoke('workspace:load', scope),
+    save: (scope, state) => ipcRenderer.invoke('workspace:save', scope, state),
+    clear: scope => ipcRenderer.invoke('workspace:clear', scope),
+    flush: () => ipcRenderer.invoke('workspace:flush'),
+    relocate: (scope, index) => ipcRenderer.invoke('workspace:relocate', scope, index),
+    onFlushRequested: callback => {
+      const listener = (_event: IpcRendererEvent, token: string) => callback(token);
+      ipcRenderer.on('workspace:flush-requested', listener);
+      return () => ipcRenderer.removeListener('workspace:flush-requested', listener);
+    },
+    flushed: (token, error) => { void ipcRenderer.invoke('workspace:flushed', token, error).catch(() => {}); },
+  },
   openFileDialog: (options?: DialogOpenFilesOptions) =>
     ipcRenderer.invoke("dialog:openFiles", options),
   openDirectoryDialog: (options?: { title?: string }) =>

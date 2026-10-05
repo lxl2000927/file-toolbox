@@ -6,7 +6,7 @@ import math
 import threading
 import time
 from functools import wraps
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional, Literal
 from urllib.parse import unquote
 import unicodedata
@@ -2411,6 +2411,8 @@ class PdfScanSplitEngine:
         log: Optional[LogCallback] = None,
         cancel_check: Optional[CancelCheck] = None,
         phase_progress: Optional[PhaseProgressCallback] = None,
+        checkpoint=None,
+        on_checkpoint=None,
     ) -> list[str]:
         if not segments:
             return []
@@ -2434,6 +2436,13 @@ class PdfScanSplitEngine:
             for idx, pages in enumerate(segments, start=1)
         ]
         try:
+            if checkpoint is not None or on_checkpoint is not None:
+                from src.utils.task_store import prepare_checkpoint, write_checkpointed_jobs
+                prepared = prepare_checkpoint('scan_segments', [pdf_path],
+                    {'segments': segments, 'output_dir': output_dir, 'prefix': prefix}, checkpoint)
+                return write_checkpointed_jobs(pdf_path, output_dir=output_dir, jobs=jobs,
+                    cancel_check=cancel_check, on_output=on_output, checkpoint=prepared,
+                    on_checkpoint=on_checkpoint)
             return write_pdf_output_jobs(
                 pdf_path, output_dir=output_dir, jobs=jobs, cancel_check=cancel_check,
                 on_output=on_output, cleanup_outputs_on_cancel=False,
@@ -2453,6 +2462,8 @@ class PdfScanSplitEngine:
         log: Optional[LogCallback] = None,
         cancel_check: Optional[CancelCheck] = None,
         phase_progress: Optional[PhaseProgressCallback] = None,
+        checkpoint=None,
+        on_checkpoint=None,
     ) -> PdfScanSplitResult:
         # 支持传入 dict 配置
         if isinstance(options, dict):
@@ -2472,15 +2483,25 @@ class PdfScanSplitEngine:
 
         perf = _PerfStats()
         scan_started_at = time.perf_counter()
-        markers, total_pages = PdfScanSplitEngine._scan_markers(
-            pdf_path,
-            reference_image_path,
-            options,
-            perf=perf,
-            progress=progress,
-            log=log,
-            cancel_check=cancel_check,
-        )
+        from src.utils.task_store import prepare_checkpoint
+        saved = prepare_checkpoint('scan_execute', [pdf_path] + ([reference_image_path] if reference_image_path else []),
+                                   {'options': asdict(options), 'output_dir': output_dir, 'prefix': prefix}, checkpoint)
+        scan = saved.get('scan')
+        if scan is not None:
+            if not isinstance(scan, dict) or not isinstance(scan.get('markers'), list) or not isinstance(scan.get('total_pages'), int):
+                raise ValueError('扫描检查点损坏')
+            markers, total_pages = scan['markers'], scan['total_pages']
+            if log:
+                log('已恢复完整扫描结果，继续未完成输出')
+        else:
+            markers, total_pages = PdfScanSplitEngine._scan_markers(
+                pdf_path, reference_image_path, options, perf=perf, progress=progress,
+                log=log, cancel_check=cancel_check,
+            )
+            if not PdfScanSplitEngine._is_cancelled(cancel_check):
+                saved['scan'] = {'markers': markers, 'total_pages': total_pages}
+                if on_checkpoint:
+                    on_checkpoint(saved)
         scan_elapsed_s = time.perf_counter() - scan_started_at
         perf.scan_seconds = scan_elapsed_s
 
@@ -2519,10 +2540,16 @@ class PdfScanSplitEngine:
         warnings = [f"发现 {len(suspect_segments)} 个超长分段，请检查是否漏掉标记页"] if suspect_segments else []
 
         write_started_at = time.perf_counter()
+        def save_segments(value):
+            saved['segments'] = value
+            saved['units'] = value['units']
+            if on_checkpoint:
+                on_checkpoint(saved)
         try:
             outputs = PdfScanSplitEngine.write_segments(
                 pdf_path, segments, output_dir=output_dir, prefix=prefix or "", log=log,
                 cancel_check=cancel_check, phase_progress=phase_progress,
+                checkpoint=saved.get('segments'), on_checkpoint=save_segments if on_checkpoint is not None else None,
             )
         except ScanWriteError as exc:
             perf.write_seconds = time.perf_counter() - write_started_at

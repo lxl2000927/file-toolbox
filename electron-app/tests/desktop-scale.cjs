@@ -6,7 +6,7 @@ const path = require('node:path');
 const root = path.resolve(__dirname, '../..');
 const samples = path.join(root, 'acceptance-samples');
 const evidence = path.join(samples, 'scale-evidence');
-const profile = path.join(samples, 'scale-profile');
+const profile = fs.mkdtempSync(path.join(samples, 'scale-profile-'));
 fs.mkdirSync(evidence, { recursive: true }); fs.mkdirSync(profile, { recursive: true });
 process.env.APPDATA = profile; app.setPath('userData', profile);
 app.disableHardwareAcceleration();
@@ -27,6 +27,7 @@ async function until(code, timeout = 120000) {
   throw Error(`Timed out ${code}\n${await js('document.body.innerText')}`);
 }
 async function click(text) {
+  await until(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(text)}); return b && !b.disabled; })()`, 20000);
   await js(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent.trim()===${JSON.stringify(text)}); if(!b || b.disabled) throw Error('Unavailable button'); b.click(); })()`);
 }
 async function jump(batch) {
@@ -89,8 +90,30 @@ app.whenReady().then(async () => {
     await click('移动所选'); await click('撤销');
     await jump(750); await until(`document.querySelector('.page-caption')?.textContent.includes('document-2997.pdf') && document.querySelectorAll('.page-card img').length===12`);
     assert.equal(await js(`document.querySelectorAll('.page-card').length`), 12);
+    const storedPath = path.join(profile, 'FileToolbox/workspaces/workbench.json');
+    let snapshot;
+    for (let attempt = 0; attempt < 600; attempt++) {
+      try { const saved = JSON.parse(fs.readFileSync(storedPath, 'utf8')); if (saved.state.sources.length === 3000 && saved.state.pages.length === 9000) { snapshot = saved.state; break; } } catch {}
+      await delay(100);
+    }
+    assert.ok(snapshot, '3000-file workspace must reach persistent storage');
+    const restoreStart = performance.now();
+    const loaded = new Promise(resolve => win.webContents.once('did-finish-load', resolve));
+    win.webContents.reload(); await loaded;
+    await until(`document.querySelector('.status-text')?.textContent.includes('已就绪')`);
+    await click('PDF 工作台');
+    await until(`document.querySelector('.workspace-status')?.textContent.includes('3000 个来源') && document.querySelectorAll('.page-card img').length===12`);
+    const restoreMs = Math.round(performance.now() - restoreStart);
+    await js(`(() => { document.querySelector('.source-navigator').open=true; const input=document.querySelector('[aria-label="搜索来源"]'); input.value='document-3000'; input.dispatchEvent(new Event('input',{bubbles:true})); })()`);
+    await until(`document.querySelectorAll('.source-name').length===1`);
+    await js(`document.querySelector('.source-name').click()`);
+    await until(`document.querySelectorAll('.page-card img').length===3 && document.querySelector('.page-caption')?.textContent.includes('document-3000.pdf')`);
+    await js(`(() => { const input=document.querySelector('[aria-label="来源原页码"]'); input.value='2'; input.dispatchEvent(new Event('input',{bubbles:true})); input.dispatchEvent(new KeyboardEvent('keyup',{key:'Enter',bubbles:true})); })()`);
+    await until(`document.querySelectorAll('.page-card img').length===12`);
+    assert.equal(await js(`document.querySelectorAll('.grid-error').length`), 0);
+    fs.writeFileSync(path.join(evidence, 'workspace-3000-restored.png'), (await win.webContents.capturePage()).toPNG());
     assert.deepEqual(errors, []);
-    fs.writeFileSync(path.join(evidence, 'desktop-scale.json'), JSON.stringify({ passed: true, timings, errors, cancellation: '3 cancellations then resume to 3000 passed', bulk_selection_ms: bulkSelectionMs, bulk_move_undo: 'passed' }, null, 2));
+    fs.writeFileSync(path.join(evidence, 'desktop-scale.json'), JSON.stringify({ passed: true, timings, errors, cancellation: '3 cancellations then resume to 3000 passed', bulk_selection_ms: bulkSelectionMs, bulk_move_undo: 'passed', restore_3000_ms: restoreMs, source_search_and_original_page_jump: 'passed' }, null, 2));
     console.log('PASS large workspace acceptance and cancellation'); app.quit();
   } catch (error) { console.error(error); app.exit(1); }
 });

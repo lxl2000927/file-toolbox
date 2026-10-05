@@ -6,12 +6,14 @@ import { usePdfTools } from "../../composables/usePdfTools";
 import { pinLeavingItem, clearPinnedItem } from "../../motion";
 import { previewRequest, ThumbnailCache } from "../../pdf-preview";
 
-const props = withDefaults(defineProps<{ sources: PdfSource[]; pages: WorkPage[]; selected?: string[]; badges?: Record<string, string>; disabled?: boolean; selectable?: boolean; movable?: boolean }>(), { selectable: true });
+const props = withDefaults(defineProps<{ sources: PdfSource[]; pages: WorkPage[]; allPages?: WorkPage[]; selected?: string[]; badges?: Record<string, string>; disabled?: boolean; selectable?: boolean; movable?: boolean; jumpPage?: number; jumpToken?: number; unavailableSources?: number[] }>(), { selectable: true });
 const emit = defineEmits<{ select: [uid: string, range: boolean]; move: [dragged: string, before: string] }>();
 const batch = ref(1);
 const pageSize = 12;
 const totalBatches = computed(() => Math.max(1, Math.ceil(props.pages.length / pageSize)));
 const visible = computed(() => props.pages.slice((batch.value - 1) * pageSize, batch.value * pageSize));
+const unavailable = computed(() => new Set(props.unavailableSources || []));
+const globalPositions = computed(() => new Map((props.allPages || props.pages).map((page, index) => [page.uid, index + 1])));
 const thumbnails = shallowRef<Record<string, string>>({});
 const cache = new ThumbnailCache();
 const loadError = ref("");
@@ -29,7 +31,8 @@ const dragOverUid = ref('');
 const key = (page: WorkPage) => `${props.sources[page.source]?.path}:${props.sources[page.source]?.signature}:${page.index}`;
 
 watch(totalBatches, count => { batch.value = Math.min(batch.value, count); });
-watch(() => visible.value.map(key).join('|'), () => {
+watch(() => [props.jumpPage, props.jumpToken], () => { if (props.jumpPage) batch.value = Math.max(1, Math.min(totalBatches.value, Math.ceil(props.jumpPage / pageSize))); }, { immediate: true });
+watch(() => visible.value.map(page => `${key(page)}:${unavailable.value.has(page.source)}`).join('|'), () => {
   if (previewTask.busy.value) void previewTask.cancel();
   generation++; void load();
 }, { immediate: true });
@@ -41,7 +44,7 @@ async function load() {
   const shown: Record<string, string> = {};
   visible.value.forEach(page => { const value = cache.get(key(page)); if (value) shown[key(page)] = value; });
   thumbnails.value = shown;
-  const missing = visible.value.filter(page => !shown[key(page)]);
+  const missing = visible.value.filter(page => !shown[key(page)] && !unavailable.value.has(page.source));
   if (!missing.length || !props.sources.length) return;
   loading.value = true;
   const keys = missing.map(key);
@@ -58,7 +61,7 @@ async function load() {
 }
 
 async function enlarge(page: WorkPage) {
-  if (detailTask.busy.value) return;
+  if (detailTask.busy.value || unavailable.value.has(page.source)) return;
   const version = ++detailGeneration;
   detail.value = page; detailImage.value = ''; detailError.value = '';
   await nextTick(); previewDialog.value?.showModal();
@@ -95,8 +98,8 @@ onBeforeUnmount(() => { disposed = true; cache.clear(); });
     <p v-if="loadError" class="grid-error" role="alert">{{ loadError }} <button class="btn" @click="load">重试预览</button></p>
     <TransitionGroup name="page-sort" tag="div" class="page-grid" appear @before-leave="pinLeavingItem" @before-enter="clearPinnedItem" @leave-cancelled="clearPinnedItem">
       <article v-for="(page, index) in visible" :key="page.uid" class="page-card" :style="{ '--motion-order': Math.min(index, 7) }" :class="{ selected: selected?.includes(page.uid), marked: badges?.[page.uid], dragging: dragUid === page.uid, 'drop-target': dragOverUid === page.uid }" :draggable="Boolean(movable && !disabled)" @dragstart="startDrag($event, page)" @dragover.prevent="dragOverUid = dragUid && dragUid !== page.uid ? page.uid : ''" @dragleave="dragOverUid = dragOverUid === page.uid ? '' : dragOverUid" @drop="drop($event, page.uid)" @dragend="endDrag">
-        <div class="page-top"><label v-if="selectable !== false"><input type="checkbox" :checked="selected?.includes(page.uid)" :disabled="disabled" :aria-label="`选择第 ${pages.indexOf(page) + 1} 页`" @click="emit('select', page.uid, $event.shiftKey)" /><span>{{ pages.indexOf(page) + 1 }}</span></label><span v-else>第 {{ page.index + 1 }} 页</span><span v-if="badges?.[page.uid]" class="page-badge">{{ badges[page.uid] }}</span></div>
-        <button class="thumbnail" :aria-label="`放大预览第 ${page.index + 1} 页`" @click="enlarge(page)"><img v-if="thumbnails[key(page)]" :src="thumbnails[key(page)]" :style="{ transform: `rotate(${page.rotation}deg)` }" alt="" /><span v-else class="placeholder">{{ loadError ? '预览失败' : '加载预览…' }}</span></button>
+        <div class="page-top"><label v-if="selectable !== false"><input type="checkbox" :checked="selected?.includes(page.uid)" :disabled="disabled" :aria-label="`选择第 ${globalPositions.get(page.uid)} 页`" @click="emit('select', page.uid, $event.shiftKey)" /><span>{{ globalPositions.get(page.uid) }}</span></label><span v-else>第 {{ page.index + 1 }} 页</span><span v-if="badges?.[page.uid]" class="page-badge">{{ badges[page.uid] }}</span></div>
+        <button class="thumbnail" :disabled="unavailable.has(page.source)" :aria-label="`放大预览第 ${page.index + 1} 页`" @click="enlarge(page)"><img v-if="thumbnails[key(page)] && !unavailable.has(page.source)" :src="thumbnails[key(page)]" :style="{ transform: `rotate(${page.rotation}deg)` }" alt="" /><span v-else class="placeholder">{{ unavailable.has(page.source) ? '来源不可用 · 请重新定位' : loadError ? '预览失败' : '加载预览…' }}</span></button>
         <div class="page-caption"><span :title="sources[page.source]?.name">{{ sources[page.source]?.name }}</span><small>原第 {{ page.index + 1 }} 页<span v-if="page.rotation"> · 旋转 {{ page.rotation }}°</span></small></div>
         <slot name="action" :page="page" />
       </article>

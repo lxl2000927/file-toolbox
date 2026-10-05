@@ -1,4 +1,6 @@
 import type { FileAccessResult, FilePathStat } from "./ipc-types";
+import type { TaskCenterAPI } from './task-types';
+import type { WorkspaceAPI } from './workspace-types';
 
 export type RenamePreviewItem = { old: string; new: string };
 
@@ -145,6 +147,7 @@ export type ScanSplitOptions = {
 };
 
 export type EngineNotificationParams = {
+  state?: string;
   task_id?: string;
   status?: string;
   phase?: string;
@@ -170,6 +173,7 @@ export type EngineNotificationPayload = {
 };
 
 export interface EngineAPI {
+  tasks: TaskCenterAPI;
   pdfTools: {
     run: (action: PdfToolAction, files: string[], options: PdfToolOptions, taskId: string) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
   };
@@ -218,6 +222,7 @@ export type PdfToolOptions = {
   dpi?: number; quality?: number; compression?: "none" | "lossless" | "raster";
   reverse_back?: boolean; image_format?: "png" | "jpeg"; ocr?: boolean; ocr_text?: boolean;
   language?: "chi_sim+eng" | "chi_sim" | "eng"; segments?: number[][];
+  output_mode?: 'single' | 'source' | 'chunks'; chunk_pages?: number;
 };
 export type PdfSource = { path: string; name: string; kind: "pdf" | "image"; page_count: number; signature: string; size: number;
   pages: { index: number; width: number; height: number; rotation: number }[] };
@@ -250,6 +255,7 @@ export type AppUpdateStatus = {
 };
 
 export interface ElectronAPI {
+  workspace: WorkspaceAPI;
   openFileDialog: (options?: { filters?: { name: string; extensions: string[] }[]; multi?: boolean; title?: string }) => Promise<string[]>;
   openDirectoryDialog: (options?: { title?: string }) => Promise<string>;
   statPaths: (paths: string[]) => Promise<FileAccessResult<FilePathStat>[]>;

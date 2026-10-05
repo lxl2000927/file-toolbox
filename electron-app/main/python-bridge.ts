@@ -59,6 +59,7 @@ export class PythonBridge {
     isDev = false,
     pythonExe = "python",
     authToken = "",
+    environment: Record<string, string> = {},
   ): Promise<void> {
     // 优先使用传入的 token，其次读取环境变量，最后为空（server.py 端会跳过空 token 检查）
     this.authToken = authToken || process.env.FILE_TOOLBOX_ENGINE_TOKEN || "";
@@ -76,6 +77,7 @@ export class PythonBridge {
         windowsHide: true,
         env: {
           ...process.env,
+          ...environment,
           FILE_TOOLBOX_ENGINE_TOKEN: authToken,
           FILE_TOOLBOX_ENGINE_DEBUG_ERRORS: isDev ? "1" : "0",
         },

@@ -1,5 +1,7 @@
 """Exercise the frozen engine from an isolated directory, without source imports."""
 import argparse
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +21,40 @@ def identity(path):
     return {'dev': str(stat.st_dev & 0xFFFFFFFF if os.name == 'nt' else stat.st_dev),
             'ino': str(stat.st_ino), 'size': str(stat.st_size), 'mtime_ns': str(stat.st_mtime_ns),
             'canonical': str(path.resolve())}
+
+
+def document_pages(paths):
+    """Read actual output contents and rotations, preserving file boundaries."""
+    pages = []
+    for path in paths:
+        with pymupdf.open(path) as document:
+            pages.append([(page.get_text().strip(), page.rotation) for page in document])
+    return pages
+
+
+def output_snapshot(paths):
+    return {str(path): (path.stat().st_mtime_ns, path.stat().st_size,
+                       hashlib.sha256(path.read_bytes()).hexdigest()) for path in map(Path, paths)}
+
+
+@contextmanager
+def block_input_reads(path):
+    """Windows byte locks reject reads without changing bytes or stat identity.
+
+    The second input can therefore fail after the first input's outputs commit,
+    and retry after unlocking can use exactly the same authorized inputs. This
+    avoids racing a cancel request against a small, fast native PDF operation.
+    """
+    if os.name != 'nt':
+        raise RuntimeError('Frozen Windows retry smoke requires Windows byte-range locks')
+    import msvcrt
+    with path.open('r+b') as stream:
+        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        try:
+            yield
+        finally:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 class Engine:
@@ -56,10 +92,14 @@ class Engine:
         if 'error' in reply: raise RuntimeError(f'{method}: {reply["error"]}')
         return reply['result']
 
-    def task(self, method, params):
-        task_id = f'smoke-{self.request_id + 1}'
+    def task_payload(self, method, params, task_id=None):
+        task_id = task_id or f'smoke-{self.request_id + 1}'
         self.call(method, {**params, 'task_id': task_id})
         payload = self.receive(lambda r: r.get('method') == 'task.complete' and r['params']['task_id'] == task_id)['params']
+        return payload
+
+    def task(self, method, params):
+        payload = self.task_payload(method, params)
         if not payload['ok']: raise RuntimeError(f'{method}: {payload}')
         return payload['result']
 
@@ -124,6 +164,88 @@ def main():
             assert engine.call('presets.list', {'scope': 'workbench'})[0]['id'] == preset['id']
             assert engine.call('history.get', {'count': 100})['records']
             checks.append('preset persistence and operation history')
+
+            # Dedicated content fixtures make page ordering and output grouping
+            # assertions independent of acceptance-sample artwork or metadata.
+            sources = []
+            for label in ['A', 'B']:
+                source = directory / f'2.7-source-{label}.pdf'
+                with pymupdf.open() as document:
+                    for number in range(1, 4):
+                        document.new_page(width=180, height=240).insert_text((15, 35), f'SMOKE {label}{number}')
+                    document.save(source)
+                sources.append(source)
+            selected = [{'source': 1, 'index': 2, 'rotation': 90}, {'source': 0, 'index': 1},
+                        {'source': 1, 'index': 0}, {'source': 0, 'index': 2}, {'source': 1, 'index': 1}]
+            source_output = tool('assemble', sources, filename='by-source', pages=selected, output_mode='source')
+            assert document_pages(source_output['output_files']) == [
+                [('SMOKE B3', 90), ('SMOKE B1', 0), ('SMOKE B2', 0)],
+                [('SMOKE A2', 0), ('SMOKE A3', 0)]]
+            checks.append('2.7 by-source output preserves selected source order, page content and rotation')
+            chunk_output = tool('assemble', sources, filename='by-chunks', pages=selected,
+                                output_mode='chunks', chunk_pages=2)
+            assert document_pages(chunk_output['output_files']) == [
+                [('SMOKE B3', 90), ('SMOKE A2', 0)], [('SMOKE B1', 0), ('SMOKE A3', 0)], [('SMOKE B2', 0)]]
+            checks.append('2.7 chunk output preserves global selected order and final partial chunk')
+
+            retry_directory = directory / 'resume-output'
+            retry_directory.mkdir()
+            retry_params = {'pdf_paths': [str(path) for path in sources],
+                'config': {'mode': 'by_page_count', 'page_count': 1, 'output_dir': str(retry_directory)},
+                '_input_identities': {str(path): identity(path) for path in sources},
+                '_output_identities': {str(retry_directory): identity(retry_directory)}}
+            failed_id, resumed_id = 'smoke-checkpoint-original', 'smoke-checkpoint-resumed'
+            original_sources = output_snapshot(sources)
+            with block_input_reads(sources[1]):
+                failed = engine.task_payload('pdf_split.execute_async', retry_params, failed_id)
+            assert not failed['ok'] and not failed.get('cancelled')
+            partial = failed['result']
+            assert partial['successful'] == 1 and partial['failed'] == 1
+            completed = partial['output_files']
+            assert document_pages(completed) == [[('SMOKE A1', 0)], [('SMOKE A2', 0)], [('SMOKE A3', 0)]]
+            original_outputs = output_snapshot(completed)
+            listing = engine.call('tasks.list', {})
+            assert not listing.get('storage_error')
+            original_record = next(record for record in listing['tasks'] if record['task_id'] == failed_id)
+            assert original_record['state'] == 'failed' and original_record['can_retry']
+            assert original_record['output_count'] == 3 and original_record['output_files'] == completed
+            checks.append('2.7 task list records failed task and three genuinely committed PDF outputs')
+
+            # Recreate the process, not its data directory: the retry must recover
+            # its checkpoint from the durable journal, not a live Python object.
+            engine.close()
+            engine = Engine(args.engine.resolve(), directory)
+            engine.receive(lambda r: r.get('method') == 'ready')
+            restored = engine.call('tasks.list', {})
+            assert not restored.get('storage_error')
+            record = next(item for item in restored['tasks'] if item['task_id'] == failed_id)
+            assert record['state'] == 'failed' and record['can_retry'] and record['output_count'] == 3
+            spec = engine.call('tasks.retry_spec', {'task_id': failed_id})
+            assert spec['method'] == 'pdf_split.execute_async'
+            assert spec['params']['pdf_paths'] == retry_params['pdf_paths']
+            retried = engine.task_payload(spec['method'], {**spec['params'], '_resume_task_id': failed_id,
+                '_input_identities': spec['input_identities'], '_output_identities': spec['output_identities']}, resumed_id)
+            assert retried['ok'], retried
+            outputs = retried['result']['output_files']
+            assert len(outputs) == len(set(outputs)) == 6
+            assert outputs[:3] == completed and output_snapshot(completed) == original_outputs
+            assert document_pages(outputs) == [[(f'SMOKE {label}{number}', 0)]
+                                               for label in ['A', 'B'] for number in range(1, 4)]
+            assert set(retry_directory.glob('*.pdf')) == {Path(path) for path in outputs}
+            assert not list(retry_directory.glob('*.tmp*'))
+            assert output_snapshot(sources) == original_sources
+            listing = engine.call('tasks.list', {})
+            records = {record['task_id']: record for record in listing['tasks']}
+            assert records[resumed_id]['state'] == 'completed' and records[resumed_id]['output_count'] == 6
+            assert not records[failed_id]['can_retry']
+            try:
+                engine.call('tasks.retry_spec', {'task_id': failed_id})
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError('A superseded parent task must not create a duplicate retry')
+            assert engine.call('ping', {})['pong']
+            checks.append('2.7 durable checkpoint retry after restart preserves PDF bytes and creates no duplicate outputs')
         finally: engine.close()
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({'passed': True, 'engine': str(args.engine.resolve()), 'checks': checks}, indent=2), encoding='utf-8')

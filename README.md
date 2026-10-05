@@ -2,7 +2,7 @@
 
 一款面向 Windows 的桌面文件处理工具，提供批量重命名、PDF 页面整理、扫描拆分、离线 OCR 与操作历史追踪。
 
-![Version](https://img.shields.io/badge/version-v2.6.0-5b6ee1?style=flat-square)
+![Version](https://img.shields.io/badge/version-v2.7.0-5b6ee1?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows-2f80ed?style=flat-square)
 ![Desktop](https://img.shields.io/badge/desktop-Electron%20%2B%20Vue-42b883?style=flat-square)
 ![Engine](https://img.shields.io/badge/engine-Python-3776ab?style=flat-square)
@@ -24,7 +24,7 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 ## 功能特性
 
-### PDF 工作台（当前源码新增）
+### PDF 工作台
 
 - 导入多份 PDF 或图片，按缩略图选择、拖动排序、旋转、删除、提取页面；支持撤销与重做。
 - 工作区支持最多 3000 份文件 / 100000 页，分批导入、可中途停止；只加载当前组缩略图，失败文件单独报告。大规模实测见 [3000 份验收](docs/acceptance-large-pdf-2026-10-04.md)。
@@ -37,9 +37,19 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 - 离线中英文 OCR 为扫描件增加可搜索文字层，保留原页面外观；带数字标题或页码的扫描件也能识别图片正文。
 - OCR 可逐页查看、复制预览（前 20 页，每页最多 4000 字），默认同时保存完整 UTF-8 TXT，并可另存导出；预览截断会明确提示。
 - 工作台与扫描参数方案独立保存，重启后可复用。输出前会核对源文件内容是否与预览一致。
+- 工作区自动保存并恢复页序、旋转和设置，缺失或变化的原文件可重新定位；扫描复核的标记与合并分段也会保留。
+- 来源按文件夹分组，可搜索文件名、筛选单份来源，并按工作区页码或原文档页码定位。
+- 支持单文件、按来源或按页数分卷输出，大型任务会检查内存与可用磁盘空间；预览由独立引擎处理。
 - 输出生成新文件，同名自动编号；中途取消或失败时列出已完成的输出。
 
-新增功能的本地验收说明见 [2026-10-05 验收清单](docs/acceptance-2026-10-05.md)。这些源码改进尚未发布到 GitHub Releases。
+验收说明见 [基础功能验收](docs/acceptance-2026-10-05.md) 和 [2.7.0 发布核验](docs/release-2.7.0.md)。
+
+### 任务中心
+
+- 集中查看后台任务、处理进度和输出结果，支持暂停、继续、取消以及手动续做失败或中断的任务。
+- 暂停在安全的处理边界生效，当前页面的原生识别调用结束后响应；取消时保留已完成文件。
+- 重启不会自动运行上次任务。续做前会重新验证输入和输出，复用已完成的输出单元；重命名操作沿用原有撤销流程。
+- 工作区恢复不保存撤销栈；恢复的输出目录需要重新选择确认后再用于新的导出。
 
 ### 批量重命名
 
@@ -87,9 +97,9 @@ File Toolbox 是一个为日常文件整理、扫描件归档和 PDF 批处理�
 
 从 GitHub Releases 下载对应版本：
 
-- `File.Toolbox-2.6.0-x64-setup.exe`：安装版。
-- `File.Toolbox-2.6.0-x64-portable.exe`：便携单文件版。
-- `File.Toolbox-2.6.0-x64.zip`：压缩版。
+- `File.Toolbox-2.7.0-x64-setup.exe`：安装版。
+- `File.Toolbox-2.7.0-x64-portable.exe`：便携单文件版。
+- `File.Toolbox-2.7.0-x64.zip`：压缩版。
 
 下载后按版本类型运行：
 
@@ -187,9 +197,9 @@ npm run package
 
 默认输出目录为 `electron-app/release`，会生成：
 
-- 安装版：`File.Toolbox-2.6.0-x64-setup.exe`
-- 便携单文件版：`File.Toolbox-2.6.0-x64-portable.exe`
-- 压缩版：`File.Toolbox-2.6.0-x64.zip`
+- 安装版：`File.Toolbox-2.7.0-x64-setup.exe`
+- 便携单文件版：`File.Toolbox-2.7.0-x64-portable.exe`
+- 压缩版：`File.Toolbox-2.7.0-x64.zip`
 
 也可以单独打包指定版本：
 

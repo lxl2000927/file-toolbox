@@ -1,0 +1,45 @@
+name: Windows release acceptance
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Candidate release tag (drafts are supported)
+        required: true
+        default: v2.7.0
+      base_tag:
+        description: Previously published installer
+        required: true
+        default: v2.6.0
+      update_channel:
+        description: Also verify the public in-app update download (after publication)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-upgrade:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install the old release and upgrade to the candidate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          BASE_TAG: ${{ inputs.base_tag }}
+          VERIFY_UPDATE_CHANNEL: ${{ inputs.update_channel }}
+        run: ./scripts/accept_installer_upgrade.ps1
+      - name: Retain acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-upgrade-evidence
+          path: acceptance-samples/installer-upgrade/
+          if-no-files-found: warn

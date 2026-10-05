@@ -10,6 +10,17 @@ function task(cancelTask = async () => ({ cancelled: true })) {
   return { ...f, notify(method, params = {}) { listener?.({ method, params: { task_id: 'first', ...params } }); } };
 }
 
+test('pausing and paused notifications keep the task cancellable and show its state', () => {
+  const f = task();
+  try {
+    f.state.startTask('first'); f.notify('task.progress', { phase: 'OCR', current: 1, total: 10 });
+    f.notify('task.state', { state: 'pausing' }); assert.match(f.state.taskState.phase, /暂停/);
+    f.notify('task.state', { state: 'paused' }); assert.equal(f.state.taskBusy, true); assert.equal(f.state.taskCancellable, true);
+    assert.match(f.state.taskState.phase, /已暂停/);
+    f.notify('task.state', { state: 'running' }); assert.match(f.state.taskState.phase, /继续/);
+  } finally { f.dispose(); }
+});
+
 test('a dequeued task remains busy before its first progress event', () => {
   const f = task();
   try {

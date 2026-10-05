@@ -5,14 +5,17 @@ import StatusBar from "./components/StatusBar.vue";
 import RenamePanel from "./components/panels/RenamePanel.vue";
 import PdfSplitPanel from "./components/panels/PdfSplitPanel.vue";
 import PdfWorkbenchPanel from "./components/panels/PdfWorkbenchPanel.vue";
+import TaskCenterPanel from './components/panels/TaskCenterPanel.vue';
+import { flushWorkspaces } from './composables/useWorkspacePersistence';
 import ScanSplitPanel from "./components/panels/ScanSplitPanel.vue";
 import AboutPanel from "./components/panels/AboutPanel.vue";
 import AppDialogHost from "./components/common/AppDialogHost.vue";
 import ToastHost from "./components/common/ToastHost.vue";
 
-type PanelKey = "rename" | "pdf_split" | "scan_split" | "pdf_workbench" | "about";
+type PanelKey = "rename" | "pdf_split" | "scan_split" | "pdf_workbench" | "tasks" | "about";
 
 const panelMap: Record<PanelKey, any> = {
+  tasks: TaskCenterPanel,
   pdf_workbench: PdfWorkbenchPanel,
   rename: RenamePanel,
   pdf_split: PdfSplitPanel,
@@ -22,7 +25,7 @@ const panelMap: Record<PanelKey, any> = {
 
 const activePanel = ref<PanelKey>("rename");
 const panelOffset = ref('14px');
-const panelOrder: PanelKey[] = ['pdf_workbench', 'scan_split', 'pdf_split', 'rename', 'about'];
+const panelOrder: PanelKey[] = ['pdf_workbench', 'scan_split', 'pdf_split', 'rename', 'tasks', 'about'];
 const engineStatus = ref<"connecting" | "ready" | "error">("connecting");
 const PANEL_STORAGE_KEY = "file-toolbox.active-panel";
 const APP_STORAGE_PREFIX = "file-toolbox.";
@@ -40,6 +43,7 @@ watch(navCollapsed, value => {
 const panelComponent = computed(() => panelMap[activePanel.value]);
 
 let unsubReady: (() => void) | null = null;
+let unsubFlush: (() => void) | undefined;
 
 async function retryEngine() {
   engineStatus.value = "connecting";
@@ -92,6 +96,10 @@ function clearAppStateStorage() {
 }
 
 onMounted(() => {
+  unsubFlush = window.electronAPI?.workspace?.onFlushRequested(async token => {
+    try { await flushWorkspaces(); await window.electronAPI!.workspace.flush(); window.electronAPI!.workspace.flushed(token); }
+    catch (error) { window.electronAPI!.workspace.flushed(token, String(error)); }
+  });
   clearStorageByPrefix(localStorage);
   const savedPanel = sessionStorage.getItem(PANEL_STORAGE_KEY) as PanelKey | null;
   if (panelOrder.includes(savedPanel as PanelKey)) {
@@ -110,6 +118,7 @@ onMounted(() => {
 watch(activePanel, (panel) => sessionStorage.setItem(PANEL_STORAGE_KEY, panel));
 
 onBeforeUnmount(() => {
+  unsubFlush?.();
   unsubReady?.();
   window.removeEventListener("pagehide", clearAppStateStorage);
   window.removeEventListener("beforeunload", clearAppStateStorage);

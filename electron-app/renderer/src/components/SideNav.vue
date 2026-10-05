@@ -5,13 +5,14 @@ import AppIcon from "./common/AppIcon.vue";
 const props = withDefaults(defineProps<{ active: string; collapsed?: boolean }>(), { collapsed: false });
 const emit = defineEmits<{ navigate: [key: string]; 'update:collapsed': [value: boolean] }>();
 
-type NavItem = { key: string; label: string; icon: "scan" | "pdf" | "rename" | "settings" };
+type NavItem = { key: string; label: string; icon: "scan" | "pdf" | "rename" | "settings" | "tasks" };
 
 const topItems: NavItem[] = [
   { key: "pdf_workbench", label: "PDF 工作台", icon: "pdf" },
   { key: "scan_split", label: "扫描拆分", icon: "scan" },
   { key: "pdf_split", label: "普通拆分", icon: "pdf" },
   { key: "rename", label: "重命名", icon: "rename" },
+  { key: "tasks", label: "任务中心", icon: "tasks" },
 ];
 
 const bottomItems: NavItem[] = [{ key: "about", label: "设置", icon: "settings" }];
