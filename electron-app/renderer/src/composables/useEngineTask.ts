@@ -43,6 +43,9 @@ export function useEngineTask(opts: {
   const cancellable = computed(() => Boolean(state.value.taskId) && (pending.value || state.value.running || state.value.queued));
 
   let unsubscribe: (() => void) | null = null;
+  let cancellingTaskId: string | null = null;
+  let submitted = false;
+  let cancelRequested = false;
 
   function start(taskId: string) {
     reset();
@@ -54,11 +57,12 @@ export function useEngineTask(opts: {
     unsubscribe = window.engine?.onNotification(({ method, params }) => {
       if (method === "engine.status") {
         const status = String(params?.status || "");
-        if (status === "error" && (state.value.running || pending.value)) {
+        if (status === "error" && busy.value) {
           const prevTaskId = state.value.taskId;
           state.value.running = false;
           state.value.queued = false;
-          state.value.taskId = "";
+          state.value.taskId = null;
+          cancellingTaskId = null;
           pending.value = false;
           cleanup();
           if (prevTaskId) {
@@ -92,12 +96,10 @@ export function useEngineTask(opts: {
         if (!params.queued) {
           pending.value = false;
           state.value.queued = false;
+          state.value.running = true;
+          state.value.phase = "准备处理";
         } else {
-          pending.value = true;
-          state.value.running = false;
-          state.value.queued = true;
-          state.value.phase = `排队中（第 ${Math.max(1, Number(params.position) || 1)} 位）`;
-          opts.onQueued?.(Number(params.position || 0));
+          markQueued(Number(params.position || 1), params.task_id);
         }
         const msg = String(params.message || "");
         if (msg) {
@@ -111,6 +113,8 @@ export function useEngineTask(opts: {
         pending.value = false;
         state.value.running = false;
         state.value.queued = false;
+        state.value.taskId = null;
+        cancellingTaskId = null;
         cleanup();
         if (params.ok) {
           onCompleteRef.current?.({
@@ -132,23 +136,52 @@ export function useEngineTask(opts: {
           });
         }
       }
+      if (method !== "task.complete") markSubmitted(taskId);
     }) ?? null;
   }
 
-  async function cancel() {
-    if (!state.value.taskId) return;
-    pending.value = false;
-    const result = await window.engine?.cancelTask(state.value.taskId);
-    if (result && !result.cancelled) {
-      state.value.running = false;
-      state.value.queued = false;
-      state.value.phase = "取消失败：任务不存在或已结束";
-      // #24 取消失败时也要 cleanup，避免监听器残留导致状态卡死
-      cleanup();
+  function markSubmitted(taskId: string) {
+    if (state.value.taskId !== taskId || submitted) return;
+    submitted = true;
+    if (cancelRequested) {
+      cancelRequested = false;
+      void cancel();
     }
   }
 
-  function markQueued(position: number) {
+  async function cancel() {
+    const taskId = state.value.taskId;
+    if (!taskId || cancellingTaskId === taskId) return;
+    // File authorization in the main process can outlast an immediate Stop
+    // click. Wait for registration so cancellation cannot miss the new job.
+    if (!submitted) {
+      cancelRequested = true;
+      state.value.phase = "等待任务提交后取消";
+      return;
+    }
+    cancellingTaskId = taskId;
+    try {
+      if (!window.engine) throw new Error("引擎不可用");
+      const result = await window.engine.cancelTask(taskId);
+      if (state.value.taskId !== taskId) return;
+      if (!result.cancelled) {
+        reset();
+        onCompleteRef.current?.({ ok: false, error: "取消失败：任务不存在或已结束" });
+      } else {
+        state.value.phase = "正在取消";
+      }
+    } catch (error) {
+      if (state.value.taskId !== taskId) return;
+      const message = `取消请求失败，可重试：${error instanceof Error ? error.message : String(error)}`;
+      state.value.phase = message;
+      opts.onLog?.(message);
+    } finally {
+      if (cancellingTaskId === taskId) cancellingTaskId = null;
+    }
+  }
+
+  function markQueued(position: number, taskId = state.value.taskId) {
+    if (!taskId || taskId !== state.value.taskId || !pending.value || state.value.running) return;
     pending.value = true;
     state.value.running = false;
     state.value.queued = true;
@@ -158,6 +191,9 @@ export function useEngineTask(opts: {
 
   function reset() {
     cleanup();
+    cancellingTaskId = null;
+    submitted = false;
+    cancelRequested = false;
     pending.value = false;
     state.value = {
       taskId: null,
@@ -180,7 +216,7 @@ export function useEngineTask(opts: {
 
   onBeforeUnmount(() => cleanup());
 
-  return { state, logs, pending, busy, cancellable, start, markQueued, cancel, reset };
+  return { state, logs, pending, busy, cancellable, start, markSubmitted, markQueued, cancel, reset };
 }
 
 export function generateTaskId(prefix: string): string {

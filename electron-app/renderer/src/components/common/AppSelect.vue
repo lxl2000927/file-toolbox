@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onDeactivated, onMounted, ref, watch } from "vue";
 import AppIcon from "./AppIcon.vue";
 
 type SelectIconName = "scan" | "pdf" | "rename" | "settings" | "package";
@@ -18,6 +18,8 @@ const props = withDefaults(defineProps<{
   placeholder?: string;
   disabled?: boolean;
   minWidth?: string;
+  inputId?: string;
+  ariaLabel?: string;
 }>(), {
   placeholder: "请选择",
   disabled: false,
@@ -30,6 +32,7 @@ const emit = defineEmits<{
 }>();
 
 const rootRef = ref<HTMLDivElement | null>(null);
+const triggerRef = ref<HTMLButtonElement | null>(null);
 const menuRef = ref<HTMLDivElement | null>(null);
 const open = ref(false);
 const activeIndex = ref(-1);
@@ -42,11 +45,19 @@ const enabledOptions = computed(() => props.options.filter((option) => !option.d
 
 watch(open, async (value) => {
   if (!value) return;
-  activeIndex.value = Math.max(0, props.options.findIndex((option) => option.value === props.modelValue));
+  const selectedIndex = props.options.findIndex((option) => option.value === props.modelValue && !option.disabled);
+  activeIndex.value = selectedIndex >= 0 ? selectedIndex : findEnabledIndex(-1, 1);
   await nextTick();
   updateMenuPosition();
   scrollActiveIntoView();
 });
+
+watch(() => props.disabled, (disabled) => { if (disabled) close(); });
+watch(() => props.options, () => {
+  if (open.value && (activeIndex.value < 0 || !props.options[activeIndex.value] || props.options[activeIndex.value].disabled)) {
+    activeIndex.value = findEnabledIndex(-1, 1);
+  }
+}, { deep: true });
 
 function updateMenuPosition() {
   const root = rootRef.value;
@@ -78,15 +89,16 @@ function close() {
 }
 
 function choose(option: SelectOption) {
-  if (option.disabled) return;
+  if (props.disabled || option.disabled) return;
   emit("update:modelValue", option.value);
   emit("change", option.value);
   close();
+  nextTick(() => triggerRef.value?.focus());
 }
 
 function findEnabledIndex(start: number, direction: 1 | -1) {
   if (!enabledOptions.value.length) return -1;
-  let index = start;
+  let index = start < 0 && direction === -1 ? 0 : start;
   for (let i = 0; i < props.options.length; i++) {
     index = (index + direction + props.options.length) % props.options.length;
     if (!props.options[index]?.disabled) return index;
@@ -96,13 +108,16 @@ function findEnabledIndex(start: number, direction: 1 | -1) {
 
 function onKeydown(event: KeyboardEvent) {
   if (props.disabled) return;
-  if (["ArrowDown", "ArrowUp", "Enter", " ", "Escape"].includes(event.key)) event.preventDefault();
+  if (event.key === "Tab") { close(); return; }
+  if (["ArrowDown", "ArrowUp", "Enter", " ", "Escape", "Home", "End"].includes(event.key)) event.preventDefault();
   if (event.key === "Escape") {
+    if (open.value) event.stopPropagation();
     close();
     return;
   }
-  if (!open.value && ["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+  if (!open.value && ["ArrowDown", "ArrowUp", "Enter", " ", "Home", "End"].includes(event.key)) {
     open.value = true;
+    if (event.key === "End") nextTick(() => { activeIndex.value = findEnabledIndex(0, -1); scrollActiveIntoView(); });
     return;
   }
   if (event.key === "ArrowDown") {
@@ -110,6 +125,9 @@ function onKeydown(event: KeyboardEvent) {
     nextTick(scrollActiveIntoView);
   } else if (event.key === "ArrowUp") {
     activeIndex.value = findEnabledIndex(activeIndex.value, -1);
+    nextTick(scrollActiveIntoView);
+  } else if (event.key === "Home" || event.key === "End") {
+    activeIndex.value = findEnabledIndex(event.key === "Home" ? -1 : 0, event.key === "Home" ? 1 : -1);
     nextTick(scrollActiveIntoView);
   } else if (event.key === "Enter" || event.key === " ") {
     const option = props.options[activeIndex.value];
@@ -126,11 +144,13 @@ function scrollActiveIntoView() {
 
 function setPointerActiveIndex(index: number) {
   const option = props.options[index];
-  activeIndex.value = option?.disabled ? -1 : index;
+  if (option && !option.disabled) activeIndex.value = index;
 }
 
-function clearPointerActiveIndex(index: number) {
-  if (activeIndex.value === index) activeIndex.value = -1;
+function onDocumentFocusIn(event: FocusEvent) {
+  const target = event.target as Node;
+  if (rootRef.value?.contains(target) || menuRef.value?.contains(target)) return;
+  close();
 }
 
 function onDocumentPointerDown(event: PointerEvent) {
@@ -145,12 +165,16 @@ function onWindowChange() {
 
 onMounted(() => {
   document.addEventListener("pointerdown", onDocumentPointerDown);
+  document.addEventListener("focusin", onDocumentFocusIn);
   window.addEventListener("resize", onWindowChange);
   window.addEventListener("scroll", onWindowChange, true);
 });
 
+onDeactivated(close);
+
 onBeforeUnmount(() => {
   document.removeEventListener("pointerdown", onDocumentPointerDown);
+  document.removeEventListener("focusin", onDocumentFocusIn);
   window.removeEventListener("resize", onWindowChange);
   window.removeEventListener("scroll", onWindowChange, true);
 });
@@ -159,7 +183,10 @@ onBeforeUnmount(() => {
 <template>
   <div ref="rootRef" class="app-select" :class="{ open, disabled }" :style="{ minWidth }">
     <button
+      ref="triggerRef"
       class="app-select-trigger"
+      :id="inputId"
+      :aria-label="ariaLabel"
       type="button"
       :disabled="disabled"
       :aria-expanded="open"
@@ -189,13 +216,14 @@ onBeforeUnmount(() => {
               option.tone ? `has-tone tone-${option.tone}` : '',
             ]"
             type="button"
+            tabindex="-1"
             role="option"
             :id="`${listboxId}-option-${index}`"
             :aria-selected="option.value === modelValue"
             :disabled="option.disabled"
             :data-index="index"
             @pointerenter="setPointerActiveIndex(index)"
-            @pointerleave="clearPointerActiveIndex(index)"
+            @pointerdown.prevent
             @click="choose(option)"
           >
             <span v-if="option.tone" class="app-select-tone" :class="`tone-${option.tone}`" aria-hidden="true" />
@@ -400,4 +428,5 @@ onBeforeUnmount(() => {
   opacity: 0;
   transform: translateY(-4px) scale(0.98);
 }
+.app-select-pop-leave-active { pointer-events: none; }
 </style>

@@ -4,6 +4,8 @@ from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
 from enum import Enum
 import re
+from src.utils.input_guard import open_input, rename_input
+from src.utils.file_metadata import copy_stream_metadata
 
 # 模块级预编译正则（避免每文件/每调用重新编译）
 _RE_LETTERS = re.compile(r"[A-Za-z]")
@@ -186,7 +188,7 @@ class RenameRule:
     def _extract_title_from_pdf(self, filepath: str) -> str:
         try:
             import pypdf
-            with open(filepath, "rb") as f:
+            with open_input(filepath) as f:
                 reader = pypdf.PdfReader(f)
                 meta = getattr(reader, "metadata", None)
                 if meta and getattr(meta, "title", None):
@@ -200,7 +202,7 @@ class RenameRule:
     def _extract_invoice_info_from_pdf(self, filepath: str) -> str:
         try:
             import pypdf
-            with open(filepath, "rb") as f:
+            with open_input(filepath) as f:
                 reader = pypdf.PdfReader(f)
                 if not reader.pages:
                     return ""
@@ -254,7 +256,7 @@ class RenameRule:
                         recognized = self._extract_title_from_pdf(filepath)
                     else:
                         try:
-                            with open(filepath, "rb") as f:
+                            with open_input(filepath) as f:
                                 data = f.read(4096)
                             text = data.decode("utf-8-sig", errors="ignore").strip()
                             if text:
@@ -347,29 +349,30 @@ def _normalized_abs_path(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
 
-def _make_unique_copy_path(target_path: str, used_paths: set[str]) -> str:
-    # TOCTOU 警告（已知债务）：
-    # 当前 engine 为单请求串行模型，不存在并发覆盖问题。
-    # 若未来引入多请求并发，需在 open(candidate, "x") 成功到 shutil.copy2 之间
-    # 加文件锁（例如 portalocker）或原子 rename 代替 copy2。
+def _copy_to_unique_path(source_path: str, target_path: str, used_paths: set[str]) -> str:
     base, ext = os.path.splitext(target_path)
     candidate = target_path
     counter = 1
     while counter <= 10000:
         norm = _normalized_abs_path(candidate)
         if norm not in used_paths:
-            # 原子检查：尝试以独占创建模式打开
             try:
-                with open(candidate, "x"):
-                    pass
-                os.remove(candidate)
+                destination = open(candidate, "xb")
             except FileExistsError:
                 pass
-            except OSError:
-                pass
             else:
-                used_paths.add(norm)
-                return candidate
+                # Never close/delete/reopen the reservation. All bytes and
+                # metadata go through the handle that exclusively created it.
+                try:
+                    with destination, open_input(source_path) as source:
+                        shutil.copyfileobj(source, destination)
+                        copy_stream_metadata(source, destination)
+                    used_paths.add(norm)
+                    return candidate
+                except Exception:
+                    # Do not unlink by pathname here: another process could
+                    # have replaced the name. Leave the partial copy for review.
+                    raise
         candidate = f"{base}_副本{counter}{ext}"
         counter += 1
     raise RuntimeError(f"无法生成唯一文件名，已尝试 10000 个副本仍然冲突: {target_path}")
@@ -410,13 +413,14 @@ class RenameEngine:
 
     def execute_rename(self, filepaths: List[str], save_method: str = "copy",
                           output_dir: Optional[str] = None) -> Dict[str, Any]:
-        # 输入校验：规范化 filepaths 类型
         if not isinstance(filepaths, (list, tuple)):
-            filepaths = [filepaths] if filepaths else []
+            raise ValueError("文件列表必须是数组")
+        if any(not isinstance(path, str) or not path for path in filepaths):
+            raise ValueError("文件路径必须是非空字符串")
         if not isinstance(save_method, str):
             save_method = "copy"
         if output_dir is not None and not isinstance(output_dir, str):
-            output_dir = str(output_dir) if output_dir else None
+            raise ValueError("输出目录必须是字符串")
 
         results = {
             "total": len(filepaths),
@@ -446,10 +450,20 @@ class RenameEngine:
                 self.operation_records.append(record)
                 results["failed"] += 1
                 results["errors"].append(f"文件不存在: {filepath}")
+                results["operations"].append(record.to_dict())
                 continue
 
             original_filename = os.path.basename(filepath)
-            new_filename = self.generate_new_filename(original_filename, i, filepath)
+            try:
+                new_filename = self.generate_new_filename(original_filename, i, filepath)
+            except Exception as exc:
+                record = FileOperationRecord(filepath, "", "rename")
+                record.error_message = f"生成文件名失败: {exc}"
+                self.operation_records.append(record)
+                results["failed"] += 1
+                results["errors"].append(f"处理文件失败 {original_filename}: {exc}")
+                results["operations"].append(record.to_dict())
+                continue
             valid, message = self.validate_filename(new_filename)
             if not valid:
                 record = FileOperationRecord(filepath, "", "rename")
@@ -475,6 +489,7 @@ class RenameEngine:
                         self.operation_records.append(record)
                         results["failed"] += 1
                         results["errors"].append(f"创建输出目录失败: {target_dir}")
+                        results["operations"].append(record.to_dict())
                         continue
             else:
                 target_dir = original_dir
@@ -485,36 +500,17 @@ class RenameEngine:
 
             try:
                 if save_method == "overwrite":
-                    if os.path.normcase(os.path.abspath(filepath)) == os.path.normcase(os.path.abspath(new_filepath)):
-                        if filepath == new_filepath:
-                            record.success = True
-                            record.error_message = "文件名未改变"
-                            results["successful"] += 1
-                        else:
-                            temp_filepath = f"{new_filepath}.rename_tmp_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-                            try:
-                                os.rename(filepath, temp_filepath)
-                                os.rename(temp_filepath, new_filepath)
-                            except Exception:
-                                if os.path.exists(temp_filepath) and not os.path.exists(filepath):
-                                    try:
-                                        os.rename(temp_filepath, filepath)
-                                    except Exception:
-                                        pass
-                                raise
-                            record.success = True
-                            results["successful"] += 1
+                    if filepath == new_filepath:
+                        with open_input(filepath):
+                            pass
+                        record.error_message = "文件名未改变"
                     else:
-                        if os.path.exists(new_filepath):
-                            raise FileExistsError(f"目标文件已存在，为避免覆盖丢失已停止: {new_filepath}")
-                        os.rename(filepath, new_filepath)
-                        record.success = True
-                        results["successful"] += 1
+                        rename_input(filepath, new_filepath)
+                    record.success = True
+                    results["successful"] += 1
 
                 elif save_method == "copy":
-                    new_filepath = _make_unique_copy_path(new_filepath, used_copy_paths)
-
-                    shutil.copy2(filepath, new_filepath)
+                    new_filepath = _copy_to_unique_path(filepath, new_filepath, used_copy_paths)
                     record.new_path = new_filepath
                     record.success = True
                     results["successful"] += 1

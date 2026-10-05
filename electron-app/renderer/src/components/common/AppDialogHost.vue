@@ -149,6 +149,7 @@ onBeforeUnmount(() => {
   align-items: center;
   justify-content: center;
   padding: 24px;
+  transition: opacity 180ms ease;
 }
 .dialog-backdrop {
   position: absolute;
@@ -156,18 +157,20 @@ onBeforeUnmount(() => {
   background: rgba(15, 23, 42, 0.38);
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
-  transition: opacity 0.2s ease;
+  transition: opacity 0.18s ease;
 }
 .dialog-card {
   position: relative;
   width: min(460px, calc(100vw - 48px));
   display: grid;
-  grid-template-columns: 44px 1fr;
+  max-height: calc(100vh - 48px);
+  overflow: hidden;
+  grid-template-columns: 44px minmax(0, 1fr);
   gap: 16px;
   padding: 20px;
   border-radius: var(--radius-xl);
   box-shadow: 0 24px 80px rgba(15, 23, 42, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.7);
-  transition: transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s ease;
+  transition: transform 300ms var(--motion-spring), opacity 200ms ease;
 }
 .dialog-icon {
   display: flex;
@@ -183,6 +186,7 @@ onBeforeUnmount(() => {
 .dialog-success .dialog-icon { background: var(--color-success-bg); color: var(--color-success); }
 .dialog-warning .dialog-icon { background: var(--color-warning-bg); color: var(--color-warning); }
 .dialog-danger .dialog-icon { background: var(--color-danger-bg); color: var(--color-danger); }
+.dialog-content { display: flex; flex-direction: column; min-height: 0; }
 .dialog-content h3 {
   margin: 0;
   color: var(--color-gray-900);
@@ -191,6 +195,10 @@ onBeforeUnmount(() => {
 }
 .dialog-message {
   margin-top: 8px;
+  overflow: auto;
+  min-height: 0;
+  padding-right: 4px;
+  user-select: text;
 }
 .dialog-message-line {
   margin: 0;
@@ -231,12 +239,17 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 20px;
+  flex-shrink: 0;
 }
+.dialog-fade-enter-from,
+.dialog-fade-leave-to { opacity: 0; }
+.dialog-fade-enter-active { transition-duration: 300ms; }
+.dialog-fade-leave-active .dialog-card { transition-duration: 150ms; }
 .dialog-fade-enter-from .dialog-backdrop,
 .dialog-fade-leave-to .dialog-backdrop { opacity: 0; }
 .dialog-fade-enter-from .dialog-card,
 .dialog-fade-leave-to .dialog-card {
   opacity: 0;
-  transform: scale(0.96) translateY(8px);
+  transform: scale(0.975) translateY(12px);
 }
 </style>

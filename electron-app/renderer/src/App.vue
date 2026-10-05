@@ -4,14 +4,16 @@ import SideNav from "./components/SideNav.vue";
 import StatusBar from "./components/StatusBar.vue";
 import RenamePanel from "./components/panels/RenamePanel.vue";
 import PdfSplitPanel from "./components/panels/PdfSplitPanel.vue";
+import PdfWorkbenchPanel from "./components/panels/PdfWorkbenchPanel.vue";
 import ScanSplitPanel from "./components/panels/ScanSplitPanel.vue";
 import AboutPanel from "./components/panels/AboutPanel.vue";
 import AppDialogHost from "./components/common/AppDialogHost.vue";
 import ToastHost from "./components/common/ToastHost.vue";
 
-type PanelKey = "rename" | "pdf_split" | "scan_split" | "about";
+type PanelKey = "rename" | "pdf_split" | "scan_split" | "pdf_workbench" | "about";
 
 const panelMap: Record<PanelKey, any> = {
+  pdf_workbench: PdfWorkbenchPanel,
   rename: RenamePanel,
   pdf_split: PdfSplitPanel,
   scan_split: ScanSplitPanel,
@@ -19,9 +21,21 @@ const panelMap: Record<PanelKey, any> = {
 };
 
 const activePanel = ref<PanelKey>("rename");
+const panelOffset = ref('14px');
+const panelOrder: PanelKey[] = ['pdf_workbench', 'scan_split', 'pdf_split', 'rename', 'about'];
 const engineStatus = ref<"connecting" | "ready" | "error">("connecting");
 const PANEL_STORAGE_KEY = "file-toolbox.active-panel";
 const APP_STORAGE_PREFIX = "file-toolbox.";
+const NAV_STORAGE_KEY = 'file-toolbox.ui.nav-collapsed';
+const navCollapsed = ref(readNavigationPreference());
+
+function readNavigationPreference() {
+  try { return localStorage.getItem(NAV_STORAGE_KEY) === '1'; }
+  catch { return false; }
+}
+watch(navCollapsed, value => {
+  try { localStorage.setItem(NAV_STORAGE_KEY, value ? '1' : '0'); } catch {}
+});
 
 const panelComponent = computed(() => panelMap[activePanel.value]);
 
@@ -66,7 +80,7 @@ function clearStorageByPrefix(storage: Storage) {
     const keys: string[] = [];
     for (let i = 0; i < storage.length; i += 1) {
       const key = storage.key(i);
-      if (key?.startsWith(APP_STORAGE_PREFIX)) keys.push(key);
+      if (key?.startsWith(APP_STORAGE_PREFIX) && key !== NAV_STORAGE_KEY) keys.push(key);
     }
     for (const key of keys) storage.removeItem(key);
   } catch {}
@@ -80,7 +94,7 @@ function clearAppStateStorage() {
 onMounted(() => {
   clearStorageByPrefix(localStorage);
   const savedPanel = sessionStorage.getItem(PANEL_STORAGE_KEY) as PanelKey | null;
-  if (["rename", "pdf_split", "scan_split", "about"].includes(savedPanel || "")) {
+  if (panelOrder.includes(savedPanel as PanelKey)) {
     activePanel.value = savedPanel as PanelKey;
   }
   probeEngine();
@@ -102,15 +116,16 @@ onBeforeUnmount(() => {
 });
 
 function onNavigate(key: string) {
+  panelOffset.value = panelOrder.indexOf(key as PanelKey) >= panelOrder.indexOf(activePanel.value) ? '14px' : '-14px';
   activePanel.value = key as PanelKey;
 }
 </script>
 
 <template>
-  <div class="app-shell">
-    <SideNav :active="activePanel" @navigate="onNavigate" />
-    <main class="app-main">
-      <Transition name="panel" mode="out-in">
+  <div class="app-shell" :class="{ 'nav-collapsed': navCollapsed }">
+    <SideNav :active="activePanel" v-model:collapsed="navCollapsed" @navigate="onNavigate" />
+    <main class="app-main" :style="{ '--panel-offset': panelOffset }">
+      <Transition name="panel">
         <KeepAlive>
           <component :is="panelComponent" :key="activePanel" />
         </KeepAlive>
@@ -125,7 +140,8 @@ function onNavigate(key: string) {
 <style scoped>
 .app-shell {
   display: grid;
-  grid-template-columns: 96px 1fr;
+  grid-template-columns: 84px minmax(0, 1fr);
+  transition: grid-template-columns var(--motion-settle) var(--motion-out);
   grid-template-rows: 1fr 30px;
   grid-template-areas:
     "side main"
@@ -133,8 +149,10 @@ function onNavigate(key: string) {
   height: 100vh;
   overflow: hidden;
 }
+.app-shell.nav-collapsed { grid-template-columns: 56px minmax(0, 1fr); }
 .app-main {
   grid-area: main;
+  position: relative;
   overflow: hidden;
   background: transparent;
   min-width: 0;

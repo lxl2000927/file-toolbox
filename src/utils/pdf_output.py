@@ -14,6 +14,9 @@ except ImportError:
     pypdf = None
 
 from src.utils.path_utils import make_unique_output_path, make_unique_temp_path
+from src.utils.input_guard import open_input
+from src.utils.file_metadata import copy_stream_metadata
+from src.utils.atomic_output import publish_exclusive
 
 
 CancelCheck = Callable[[], bool]
@@ -68,6 +71,24 @@ def _release_output_paths(reserved: set[str]) -> None:
         _RESERVED_OUTPUT_PATHS.difference_update(reserved)
 
 
+def _publish_reserved_output(tmp_path, out_path, output_dir, filename, used_paths, reserved):
+    # Reservations only coordinate legacy writers in this process. A workbench
+    # job or another process may publish meanwhile: never replace its file.
+    for _ in range(10000):
+        try:
+            publish_exclusive(tmp_path, out_path)
+            return out_path
+        except FileExistsError:
+            with _OUTPUT_RESERVATION_LOCK:
+                unavailable = set(used_paths) | _RESERVED_OUTPUT_PATHS
+                out_path = make_unique_output_path(output_dir, filename, unavailable)
+                normalized = _normalized_path(out_path)
+                reserved.add(normalized)
+                _RESERVED_OUTPUT_PATHS.add(normalized)
+                used_paths.add(normalized)
+    raise RuntimeError('无法生成唯一的输出文件名（尝试次数超过上限）')
+
+
 def write_pdf_output_jobs(
     pdf_path: str,
     *,
@@ -88,7 +109,7 @@ def write_pdf_output_jobs(
         used_paths = set()
     outputs: list[str] = []
 
-    with open(pdf_path, "rb") as src_f:
+    with open_input(pdf_path) as src_f:
         reader = pypdf.PdfReader(src_f)
         total_pages = len(reader.pages)
         if total_pages <= 0:
@@ -117,8 +138,12 @@ def write_pdf_output_jobs(
             out_path, tmp_path, reserved = _reserve_output_paths(output_dir, normalized_jobs[0].filename, used_paths)
             try:
                 try:
-                    shutil.copy2(pdf_path, tmp_path)
-                    os.replace(tmp_path, out_path)
+                    src_f.seek(0)
+                    with open(tmp_path, "xb") as out_f:
+                        shutil.copyfileobj(src_f, out_f)
+                        copy_stream_metadata(src_f, out_f)
+                    out_path = _publish_reserved_output(tmp_path, out_path, output_dir,
+                        normalized_jobs[0].filename, used_paths, reserved)
                 except Exception:
                     try:
                         if os.path.exists(tmp_path):
@@ -162,14 +187,15 @@ def write_pdf_output_jobs(
             out_path, tmp_path, reserved = _reserve_output_paths(output_dir, job.filename, used_paths)
             try:
                 try:
-                    with open(tmp_path, "wb") as out_f:
+                    with open(tmp_path, "xb") as out_f:
                         writer = pypdf.PdfWriter()
                         for page_index in job.page_indexes:
                             if _is_cancelled(cancel_check):
                                 raise RuntimeError("已取消")
                             writer.add_page(reader.pages[page_index])
                         writer.write(out_f)
-                    os.replace(tmp_path, out_path)
+                    out_path = _publish_reserved_output(tmp_path, out_path, output_dir,
+                        job.filename, used_paths, reserved)
                 except Exception:
                     try:
                         if os.path.exists(tmp_path):

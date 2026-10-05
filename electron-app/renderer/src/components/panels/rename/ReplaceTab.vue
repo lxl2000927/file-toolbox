@@ -23,14 +23,14 @@ function patch(p: RenameRulePatch<"replace_text">) {
     <div class="grid">
       <label class="label-inline">查找</label>
       <input
-        class="input"
+        aria-label="查找文字" class="input"
         placeholder="要查找的文字"
         :value="rule.find || ''"
         @input="patch({ find: ($event.target as HTMLInputElement).value })"
       />
       <label class="label-inline">替换为</label>
       <input
-        class="input"
+        aria-label="替换后的文字" class="input"
         placeholder="替换后的文字（留空表示删除）"
         :value="rule.replace || ''"
         @input="patch({ replace: ($event.target as HTMLInputElement).value })"
@@ -44,6 +44,12 @@ function patch(p: RenameRulePatch<"replace_text">) {
         />
         区分大小写
       </label>
+    </div>
+    <div class="rule-guide">
+      <span class="rule-guide-label">使用示例</span>
+      <div class="example-flow"><span>合同_旧版.pdf</span><span class="example-arrow">→</span><strong>合同_新版.pdf</strong></div>
+      <p>查找“旧版”，替换为“新版”。替换为留空时删除匹配的文字；文件扩展名保持不变。</p>
+      <p>添加文件后，左侧会按当前输入实时预览新名称。</p>
     </div>
   </fieldset>
 </template>

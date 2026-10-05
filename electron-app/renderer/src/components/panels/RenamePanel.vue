@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, toRaw, onBeforeUnmount, onMounted, shallowRef, triggerRef } from "vue";
+import { ref, computed, watch, toRaw, onBeforeUnmount, onMounted, onDeactivated, nextTick, shallowRef, triggerRef } from "vue";
 import InsertTab from "./rename/InsertTab.vue";
 import ReplaceTab from "./rename/ReplaceTab.vue";
 import DeleteTab from "./rename/DeleteTab.vue";
@@ -10,6 +10,8 @@ import { useAppDialog } from "../../composables/useAppDialog";
 import { useToast } from "../../composables/useToast";
 import { fileBasename, formatEngineError } from "../../utils";
 import PanelBanner from "../common/PanelBanner.vue";
+import AppTabs from "../common/AppTabs.vue";
+import AppIcon from "../common/AppIcon.vue";
 
 type TabKey = "insert" | "replace" | "delete" | "smart" | "custom";
 type NaturalSortPart = { type: "number"; value: number } | { type: "text"; value: string };
@@ -43,6 +45,8 @@ const customTabRules = ref<RenameRule[]>([]);
 const sortDir = ref<"asc" | "desc" | null>(null);
 const sortMode = ref<"name" | "size">("name");
 const sortMenuOpen = ref(false);
+const sortBtnRef = ref<HTMLButtonElement | null>(null);
+const sortMenuRef = ref<HTMLDivElement | null>(null);
 const sortMenuStyle = ref<Record<string, string>>({});
 const dragOver = ref(false);
 const draggingFile = ref<string | null>(null);
@@ -201,6 +205,7 @@ function setSort(mode: "name" | "size", dir: "asc" | "desc") {
   sortMode.value = mode;
   sortDir.value = dir;
   sortMenuOpen.value = false;
+  nextTick(() => sortBtnRef.value?.focus());
 }
 
 function beginRowDrag(path: string, e: PointerEvent) {
@@ -301,7 +306,7 @@ function endRowDrag(e: PointerEvent) {
   summary.value = null;
 }
 
-function openSortMenu(e: MouseEvent) {
+function openSortMenu(e: MouseEvent | KeyboardEvent) {
   e.stopPropagation();
   const btn = e.currentTarget as HTMLElement;
   const rect = btn.getBoundingClientRect();
@@ -312,11 +317,43 @@ function openSortMenu(e: MouseEvent) {
     left: `${Math.max(8, left)}px`,
   };
   sortMenuOpen.value = !sortMenuOpen.value;
+  if (sortMenuOpen.value) nextTick(() => sortMenuRef.value?.querySelector<HTMLButtonElement>("button")?.focus());
 }
 
 function closeSortMenu() {
   sortMenuOpen.value = false;
 }
+
+function onSortTriggerKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") { closeSortMenu(); return; }
+  if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+  event.preventDefault();
+  if (!sortMenuOpen.value) openSortMenu(event);
+  else sortMenuRef.value?.querySelector<HTMLButtonElement>("button")?.focus();
+}
+
+function onSortMenuKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape" || event.key === "Tab") {
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); }
+    closeSortMenu();
+    sortBtnRef.value?.focus();
+    return;
+  }
+  if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  const items = Array.from(sortMenuRef.value?.querySelectorAll<HTMLButtonElement>("button") || []);
+  const current = items.indexOf(document.activeElement as HTMLButtonElement);
+  const index = event.key === "Home" ? 0 : event.key === "End" ? items.length - 1
+    : (current + (event.key === "ArrowDown" ? 1 : -1) + items.length) % items.length;
+  items[index]?.focus();
+}
+
+function onSortFocusIn(event: FocusEvent) {
+  const target = event.target as Node;
+  if (!sortMenuRef.value?.contains(target) && !sortBtnRef.value?.contains(target)) closeSortMenu();
+}
+
+onDeactivated(() => { closeSortMenu(); cleanupRowDrag(); });
 
 onBeforeUnmount(() => {
   if (previewTimer.value !== null) {
@@ -324,6 +361,8 @@ onBeforeUnmount(() => {
     previewTimer.value = null;
   }
   document.removeEventListener("click", closeSortMenu);
+  document.removeEventListener("focusin", onSortFocusIn);
+  window.removeEventListener("resize", closeSortMenu);
   cleanupRowDrag();
   // 防御性移除列宽拖拽监听器，避免组件销毁时残留
   document.removeEventListener("mousemove", onColMove);
@@ -334,6 +373,8 @@ onBeforeUnmount(() => {
 
 onMounted(() => {
   document.addEventListener("click", closeSortMenu);
+  document.addEventListener("focusin", onSortFocusIn);
+  window.addEventListener("resize", closeSortMenu);
   syncTableViewport();
   if (typeof ResizeObserver !== "undefined" && tableWrapRef.value) {
     tableResizeObserver = new ResizeObserver(syncTableViewport);
@@ -568,14 +609,15 @@ async function execute() {
 
 async function undo() {
   if (!canUndo.value || !window.engine) return;
-  const confirmed = await dialog.confirm({
-    title: "撤销重命名",
-    message: "确定要撤销上次的重命名操作吗？此操作会将已覆盖重命名的文件恢复为原路径。",
-    kind: "warning",
-    confirmText: "确认撤销",
-  });
-  if (!confirmed) return;
+  executing.value = true;
   try {
+    const confirmed = await dialog.confirm({
+      title: "撤销重命名",
+      message: "确定撤销上次操作吗？原地重命名的文件将恢复原路径，输出的副本将被删除。",
+      kind: "warning",
+      confirmText: "确认撤销",
+    });
+    if (!confirmed) return;
     const r = await window.engine.rename.undo(undoToken.value);
     // #25 只对 restored 中的 from→to 做映射，failed 的 path 保留当前路径
     if (r?.restored?.length) {
@@ -587,14 +629,21 @@ async function undo() {
       selected.value = new Set(files.value);
     }
     // failed 的文件保持当前路径不变
-    lastOperations.value = [];
-    undoToken.value = "";
+    if (r?.failed?.length) {
+      const restored = new Set((r.restored || []).map((item) => item.from));
+      lastOperations.value = lastOperations.value.filter((op) => op.success && !restored.has(op.new_path));
+    } else {
+      lastOperations.value = [];
+      undoToken.value = "";
+    }
     summary.value = null;
     if (r?.failed?.length) error.value = `部分撤销失败：${r.failed.map((item) => item.error || item.path).join("；")}`;
     else error.value = "";
     await doPreview();
   } catch (caught) {
     error.value = formatEngineError(caught);
+  } finally {
+    executing.value = false;
   }
 }
 
@@ -702,11 +751,16 @@ function onColUp() {
                       原文件名({{ counterText }})
                     </button>
                     <button
+                      ref="sortBtnRef"
                       class="sort-btn"
                       type="button"
                       title="排序选项"
                       aria-label="打开排序选项"
+                      aria-haspopup="menu"
+                      :aria-expanded="sortMenuOpen"
+                      aria-controls="rename-sort-menu"
                       @click="openSortMenu"
+                      @keydown="onSortTriggerKeydown"
                     >
                       <span class="sort-indicator" :class="{ unsorted: !sortDir, asc: sortDir === 'asc', desc: sortDir === 'desc' }">
                         <span class="sort-triangle sort-triangle-up"></span>
@@ -778,7 +832,7 @@ function onColUp() {
             </tbody>
           </table>
           <div v-else class="empty-state empty-drop-state">
-            <div class="empty-icon">📂</div>
+            <div class="empty-icon"><AppIcon name="rename" :size="28" /></div>
             <div class="empty-title">还没有添加文件</div>
             <div class="empty-hint">点击左上角「添加文件」或拖拽文件到此处</div>
           </div>
@@ -787,24 +841,15 @@ function onColUp() {
 
       <!-- 右：Tab 规则面板 -->
       <section class="rules-section">
-        <div
-          class="tab-bar segmented-control segmented-animated"
-          :style="{ '--active-index': Math.max(0, tabs.findIndex((t) => t.key === activeTab)), '--segment-count': tabs.length }"
-        >
-          <button
-            v-for="t in tabs"
-            :key="t.key"
-            class="tab segmented-item"
-            :class="{ active: activeTab === t.key }"
-            @click="activeTab = t.key"
-          >{{ t.label }}</button>
-        </div>
-        <div class="tab-body glass-card section-card">
+        <AppTabs id="rename-rules" :model-value="activeTab" label="重命名规则" :options="tabs.map((tab) => ({ value: tab.key, label: tab.label }))" @update:model-value="activeTab = $event as TabKey" />
+        <div class="tab-body glass-card section-card" :id="`rename-rules-${activeTab}-panel`" role="tabpanel" :aria-labelledby="`rename-rules-${activeTab}-tab`">
+          <Transition name="tab-fade" mode="out-in">
           <InsertTab v-if="activeTab === 'insert'" :rules="insertTabRules" @update:rules="insertTabRules = $event" />
           <ReplaceTab v-else-if="activeTab === 'replace'" :rules="replaceTabRules" @update:rules="replaceTabRules = $event" />
           <DeleteTab v-else-if="activeTab === 'delete'" :rules="deleteTabRules" @update:rules="deleteTabRules = $event" />
           <SmartTab v-else-if="activeTab === 'smart'" :rules="smartTabRules" @update:rules="smartTabRules = $event" />
           <CustomTab v-else :rules="customEditorRules" @update:rules="updateCustomEditorRules" />
+          </Transition>
         </div>
 
         <!-- 底部：选项与操作 -->
@@ -812,11 +857,11 @@ function onColUp() {
           <!-- 选项与操作：一行内平铺 -->
           <div class="action-row action-main">
             <div class="option-group output-group">
-              <input class="input flex-1" :value="outputDir" placeholder="输出目录（留空则覆盖原文件）" readonly :title="outputDir" />
+              <label for="rename-output" class="output-label">保存到</label>
+              <input id="rename-output" class="input flex-1" :value="outputDir" placeholder="原目录，修改原文件名" readonly :title="outputDir" />
               <button class="btn btn-outline btn-sm" @click="pickOutputDir">选择目录</button>
               <button v-if="outputDir" class="btn btn-secondary btn-sm" @click="outputDir = ''">清除</button>
             </div>
-            <span class="flex-1" />
             <div class="action-controls">
               <button class="btn btn-outline" :disabled="!canUndo" @click="undo">撤销</button>
               <button
@@ -839,13 +884,15 @@ function onColUp() {
     </div>
 
     <Teleport to="body">
-      <div v-if="sortMenuOpen" class="sort-menu" :style="sortMenuStyle" @click.stop>
-        <button class="sort-menu-item" :class="{ active: sortMode === 'name' && sortDir === 'asc' }" @click="setSort('name', 'asc')">按文件名升序</button>
-        <button class="sort-menu-item" :class="{ active: sortMode === 'name' && sortDir === 'desc' }" @click="setSort('name', 'desc')">按文件名降序</button>
+      <Transition name="overlay-fade">
+      <div v-if="sortMenuOpen" ref="sortMenuRef" id="rename-sort-menu" role="menu" aria-label="排序选项" class="sort-menu" :style="sortMenuStyle" @click.stop @keydown="onSortMenuKeydown">
+        <button class="sort-menu-item" role="menuitemradio" tabindex="-1" :aria-checked="sortMode === 'name' && sortDir === 'asc'" :class="{ active: sortMode === 'name' && sortDir === 'asc' }" @click="setSort('name', 'asc')">按文件名升序</button>
+        <button class="sort-menu-item" role="menuitemradio" tabindex="-1" :aria-checked="sortMode === 'name' && sortDir === 'desc'" :class="{ active: sortMode === 'name' && sortDir === 'desc' }" @click="setSort('name', 'desc')">按文件名降序</button>
         <div class="sort-menu-sep"></div>
-        <button class="sort-menu-item" :class="{ active: sortMode === 'size' && sortDir === 'asc' }" @click="setSort('size', 'asc')">按文件大小升序</button>
-        <button class="sort-menu-item" :class="{ active: sortMode === 'size' && sortDir === 'desc' }" @click="setSort('size', 'desc')">按文件大小降序</button>
+        <button class="sort-menu-item" role="menuitemradio" tabindex="-1" :aria-checked="sortMode === 'size' && sortDir === 'asc'" :class="{ active: sortMode === 'size' && sortDir === 'asc' }" @click="setSort('size', 'asc')">按文件大小升序</button>
+        <button class="sort-menu-item" role="menuitemradio" tabindex="-1" :aria-checked="sortMode === 'size' && sortDir === 'desc'" :class="{ active: sortMode === 'size' && sortDir === 'desc' }" @click="setSort('size', 'desc')">按文件大小降序</button>
       </div>
+      </Transition>
     </Teleport>
   </div>
 </template>
@@ -1242,7 +1289,7 @@ function onColUp() {
   padding: 10px;
 }
 .action-bar {
-  padding: 6px 10px 10px;
+  padding: 12px;
 }
 .action-row {
   display: flex;
@@ -1250,11 +1297,10 @@ function onColUp() {
   gap: var(--space-3);
   flex-wrap: wrap;
 }
-.action-main {
-  justify-content: space-between;
-  gap: var(--space-3);
-}
+.action-main { display: flex; flex-direction: column; align-items: stretch; gap: 10px; }
+.output-label { color: var(--color-gray-600); font-size: 12px; white-space: nowrap; }
 .action-controls {
+  justify-content: flex-end;
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -1264,7 +1310,7 @@ function onColUp() {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  flex: 1 1 260px;
+  flex: 0 0 auto;
   min-width: 0;
 }
 .action-copy {

@@ -7,6 +7,8 @@ import { useAppDialog } from "../../composables/useAppDialog";
 import { fileBasename, positiveInt, positiveNumber, inputPositiveInt, inputPositiveNumber, formatEngineError } from "../../utils";
 import AppSelect from "../common/AppSelect.vue";
 import PanelBanner from "../common/PanelBanner.vue";
+import AppTabs from "../common/AppTabs.vue";
+import AppIcon from "../common/AppIcon.vue";
 
 type FileItem = { path: string; pageCount: number | null; valid: boolean; message: string };
 
@@ -78,25 +80,30 @@ function collectOutputFiles(result: unknown): string[] {
   return Array.from(new Set([...files, ...nested].filter(Boolean).map(String)));
 }
 
-const { state: taskState, busy: taskBusy, cancellable: taskCancellable, start: startTask, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
+const lastTaskCancelled = ref(false);
+const { state: taskState, busy: taskBusy, cancellable: taskCancellable, start: startTask, markSubmitted, markQueued, cancel: cancelTask, reset: resetTask } = useEngineTask({
   onComplete: (payload) => {
     const outputFiles = collectOutputFiles(payload.result);
+    lastTaskCancelled.value = Boolean(payload.cancelled);
+    if (payload.cancelled) {
+      summary.value = payload.result && typeof payload.result === "object" && "total" in payload.result
+        ? payload.result as ExecuteSummary : null;
+      error.value = "";
+      toast.info(outputFiles.length ? `已取消，保留了 ${outputFiles.length} 个已生成的文件` : "拆分已取消，未生成文件");
+      return;
+    }
     if (payload.ok) {
       summary.value = payload.result as ExecuteSummary;
       error.value = "";
       const s = summary.value;
-      if (s) toast.success(`拆分完成：成功 ${s.successful} / ${s.total}，失败 ${s.failed}`);
-      // #27 取消时已生成的文件不删除，提示用户保留了多少个
-      if (payload.cancelled && outputFiles.length > 0) {
-        toast.info(`已取消，但保留了 ${outputFiles.length} 个已生成的文件`);
+      if (s) {
+        const message = `拆分完成：成功 ${s.successful} / ${s.total}，失败 ${s.failed}`;
+        if (s.failed === 0) toast.success(message);
+        else toast.info(message);
       }
     } else {
       error.value = formatEngineError(payload);
       toast.error(error.value);
-      // #27 即便失败/取消，也可能有部分输出文件
-      if (payload.cancelled && outputFiles.length > 0) {
-        toast.info(`已取消，但保留了 ${outputFiles.length} 个已生成的文件`);
-      }
     }
   },
 });
@@ -105,7 +112,7 @@ const activeFile = computed(() => files.value[activeIndex.value]);
 const validCount = computed(() => files.value.filter((f) => f.valid).length);
 const canPreview = computed(() => validCount.value > 0 && !previewing.value && !taskBusy.value);
 const canRun = computed(() => validCount.value > 0 && !previewing.value && !taskBusy.value);
-const isCancelledSummary = computed(() => Boolean(summary.value?.errors?.some((msg: string) => String(msg).includes("已取消"))));
+const isCancelledSummary = computed(() => lastTaskCancelled.value || Boolean(summary.value?.errors?.some((msg: string) => String(msg).includes("已取消"))));
 
 const hasPreview = computed(() => previewPlans.value.length > 0 || previewTextLines.value.length > 0);
 const previewStale = computed(() => hasPreview.value && previewSignature.value !== currentPreviewSignature());
@@ -123,12 +130,13 @@ const previewStatusClass = computed(() => ({
 const splitBannerKind = computed<"info" | "success" | "warning" | "danger">(() => {
   if (taskState.value.running || previewing.value) return "info";
   if (error.value) return "danger";
+  if (lastTaskCancelled.value) return "warning";
   if (summary.value) return summary.value.failed === 0 && !isCancelledSummary.value ? "success" : "warning";
   if (previewStale.value) return "warning";
   return "info";
 });
 const splitBannerIcon = computed<"pdf" | "alert" | "check">(() => {
-  if (error.value || previewStale.value) return "alert";
+  if (error.value || previewStale.value || lastTaskCancelled.value) return "alert";
   if (summary.value && summary.value.failed === 0 && !isCancelledSummary.value) return "check";
   return "pdf";
 });
@@ -136,6 +144,7 @@ const splitBannerMessage = computed(() => {
   if (taskState.value.running) return `正在拆分：${taskState.value.phase || "处理中"} · ${taskState.value.current}/${taskState.value.total}`;
   if (previewing.value) return "正在生成拆分预览…";
   if (error.value) return error.value;
+  if (lastTaskCancelled.value && !summary.value) return "拆分已取消。";
   if (summary.value) return `${isCancelledSummary.value ? "已取消" : "拆分完成"}：成功 ${summary.value.successful} / ${summary.value.total}，失败 ${summary.value.failed}`;
   if (previewStale.value) return "设置已变更，当前预览已过期，请重新生成预览。";
   if (hasPreview.value) return "拆分预览已生成，可核对输出文件名后开始拆分。";
@@ -248,6 +257,7 @@ function clearFiles() {
   previewTextLines.value = [];
   previewSignature.value = "";
   summary.value = null;
+  lastTaskCancelled.value = false;
   activeIndex.value = 0;
 }
 
@@ -271,6 +281,7 @@ async function refreshPreview() {
   }
   const token = ++previewToken;
   previewing.value = true;
+  lastTaskCancelled.value = false;
   error.value = "";
   summary.value = null;
   try {
@@ -344,6 +355,7 @@ async function executeSplit() {
   }
   summary.value = null;
   error.value = "";
+  lastTaskCancelled.value = false;
   previewPlans.value = [];
   previewTextLines.value = [];
   previewSignature.value = "";
@@ -358,8 +370,10 @@ async function executeSplit() {
   try {
     startTask(taskId);
     const res = await window.engine.pdfSplit.executeAsync(paths, normalizedConfig(), taskId);
-    if (res?.queued) markQueued(res.position || 1);
+    markSubmitted(taskId);
+    if (res?.queued) markQueued(res.position || 1, taskId);
   } catch (caught) {
+    if (taskState.value.taskId !== taskId) return;
     error.value = formatEngineError(caught);
     resetTask();
   }
@@ -396,7 +410,7 @@ async function onDrop(e: DragEvent) {
           @drop="onDrop"
         >
           <div v-if="files.length === 0" class="empty-state">
-            <div class="empty-icon">📂</div>
+            <div class="empty-icon"><AppIcon name="pdf" :size="28" /></div>
             <div class="empty-title">还没有添加 PDF</div>
             <div class="empty-hint">支持拖拽添加，或点击左上角「添加 PDF 文件」选择文件。</div>
           </div>
@@ -426,22 +440,12 @@ async function onDrop(e: DragEvent) {
       <section class="right-col">
         <!-- 拆分模式 -->
         <fieldset class="group glass-card section-card">
-          <div
-            class="segment-group segmented-control segmented-animated"
-            :style="{ '--active-index': Math.max(0, splitModeOptions.findIndex((opt) => opt.value === config.mode)), '--segment-count': splitModeOptions.length }"
-          >
-            <button
-              v-for="opt in splitModeOptions"
-              :key="opt.value"
-              class="segment-btn segmented-item"
-              :class="{ active: config.mode === opt.value }"
-              @click="config.mode = opt.value as PdfSplitMode; schedulePreview()"
-            >{{ opt.label }}</button>
-          </div>
-
-          <div v-if="config.mode === 'by_page_count'" class="form-row-layout mt-3">
-            <label class="label-inline">每份页数：</label>
-            <input
+          <AppTabs id="pdf-mode" :model-value="config.mode" label="PDF 拆分方式" :options="splitModeOptions" @update:model-value="config.mode = $event as PdfSplitMode; schedulePreview()" />
+          <div class="split-mode-body" :id="`pdf-mode-${config.mode}-panel`" role="tabpanel" :aria-labelledby="`pdf-mode-${config.mode}-tab`">
+          <Transition name="tab-fade" mode="out-in">
+          <div v-if="config.mode === 'by_page_count'" key="by_page_count" class="form-row-layout mt-3">
+            <label for="pdf-page-count" class="label-inline">每份页数：</label>
+            <input id="pdf-page-count"
               class="input"
               type="number"
               min="1"
@@ -451,9 +455,9 @@ async function onDrop(e: DragEvent) {
               @compositionend="composing = false; schedulePreview()"
             />
           </div>
-          <div v-else-if="config.mode === 'by_page_range'" class="form-row-layout mt-3">
-            <label class="label-inline">页码范围：</label>
-            <input
+          <div v-else-if="config.mode === 'by_page_range'" key="by_page_range" class="form-row-layout mt-3">
+            <label for="pdf-page-range" class="label-inline">页码范围：</label>
+            <input id="pdf-page-range"
               class="input"
               placeholder="如：1-3, 5, 10-12"
               :value="config.page_ranges ?? ''"
@@ -462,10 +466,10 @@ async function onDrop(e: DragEvent) {
               @compositionend="composing = false; schedulePreview()"
             />
           </div>
-          <div v-else-if="config.mode === 'by_file_size'" class="form-row-layout mt-3">
-            <label class="label-inline">最大文件大小：</label>
+          <div v-else-if="config.mode === 'by_file_size'" key="by_file_size" class="form-row-layout mt-3">
+            <label for="pdf-file-size" class="label-inline">最大文件大小：</label>
             <div class="size-field">
-              <input
+              <input id="pdf-file-size"
                 class="input"
                 type="number"
               min="0.1"
@@ -484,9 +488,9 @@ async function onDrop(e: DragEvent) {
               />
             </div>
           </div>
-          <div v-else-if="config.mode === 'by_bookmark'" class="form-row-layout mt-3">
-            <label class="label-inline">书签级别：</label>
-            <input
+          <div v-else-if="config.mode === 'by_bookmark'" key="by_bookmark" class="form-row-layout mt-3">
+            <label for="pdf-bookmark-level" class="label-inline">书签级别：</label>
+            <input id="pdf-bookmark-level"
               class="input"
               type="number"
               min="1"
@@ -496,16 +500,20 @@ async function onDrop(e: DragEvent) {
               @compositionend="composing = false; schedulePreview()"
             />
           </div>
+          </Transition>
+          </div>
         </fieldset>
 
         <!-- 输出设置 -->
         <fieldset class="group glass-card section-card">
           <div class="row">
-            <input class="input flex-1" :value="outputDir" placeholder="输出目录（留空则与 PDF 同目录）" readonly :title="outputDir" />
-            <button class="btn btn-primary btn-sm" @click="pickOutputDir">选择输出目录</button>
+            <label for="split-output" class="output-label">保存到</label>
+            <input id="split-output" class="input flex-1" :value="outputDir" placeholder="输出目录（留空则与 PDF 同目录）" readonly :title="outputDir" />
+            <button class="btn btn-outline btn-sm" @click="pickOutputDir">选择输出目录</button>
           </div>
           <div class="row mt-3">
-            <input
+            <label for="split-prefix" class="output-label">命名前缀</label>
+            <input id="split-prefix"
               class="input flex-1"
               placeholder="输出文件名前缀（可选，例如：split_）"
               v-model="filePrefix"
@@ -517,7 +525,7 @@ async function onDrop(e: DragEvent) {
         <fieldset class="group group-actions glass-card section-card">
           <div class="row">
             <button
-              class="btn btn-primary btn-block"
+              class="btn btn-outline btn-block"
               :disabled="!canPreview"
               :aria-busy="previewing"
               @click="refreshPreview"
@@ -560,6 +568,16 @@ async function onDrop(e: DragEvent) {
               <div class="empty-title">尚未生成预览</div>
               <div class="empty-hint">点击「预览拆分结果」查看输出计划</div>
             </div>
+            <div v-else-if="previewPlans.length" class="planned-files selectable">
+              <article v-for="item in previewPlans" :key="item.file" class="planned-file">
+                <div class="plan-heading"><strong :title="item.file">{{ fileBasename(item.file) }}</strong><span class="tag" :class="item.plan.valid ? 'tag-info' : 'tag-danger'">{{ item.plan.valid ? `${item.plan.outputs.length} 份` : '无法预览' }}</span></div>
+                <p v-if="item.plan.message && item.plan.message !== 'OK'" class="plan-warning">{{ item.plan.message }}</p>
+                <p v-if="item.plan.output_dir" class="plan-directory" :title="item.plan.output_dir">保存到 {{ item.plan.output_dir }}</p>
+                <div v-for="(output, index) in item.plan.outputs" :key="`${index}-${output.filename}`" class="planned-output">
+                  <span class="plan-index">{{ index + 1 }}</span><span class="plan-name" :title="output.filename">{{ output.filename }}</span><span class="plan-range">{{ output.page_range ? `第 ${output.page_range[0]}–${output.page_range[1]} 页` : '自动分段' }}</span>
+                </div>
+              </article>
+            </div>
             <pre v-else class="preview-text selectable">{{ previewLines.join("\n") }}</pre>
           </div>
 
@@ -581,6 +599,16 @@ async function onDrop(e: DragEvent) {
 </template>
 
 <style scoped>
+.split-mode-body { min-height: 52px; }
+.output-label { flex-shrink: 0; width: 58px; font-size: 12px; color: var(--color-gray-600); }
+.planned-files { display: flex; flex-direction: column; gap: 12px; }
+.plan-heading { display: flex; gap: 10px; align-items: center; }
+.plan-heading strong { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.plan-directory { color: var(--color-gray-500); font-size: 12px; overflow-wrap: anywhere; margin: 6px 0; }
+.plan-warning { color: var(--color-warning); font-size: 12px; margin: 6px 0; }
+.planned-output { display: grid; grid-template-columns: 24px minmax(0, 1fr) max-content; gap: 8px; align-items: center; padding: 8px 0; border-top: 1px solid var(--color-border); font-size: 13px; }
+.plan-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.plan-index, .plan-range { color: var(--color-gray-500); font-size: 12px; }
 .split-grid {
   --panel-grid-columns: minmax(380px, 1.18fr) minmax(320px, 1fr);
 }

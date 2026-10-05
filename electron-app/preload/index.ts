@@ -16,6 +16,14 @@ type DialogOpenFilesOptions = {
 };
 
 const engineApi: EngineAPI = {
+  pdfTools: {
+    run: (action, files, options, taskId) => ipcRenderer.invoke("engine:call", "pdf_tools.run", { action, files, options, task_id: taskId }),
+  },
+  presets: {
+    list: (scope) => ipcRenderer.invoke("engine:call", "presets.list", { scope }),
+    save: (scope, name, settings) => ipcRenderer.invoke("engine:call", "presets.save", { scope, name, settings }),
+    delete: (scope, id) => ipcRenderer.invoke("engine:call", "presets.delete", { scope, id }),
+  },
   status: () => ipcRenderer.invoke("engine:status"),
   ping: () => ipcRenderer.invoke("engine:call", "ping", {}),
 
@@ -128,6 +136,10 @@ const electronApi: ElectronAPI = {
   },
   openExternal: (url: string) => ipcRenderer.invoke("app:openExternal", url),
   openDataDir: () => ipcRenderer.invoke("app:openDataDir"),
+  openDocument: (path: string) => ipcRenderer.invoke("document:open", path),
+  revealDocument: (path: string) => ipcRenderer.invoke("document:reveal", path),
+  copyText: (text: string) => ipcRenderer.invoke("clipboard:writeText", text),
+  saveTextCopy: (path: string) => ipcRenderer.invoke("document:saveTextCopy", path),
   restartEngine: () => ipcRenderer.invoke("engine:restart"),
   saveFile: (options: { content: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) =>
     ipcRenderer.invoke("dialog:saveFile", options),

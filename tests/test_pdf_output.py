@@ -2,13 +2,39 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from pypdf import PdfReader, PdfWriter
 
 from src.utils.pdf_output import PdfOutputJob, write_pdf_output_jobs
+from src.utils import pdf_output
+from src.utils.atomic_output import write_new_output
 
 
 class PdfOutputTests(unittest.TestCase):
+    def test_workbench_output_winning_a_reserved_name_is_never_overwritten(self):
+        for indexes in ([0, 1], [0]):
+            with self.subTest(pages=indexes), tempfile.TemporaryDirectory(prefix='toolbox-output-race-') as root:
+                source = os.path.join(root, 'source.pdf')
+                self._write_pdf(source, 2)
+                competitor = os.path.join(root, 'competitor.pdf')
+                self._write_pdf(competitor, 3)
+                with open(competitor, 'rb') as stream:
+                    completed_bytes = stream.read()
+                reserved = pdf_output._reserve_output_paths
+                published = []
+                def publish_between_reserve_and_write(*args):
+                    reservation = reserved(*args)
+                    published.append(write_new_output(root, 'same.pdf', lambda stream: stream.write(completed_bytes)))
+                    return reservation
+                with patch.object(pdf_output, '_reserve_output_paths', side_effect=publish_between_reserve_and_write):
+                    outputs = write_pdf_output_jobs(source, output_dir=root, jobs=[PdfOutputJob('same.pdf', indexes)])
+                with open(published[0], 'rb') as stream:
+                    self.assertEqual(stream.read(), completed_bytes, 'completed workbench output was overwritten')
+                self.assertNotEqual(outputs[0], published[0])
+                self.assertEqual(len(PdfReader(outputs[0]).pages), len(indexes))
+                self.assertFalse(any('.tmp' in name for name in os.listdir(root)))
+
     @staticmethod
     def _write_pdf(path: str, page_count: int) -> None:
         writer = PdfWriter()

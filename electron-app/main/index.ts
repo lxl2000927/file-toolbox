@@ -1,6 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, net, protocol, session, shell } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, session, shell } from "electron";
 import { autoUpdater, type ProgressInfo, type UpdateInfo } from "electron-updater";
-import { dirname, extname, isAbsolute, join, relative, resolve } from "path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import { existsSync, promises as fsp } from "fs";
 import https from "https";
 import { randomBytes } from "crypto";
@@ -62,13 +62,20 @@ const DEV_RENDERER_URL = "http://localhost:5173";
 const MAX_REFERENCE_IMAGE_FILE_SIZE = 15 * 1024 * 1024;  // 原始参考图片文件大小上限（≈15 MiB）
 const MAX_INPUT_PDF_FILE_SIZE = 200 * 1024 * 1024;
 const MAX_GENERIC_INPUT_FILE_SIZE = 500 * 1024 * 1024;
-type AuthorizedPath = { kind: "file" | "directory" };
+type FileIdentity = { dev: string; ino: string; size: string; mtime_ns: string; canonical?: string };
+type AuthorizedPath = { kind: "file" | "directory"; canonical: string; identity: FileIdentity };
 const authorizedPaths = new Map<string, AuthorizedPath>();
+const authorizedDirectories = new Map<string, AuthorizedPath>();
 const MAX_AUTHORIZED_PATHS = 12000;
 const ENGINE_AUTH_TOKEN = randomBytes(32).toString("hex");
 const ENGINE_METHODS = new Set(["ping", "rename.preview", "rename.execute", "rename.undo", "pdf_split.validate", "pdf_split.preview", "pdf_split.preview_many", "pdf_split.execute_async", "scan_split.execute_async", "scan_split.preview_reference", "scan_split.probe_page", "scan_split.scan_only", "task.cancel", "history.get", "history.clear"]);
 const MAX_SAVE_FILE_CONTENT_SIZE = 20 * 1024 * 1024;
+for (const method of ["pdf_tools.run", "presets.list", "presets.save", "presets.delete"]) ENGINE_METHODS.add(method);
 const REFERENCE_IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif"]);
+// MuPDF can preserve JPEG2000/JBIG2/portable-map encodings when extracting
+// embedded images; these are valid outputs even though they aren't import types.
+const RESULT_DOCUMENT_EXTENSIONS = new Set(['pdf', 'txt', ...REFERENCE_IMAGE_EXTENSIONS,
+  'jpx', 'jp2', 'j2k', 'jbig2', 'jb2', 'pnm', 'pam', 'pbm', 'pgm', 'ppm']);
 
 class FileAccessFailure extends Error {
   constructor(
@@ -133,15 +140,18 @@ let updateStatus: AppUpdateStatus = {
 function isAllowedAppUrl(rawUrl: string): boolean {
   try {
     const url = new URL(rawUrl);
-    if (isDev) return url.origin === new URL(DEV_RENDERER_URL).origin;
-    return url.protocol === "file:";
+    url.hash = "";
+    const entry = isDev ? DEV_RENDERER_URL + "/" : pathToFileURL(join(__dirname, "../renderer/index.html")).href;
+    return url.href === entry;
   } catch {
     return false;
   }
 }
 
 function isMainSender(event: Electron.IpcMainInvokeEvent): boolean {
-  return Boolean(mainWindow && event.sender === mainWindow.webContents && !mainWindow.isDestroyed());
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents
+    && event.senderFrame === mainWindow.webContents.mainFrame
+    && event.senderFrame && isAllowedAppUrl(event.senderFrame.url));
 }
 
 async function canonicalPath(pathValue: string): Promise<string> {
@@ -149,40 +159,98 @@ async function canonicalPath(pathValue: string): Promise<string> {
 }
 
 function rememberAuthorizedPath(pathValue: string, entry: AuthorizedPath): void {
-  authorizedPaths.delete(pathValue);
-  authorizedPaths.set(pathValue, entry);
+  const key = grantKey(pathValue);
+  authorizedPaths.delete(key);
+  authorizedPaths.set(key, entry);
+  authorizedDirectories.delete(key);
+  if (entry.kind === "directory") authorizedDirectories.set(key, entry);
   while (authorizedPaths.size > MAX_AUTHORIZED_PATHS) {
     const oldest = authorizedPaths.keys().next().value;
     if (oldest === undefined) break;
     authorizedPaths.delete(oldest);
+    authorizedDirectories.delete(oldest);
   }
 }
 
+function grantKey(pathValue: string): string {
+  const path = resolve(pathValue);
+  return process.platform === "win32" ? path.toLowerCase() : path;
+}
+
+function authorizationCandidates(pathValue: string): AuthorizedPath[] {
+  const lexical = resolve(pathValue);
+  const direct = authorizedPaths.get(grantKey(lexical));
+  const candidates = direct ? [direct] : [];
+  for (const [root, entry] of authorizedDirectories) {
+    if (entry !== direct && containsPath(root, lexical)) candidates.push(entry);
+  }
+  return candidates;
+}
+
 async function authorizePath(pathValue: string): Promise<void> {
-  const resolved = resolve(pathValue);
-  try {
-    const canonical = await canonicalPath(pathValue);
-    const stat = await fsp.stat(canonical);
-    rememberAuthorizedPath(canonical, { kind: stat.isDirectory() ? "directory" : "file" });
-  } catch {
-    rememberAuthorizedPath(resolved, { kind: "file" });
+  assertPathString(pathValue);
+  const canonical = await canonicalPath(pathValue);
+  const stat = await fsp.stat(canonical, { bigint: true });
+  if (!stat.isDirectory() && !stat.isFile()) throw new Error("仅支持普通文件和目录");
+  const entry: AuthorizedPath = { kind: stat.isDirectory() ? "directory" : "file", canonical, identity: fileIdentity(stat) };
+  rememberAuthorizedPath(resolve(pathValue), entry);
+  rememberAuthorizedPath(canonical, entry);
+}
+
+function fileIdentity(stat: import("fs").BigIntStats): FileIdentity {
+  return { dev: String(stat.dev), ino: String(stat.ino), size: String(stat.size), mtime_ns: String(stat.mtimeNs) };
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+}
+
+function containsPath(root: string, value: string): boolean {
+  const child = relative(root, value);
+  return !child || (child !== ".." && !child.startsWith("..\\") && !child.startsWith("../") && !isAbsolute(child));
+}
+
+function assertPathString(value: unknown, allowEmpty = false): asserts value is string {
+  if (typeof value !== "string" || /[\x00-\x1f]/.test(value) || (!value && !allowEmpty)
+    || (value !== "" && (!value.trim() || !isAbsolute(value)))) throw new Error("路径必须是绝对路径字符串");
+}
+
+// Resolve missing descendants through their existing ancestor, never fall back
+// to a lexical path when realpath fails for permission or other I/O errors.
+async function canonicalOutputPath(pathValue: string): Promise<string> {
+  let ancestor = resolve(pathValue);
+  const suffix: string[] = [];
+  for (;;) {
+    try { return resolve(await fsp.realpath(ancestor), ...suffix); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      const parent = dirname(ancestor);
+      if (parent === ancestor) throw error;
+      // A dangling link is not a missing directory we may safely create.
+      try { await fsp.lstat(ancestor); throw new Error("路径包含失效的链接"); }
+      catch (statError) { if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError; }
+      suffix.unshift(relative(parent, ancestor));
+      ancestor = parent;
+    }
   }
 }
 
 async function isAuthorizedPath(pathValue: string): Promise<boolean> {
-  let actual: string;
   try {
-    actual = await canonicalPath(pathValue);
-  } catch {
-    actual = resolve(pathValue);
-  }
-  for (const [root, entry] of authorizedPaths) {
-    if (actual.toLowerCase() === root.toLowerCase()) return true;
-    if (entry.kind !== "directory") continue;
-    const childPath = relative(root, actual);
-    if (childPath && !childPath.startsWith("..") && !isAbsolute(childPath)) return true;
-  }
-  return false;
+    assertPathString(pathValue);
+    const lexical = resolve(pathValue);
+    const candidates = authorizationCandidates(lexical);
+    if (!candidates.length) return false; // Includes unselected UNC paths: no filesystem I/O.
+    const actual = await canonicalOutputPath(lexical);
+    for (const entry of candidates) {
+      if (entry.kind === "directory" && containsPath(entry.canonical, actual)) return true;
+      if (entry.kind === "file" && samePath(entry.canonical, actual)) {
+        const stat = await fsp.stat(actual, { bigint: true });
+        if (String(stat.dev) === entry.identity.dev && String(stat.ino) === entry.identity.ino) return true;
+      }
+    }
+    return false;
+  } catch { return false; }
 }
 
 async function validateInputFile(pathValue: string, allowedExts: Set<string>, maxSize: number): Promise<void> {
@@ -193,37 +261,66 @@ async function validateInputFile(pathValue: string, allowedExts: Set<string>, ma
   if (allowedExts.size && !allowedExts.has(ext)) throw new FileAccessFailure("unsupported_type", "不支持的文件类型", pathValue);
 }
 
-async function validateEngineParamPaths(method: string, params: any): Promise<void> {
-  const pathParams: Record<string, (value: any) => unknown[]> = {
-    "rename.preview": (value) => [value?.files],
-    "rename.execute": (value) => [value?.files, value?.output_dir],
-    "pdf_split.validate": (value) => [value?.pdf_path],
-    "pdf_split.preview": (value) => [value?.pdf_path, value?.config?.output_dir],
-    "pdf_split.preview_many": (value) => [value?.pdf_paths, value?.config?.output_dir],
-    "pdf_split.execute_async": (value) => [value?.pdf_paths, value?.config?.output_dir],
-    "scan_split.preview_reference": (value) => [value?.reference_image_path],
-    "scan_split.probe_page": (value) => [value?.pdf_path, value?.reference_image_path],
-    "scan_split.scan_only": (value) => [value?.pdf_path, value?.reference_image_path],
-    "scan_split.execute_async": (value) => [value?.pdf_path, value?.reference_image_path, value?.output_dir],
+async function validateEngineParamPaths(method: string, params: any): Promise<any> {
+  if (!params || typeof params !== "object" || Array.isArray(params)) throw new Error("参数必须是对象");
+  const checked = { ...params, _input_identities: {} as Record<string, FileIdentity> };
+  const inputs: Array<{ path: string; kind: "pdf" | "reference" | "file" }> = [];
+  const outputs: string[] = [];
+  const input = (value: unknown, kind: "pdf" | "reference" | "file", optional = false) => {
+    if (value === undefined && optional) return;
+    assertPathString(value, optional);
+    if (value) inputs.push({ path: value, kind });
   };
-  const extract = pathParams[method];
-  const paths = (extract ? extract(params) : [])
-    .flat(Infinity)
-    .filter((value): value is string => typeof value === "string" && Boolean(value.trim()));
-  for (const pathValue of paths) if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
-  if (method.startsWith("pdf_split.")) {
-    const pdfPaths = [params?.pdf_path, params?.pdf_path_from, params?.pdf_path_to, ...(Array.isArray(params?.pdf_paths) ? params.pdf_paths : [])].filter(Boolean);
-    for (const pathValue of pdfPaths) await validateInputFile(String(pathValue), new Set(["pdf"]), MAX_INPUT_PDF_FILE_SIZE);
-  }
-  if (method.startsWith("scan_split.")) {
-    const imageExts = new Set(["png", "jpg", "jpeg", "bmp", "tiff", "tif", "webp", "gif"]);
-    for (const pathValue of [params?.pdf_path, params?.input_path, params?.reference_image, params?.reference_image_path].filter(Boolean)) {
-      const ext = extname(String(pathValue)).slice(1).toLowerCase();
-      const isImage = imageExts.has(ext);
-      await validateInputFile(String(pathValue), isImage ? imageExts : new Set(["pdf"]), isImage ? MAX_REFERENCE_IMAGE_FILE_SIZE : MAX_INPUT_PDF_FILE_SIZE);
+  const batch = (value: unknown, kind: "pdf" | "file") => {
+    if (!Array.isArray(value) || value.length > 5000) throw new Error("文件列表必须是一维数组，最多 5000 个文件");
+    for (const item of value) input(item, kind);
+  };
+  const output = (value: unknown) => {
+    if (value === undefined) return;
+    assertPathString(value, true);
+    if (value) outputs.push(value);
+  };
+  if (method === "rename.preview" || method === "rename.execute") {
+    batch(checked.files, "file");
+    output(checked.output_dir);
+  } else if (method === "pdf_tools.run") {
+    if (!Array.isArray(checked.files) || !checked.files.length || checked.files.length > 3000) throw new Error("请选择 1–3000 个文件");
+    for (const file of checked.files) input(file, "reference");
+    if (!checked.options || typeof checked.options !== "object" || Array.isArray(checked.options)) throw new Error("PDF 选项必须是对象");
+    checked.options = { ...checked.options };
+    output(checked.options.output_dir);
+  } else if (method.startsWith("pdf_split.")) {
+    if (method === "pdf_split.preview_many" || method === "pdf_split.execute_async") batch(checked.pdf_paths, "pdf");
+    else input(checked.pdf_path, "pdf");
+    if (checked.config !== undefined) {
+      if (!checked.config || typeof checked.config !== "object" || Array.isArray(checked.config)) throw new Error("PDF 配置必须是对象");
+      checked.config = { ...checked.config };
+      output(checked.config.output_dir);
     }
+  } else if (method.startsWith("scan_split.")) {
+    if (method !== "scan_split.preview_reference") input(checked.pdf_path, "pdf");
+    input(checked.reference_image_path, "reference", method !== "scan_split.preview_reference");
+    output(checked.output_dir);
   }
-  if (method.startsWith("rename.")) for (const pathValue of (Array.isArray(params?.files) ? params.files : [])) await validateInputFile(String(pathValue), new Set(), MAX_GENERIC_INPUT_FILE_SIZE);
+  for (const pathValue of outputs) {
+    if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
+  }
+  for (const { path: pathValue, kind } of inputs) {
+    if (!(await isAuthorizedPath(pathValue))) throw new Error(`Unauthorized path: ${pathValue}`);
+    const canonical = await canonicalPath(pathValue);
+    const isImage = kind === "reference" && REFERENCE_IMAGE_EXTENSIONS.has(extname(pathValue).slice(1).toLowerCase());
+    await validateInputFile(pathValue, kind === "file" ? new Set() : isImage ? REFERENCE_IMAGE_EXTENSIONS : new Set(["pdf"]),
+      kind === "file" ? MAX_GENERIC_INPUT_FILE_SIZE : isImage ? MAX_REFERENCE_IMAGE_FILE_SIZE : MAX_INPUT_PDF_FILE_SIZE);
+    const identity = fileIdentity(await fsp.stat(pathValue, { bigint: true }));
+    // Recheck selection after stat so a replacement cannot become a new trusted input.
+    if (!(await isAuthorizedPath(pathValue))) throw new Error(`文件已发生变化，请重新选择: ${pathValue}`);
+    const identityAllowed = authorizationCandidates(pathValue).some((entry) => entry.kind === "directory"
+      ? containsPath(entry.canonical, canonical)
+      : samePath(entry.canonical, canonical) && identity.dev === entry.identity.dev && identity.ino === entry.identity.ino);
+    if (!identityAllowed) throw new Error(`文件已发生变化，请重新选择: ${pathValue}`);
+    checked._input_identities[pathValue] = { ...identity, canonical };
+  }
+  return checked;
 }
 
 function validateExternalUrl(rawUrl: string): string {
@@ -365,6 +462,7 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = null;
     authorizedPaths.clear();
+    authorizedDirectories.clear();
   });
 
   mainWindow.once("ready-to-show", () => {
@@ -418,8 +516,9 @@ function setupIPC() {
     if (!bridge || engineStatus !== "ready") {
       throw new Error(engineStatus === "error" ? `Python 引擎启动失败：${engineError || "未知错误"}` : "Python 引擎启动中，请稍候");
     }
-    await validateEngineParamPaths(String(method || ""), params);
-    return bridge.call(method, params);
+    const checked = await validateEngineParamPaths(method, params);
+    if (!isMainSender(event)) throw new Error("Invalid IPC sender");
+    return bridge.call(method, checked);
   });
 
   ipcMain.handle("engine:status", async (event) => {
@@ -428,12 +527,20 @@ function setupIPC() {
   });
 
   ipcMain.handle("fs:authorizePaths", async (event, paths: string[]) => {
-    if (!isMainSender(event) || !Array.isArray(paths)) return [];
+    if (!isMainSender(event) || !mainWindow || !Array.isArray(paths) || !paths.length || paths.length > 5000) return [];
+    try { paths.forEach((value) => assertPathString(value)); } catch { return []; }
+    const requested = [...new Set(paths)];
+    // Raw IPC strings cannot prove a native drag/drop. Confirm in the main
+    // process before touching even a network path supplied by the renderer.
+    const consent = await dialog.showMessageBox(mainWindow, {
+      type: "question", title: "允许访问拖入的文件", message: `是否允许处理这 ${requested.length} 个项目？`,
+      detail: "文件夹授权包含其内容。请核对刚刚拖入的路径：\n\n" + requested.join("\n"),
+      buttons: ["允许", "取消"], defaultId: 1, cancelId: 1, noLink: true,
+    });
+    if (consent.response !== 0 || !isMainSender(event)) return [];
     const authorized: string[] = [];
-    for (const pathValue of paths) {
-      if (typeof pathValue !== "string" || !pathValue) continue;
-      await authorizePath(pathValue);
-      authorized.push(pathValue);
+    for (const pathValue of requested) {
+      try { await authorizePath(pathValue); authorized.push(pathValue); } catch { /* fail closed */ }
     }
     return authorized;
   });
@@ -700,6 +807,14 @@ function unsupportedUpdateStatus(): AppUpdateStatus {
   });
 }
 
+function handleUpdaterError(error: Error): void {
+  const restoreEngine = updateStatus.state === 'installing' && !bridge;
+  publishUpdateStatus({ state: 'error', error: error.message || String(error) });
+  if (restoreEngine) {
+    void startEngine().catch(failure => console.error('[main] 安装失败后恢复引擎失败:', failure));
+  }
+}
+
 function configureAutoUpdater(): void {
   if (updaterConfigured) return;
   updaterConfigured = true;
@@ -730,12 +845,11 @@ function configureAutoUpdater(): void {
   autoUpdater.on("update-downloaded", (info) => {
     publishUpdateStatus({ state: "downloaded", percent: 100, error: undefined, ...updateInfoFields(info) });
   });
-  autoUpdater.on("error", (error) => {
-    publishUpdateStatus({ state: "error", error: error.message || String(error) });
-  });
+  autoUpdater.on("error", handleUpdaterError);
 }
 
 async function checkForAppUpdate(): Promise<AppUpdateStatus> {
+  if (updateDownloadPromise || ["downloading", "downloaded", "installing"].includes(updateStatus.state)) return updateStatus;
   if (updateCheckPromise) return updateCheckPromise;
   const supportsAutomaticUpdate = isUpdateSupported();
   updateCheckPromise = (async () => {
@@ -795,24 +909,25 @@ async function downloadAppUpdate(): Promise<AppUpdateStatus> {
     throw new Error("请先检查更新并确认存在新版本");
   }
   configureAutoUpdater();
-  updateDownloadPromise = (async () => {
+  const attempt = (async () => {
     publishUpdateStatus({ state: "downloading", error: undefined, percent: 0, transferred: 0, total: 0, bytesPerSecond: 0 });
     try {
       await autoUpdater.downloadUpdate();
       return updateStatus;
     } catch (error) {
       return publishUpdateStatus({ state: "error", error: error instanceof Error ? error.message : String(error) });
-    } finally {
-      updateDownloadPromise = null;
     }
   })();
-  return updateDownloadPromise;
+  updateDownloadPromise = attempt;
+  try { return await attempt; }
+  finally { if (updateDownloadPromise === attempt) updateDownloadPromise = null; }
 }
 
 ipcMain.handle("app:update:getStatus", async (event) => {
   if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
-  if (!isUpdateSupported()) return unsupportedUpdateStatus();
-  return publishUpdateStatus({});
+  if (updateStatus.state === "idle" && !isUpdateSupported()) return unsupportedUpdateStatus();
+  return { ...updateStatus, current: app.getVersion(), packageType: getPackageType(),
+    portable: isPortableBuild(), supported: isUpdateSupported() };
 });
 
 ipcMain.handle("app:update:check", async (event) => {
@@ -838,17 +953,64 @@ ipcMain.handle("app:update:install", async (event) => {
     } catch (error) {
       console.error("[main] 更新安装前关闭 Python 引擎失败:", error);
       bridge = currentBridge;
+      engineStatus = 'error';
+      engineError = '更新安装前关闭引擎失败，请重启引擎后重试';
+      publishEngineStatus();
       publishUpdateStatus({ state: "error", error: "安装更新前无法安全关闭 Python 引擎" });
       throw new Error("安装更新前无法安全关闭 Python 引擎");
     }
   }
-  setTimeout(() => autoUpdater.quitAndInstall(false, true), 0);
+  setTimeout(() => {
+    try { autoUpdater.quitAndInstall(false, true); }
+    catch (error) { handleUpdaterError(error instanceof Error ? error : new Error(String(error))); }
+  }, 0);
   return { accepted: true, status: updateStatus };
 });
 
 ipcMain.handle("app:openExternal", async (event, url: string) => {
   if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
   return shell.openExternal(validateExternalUrl(url));
+});
+
+async function documentPath(event: Electron.IpcMainInvokeEvent, value: string, textOnly = false): Promise<string> {
+  if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
+  assertPathString(value);
+  if (!await isAuthorizedPath(value)) throw new Error("文件未授权或已发生变化，请重新选择");
+  const canonical = await canonicalPath(value);
+  const extensions = textOnly ? new Set(['txt']) : RESULT_DOCUMENT_EXTENSIONS;
+  await validateInputFile(canonical, extensions, Infinity);
+  if (!await isAuthorizedPath(canonical) || !isMainSender(event)) throw new Error("文件已发生变化，请重新选择");
+  return canonical;
+}
+
+ipcMain.handle("document:open", async (event, value: string) => {
+  const path = await documentPath(event, value);
+  const failure = await shell.openPath(path);
+  if (failure) throw new Error(failure);
+});
+ipcMain.handle("document:reveal", async (event, value: string) => {
+  shell.showItemInFolder(await documentPath(event, value));
+});
+ipcMain.handle("clipboard:writeText", async (event, text: string) => {
+  if (!isMainSender(event)) throw new Error("IPC 调用来源无效");
+  if (typeof text !== 'string' || Buffer.byteLength(text, 'utf8') > MAX_SAVE_FILE_CONTENT_SIZE) throw new Error("复制内容无效或过大");
+  clipboard.writeText(text);
+});
+ipcMain.handle("document:saveTextCopy", async (event, value: string) => {
+  let source = await documentPath(event, value, true);
+  const selected = await dialog.showSaveDialog(mainWindow!, {
+    title: '导出完整 OCR 文字', defaultPath: basename(source), filters: [{ name: '文字文件', extensions: ['txt'] }],
+  });
+  if (selected.canceled || !selected.filePath) return { saved: false };
+  source = await documentPath(event, value, true);
+  const target = selected.filePath;
+  if (extname(target).toLowerCase() !== '.txt') throw new Error('请保存为 .txt 文件');
+  if (!samePath(source, resolve(target))) {
+    const temporary = join(dirname(target), `.ocr-export-${randomBytes(12).toString('hex')}.tmp`);
+    try { await fsp.copyFile(source, temporary); await fsp.rename(temporary, target); }
+    finally { await fsp.unlink(temporary).catch(() => {}); }
+  }
+  return { saved: true, path: target };
 });
 
 ipcMain.handle("app:openDataDir", async (event) => {

@@ -38,6 +38,45 @@ class HistoryManagerTests(unittest.TestCase):
         self.assertIn("日志 199", stored["log_tail"][-1])
         self.assertEqual(len(details["log_tail"]), 200)
 
+    def test_record_is_a_snapshot_of_nested_details(self):
+        details = {'operations': [{'success': True}]}
+        self.manager.add_record('rename', 'snapshot', details)
+        details['operations'][0]['success'] = False
+        self.assertTrue(self.manager.get_recent_records(1)[0].details['operations'][0]['success'])
+
+    def test_reloading_respects_history_limit(self):
+        for index in range(5):
+            self.manager.add_record('rename', str(index), {})
+        self.manager._flush_to_disk()
+        self.manager.max_history_size = 2
+        self.manager._load_from_file()
+        self.assertEqual([r.description for r in self.manager.get_recent_records(100)], ['4', '3'])
+
+    def test_wrong_json_root_is_backed_up_and_reported(self):
+        from pathlib import Path
+        Path(self.history_path).write_text('{"records": "unexpected format"}', encoding='utf-8')
+        self.manager._load_from_file()
+        self.assertIn('损坏', self.manager.last_error or '')
+        backups = list(Path(self.temp_dir.name).glob('history.json.corrupt.*'))
+        self.assertEqual(len(backups), 1)
+        self.assertIn('unexpected format', backups[0].read_text(encoding='utf-8'))
+
+    def test_exit_without_changes_does_not_overwrite_unreadable_history(self):
+        from pathlib import Path
+        Path(self.history_path).write_text('original history data', encoding='utf-8')
+        self.manager._dirty.clear()
+        self.manager._flush_exit()
+        self.assertEqual(Path(self.history_path).read_text(encoding='utf-8'), 'original history data')
+
+    def test_success_with_warnings_is_not_classified_as_clean_success(self):
+        self.assertEqual(HistoryManager.infer_level(True, None, {'warnings': ['页数不一致']}, '交错合并'), 'warning')
+
+    def test_successful_retry_clears_storage_error(self):
+        self.manager.last_error = 'disk full'
+        self.manager.add_record('rename', 'retry', {})
+        self.assertTrue(self.manager._flush_to_disk())
+        self.assertIsNone(self.manager.last_error)
+
     def test_large_detail_with_single_item_converges(self):
         details = {
             "records": ["记录" * 40000],

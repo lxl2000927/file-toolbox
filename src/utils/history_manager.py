@@ -15,6 +15,7 @@ import uuid  # Imp5: moved to top level
 class OperationType(Enum):
     RENAME = "rename"
     PDF_SPLIT = "pdf_split"
+    PDF_TOOLS = "pdf_tools"
     SCAN_SPLIT = "scan_split"
     UPDATE_CHECK = "update_check"
     INTERNAL = "internal"
@@ -112,7 +113,7 @@ class HistoryManager:
     @staticmethod
     def infer_source(operation_type) -> str:
         value = operation_type.value if isinstance(operation_type, OperationType) else str(operation_type or "")
-        if value in {OperationType.RENAME.value, OperationType.PDF_SPLIT.value, OperationType.SCAN_SPLIT.value}:
+        if value in {OperationType.RENAME.value, OperationType.PDF_SPLIT.value, OperationType.SCAN_SPLIT.value, OperationType.PDF_TOOLS.value}:
             return value
         return "system"
 
@@ -129,7 +130,7 @@ class HistoryManager:
         if success is False or error_message:
             return "error"
         if success is True:
-            if detail.get("suspect_segments"):
+            if detail.get("suspect_segments") or detail.get("warnings"):
                 return "warning"
             return "success"
         if detail.get("suspect_segments"):
@@ -208,7 +209,7 @@ class HistoryManager:
         except (TypeError, ValueError):
             return details
         if original_size <= cls._MAX_DETAILS_BYTES:
-            return details
+            return copy.deepcopy(details)
 
         compact = cls._truncate_detail_value(copy.deepcopy(details))
         compact["details_truncated"] = True
@@ -345,6 +346,7 @@ class HistoryManager:
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(tmp_path, storage_path)
+                self.last_error = None
                 return True
             except Exception:
                 try:
@@ -368,6 +370,8 @@ class HistoryManager:
                 return
             with open(storage_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            if not isinstance(data, list):
+                raise ValueError('历史记录根节点必须为数组')
             records: list[OperationRecord] = []
             skipped = 0
             if isinstance(data, list):
@@ -381,10 +385,10 @@ class HistoryManager:
                         skipped += 1
                         continue
             with self._lock:
-                self.history = records
+                self.history = records[:self.max_history_size]
             if skipped > 0:
                 self.last_error = f"跳过 {skipped} 条损坏的历史记录"
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError):
             try:
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 bad_path = f"{storage_path}.corrupt.{ts}"
@@ -430,17 +434,26 @@ class HistoryManager:
                 self.last_error = str(e)
                 return False
 
+    def flush_pending(self) -> bool:
+        if not self._dirty.is_set():
+            return True
+        self._dirty.clear()
+        if self._flush_to_disk():
+            return True
+        self._dirty.set()
+        return False
+
     def _flush_exit(self) -> None:
         writer_stop = getattr(self, "_writer_stop", None)
         writer_thread = getattr(self, "_writer_thread", None)
         if writer_stop is not None:
             writer_stop.set()
         dirty = getattr(self, "_dirty", None)
-        if dirty is not None:
-            dirty.set()
         if writer_thread is not None and writer_thread.is_alive():
             writer_thread.join(timeout=5)  # 等 _writer_loop 自然退出，避免双写
-        self._flush_to_disk()             # 补刷一次，确保退出前数据落盘
+        # Do not overwrite a file that failed to load if this session made no changes.
+        if dirty is not None:
+            self.flush_pending()
 
     def get_statistics(self) -> Dict[str, Any]:
         with self._lock:

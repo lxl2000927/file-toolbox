@@ -13,6 +13,7 @@ except ImportError:
 _RE_TITLE_SANITIZE = re.compile(r"[^\w\-_\. ]")
 
 from src.utils.pdf_output import PdfOutputJob, write_pdf_output_jobs
+from src.utils.input_guard import open_input
 
 
 CancelCheck = Any
@@ -49,7 +50,9 @@ class PdfSplitConfig:
             self.bookmark_level = max(1, int(config_dict.get("bookmark_level", 1)))
         except (TypeError, ValueError):
             self.bookmark_level = 1
-        self.output_dir = str(config_dict.get("output_dir", "") or "")
+        self.output_dir = config_dict.get("output_dir", "")
+        if not isinstance(self.output_dir, str):
+            raise ValueError("输出目录必须是字符串")
         self.file_prefix = str(config_dict.get("file_prefix", "") or "")
     
     def to_dict(self) -> Dict[str, Any]:
@@ -177,7 +180,7 @@ class PdfSplitEngine:
             return False, "缺少依赖：pypdf", None
         
         try:
-            with open(filepath, 'rb') as file:
+            with open_input(filepath) as file:
                 pdf_reader = pypdf.PdfReader(file)
                 page_count = len(pdf_reader.pages)
                 
@@ -269,7 +272,7 @@ class PdfSplitEngine:
             }
 
         try:
-            with open(pdf_path, "rb") as f:
+            with open_input(pdf_path) as f:
                 reader = pypdf.PdfReader(f)
                 total_pages = int(len(reader.pages))
                 if total_pages <= 0:
@@ -394,6 +397,7 @@ class PdfSplitEngine:
         outputs: list[PlannedOutput],
         used_paths: Optional[set[str]] = None,
         cancel_check: Optional[CancelCheck] = None,
+        on_output=None,
     ) -> list[str]:
         if not outputs:
             return []
@@ -412,6 +416,7 @@ class PdfSplitEngine:
             used_paths=used_paths,
             cancel_check=cancel_check,
             cleanup_outputs_on_cancel=False,
+            on_output=on_output,
         )
     
     def _destination_page_1based(self, pdf_reader, item) -> Optional[int]:
@@ -477,6 +482,12 @@ class PdfSplitEngine:
             s = max(1, min(int(start_page), total_pages))
             normalized.append((title, s))
         normalized.sort(key=lambda x: x[1])
+        # Multiple titles can point to one page. Split each page only once,
+        # retaining the first title and preserving the document's front matter.
+        normalized = list({page: (title, page) for title, page in reversed(normalized)}.values())
+        normalized.sort(key=lambda x: x[1])
+        if normalized[0][1] > 1:
+            normalized.insert(0, ("前置页面", 1))
 
         bookmarks: list[Tuple[str, int, int]] = []
         for i, (title, start) in enumerate(normalized):
@@ -531,13 +542,6 @@ class PdfSplitEngine:
             return results
 
         configured_output_dir = self.config.output_dir or ""
-        if configured_output_dir and not os.path.exists(configured_output_dir):
-            try:
-                os.makedirs(configured_output_dir, exist_ok=True)
-            except Exception as e:
-                results["errors"].append(f"创建输出目录失败: {str(e)}")
-                return results
-
         used_paths: set[str] = set()
 
         def cancelled() -> bool:
@@ -561,18 +565,21 @@ class PdfSplitEngine:
                 if any(getattr(o, "page_range", None) is None for o in outputs):
                     raise RuntimeError("输出计划不完整，无法执行拆分")
 
-                output_files = self._write_planned_outputs(
+                def completed_output(path, _pages, _elapsed):
+                    record.output_files.append(path)
+                    record.output_count = len(record.output_files)
+                    results["output_files"].append(path)
+
+                self._write_planned_outputs(
                     pdf_path,
                     output_dir=output_dir,
                     outputs=list(outputs),
                     used_paths=used_paths,
                     cancel_check=cancel_check,
+                    on_output=completed_output,
                 )
-                
-                record.output_files = output_files
-                record.output_count = len(output_files)
-                results["output_files"].extend(output_files)
-                if cancelled() and output_files:
+
+                if cancelled():
                     raise RuntimeError("已取消")
                 record.success = True
                 results["successful"] += 1
@@ -606,7 +613,7 @@ class PdfSplitEngine:
             "total_files": results["total"],
             "successful_files": results["successful"],
             "failed_files": results["failed"],
-            "total_outputs": sum(len(record.get("output_files", [])) for record in results["operations"]),
+            "total_outputs": len(results["output_files"]),
             "errors": results["errors"][:20],
             "operations": results["operations"][:20] if results["operations"] else []
         }

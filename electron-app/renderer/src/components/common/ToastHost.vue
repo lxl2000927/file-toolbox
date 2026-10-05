@@ -1,14 +1,14 @@
 <script setup lang="ts">
-import { toastState } from "../../composables/useToast";
+import { toastState, useToast } from "../../composables/useToast";
 import AppIcon from "./AppIcon.vue";
 
-function toastIconName(item: { kind: "success" | "error" | "info" }): "success" | "close" | "info" {
+function toastIconName(item: { kind: "success" | "error" | "info" }): "success" | "alert" | "info" {
   if (item.kind === "success") return "success";
-  if (item.kind === "error") return "close";
+  if (item.kind === "error") return "alert";
   return "info";
 }
 
-/* TODO: useToast 停留时长建议 success 4s, info 3s, error 5s */
+const toast = useToast();
 </script>
 
 <template>
@@ -18,7 +18,10 @@ function toastIconName(item: { kind: "success" | "error" | "info" }): "success" 
         v-for="item in toastState.items"
         :key="item.id"
         class="toast-item glass-card"
-        :class="`toast-${item.kind}`"
+        :class="[`toast-${item.kind}`, { paused: item.paused }]"
+        :style="{ '--toast-duration': `${item.duration}ms` }"
+        @mouseenter="toast.pause(item.id, 'pointer')" @mouseleave="toast.resume(item.id, 'pointer')"
+        @focusin="toast.pause(item.id, 'focus')" @focusout="toast.resume(item.id, 'focus')"
         role="status"
         :aria-live="item.kind === 'error' ? 'assertive' : 'polite'"
       >
@@ -26,6 +29,7 @@ function toastIconName(item: { kind: "success" | "error" | "info" }): "success" 
           <AppIcon :name="toastIconName(item)" :size="14" />
         </span>
         <span class="toast-text">{{ item.message }}</span>
+        <button class="toast-close" aria-label="关闭通知" @click="toast.dismiss(item.id)"><AppIcon name="close" :size="14" /></button>
       </div>
     </TransitionGroup>
   </Teleport>
@@ -61,8 +65,12 @@ function toastIconName(item: { kind: "success" | "error" | "info" }): "success" 
   bottom: 0; left: 0;
   height: 2px;
   border-radius: 0 2px 0 0;
-  animation: toastTimer 3s linear forwards;
+  animation: toastTimer var(--toast-duration) linear forwards;
 }
+.toast-item.paused::after { animation-play-state: paused; }
+.toast-close { display: grid; place-items: center; padding: 5px; border-radius: 5px; margin-left: auto; color: var(--color-gray-500); flex-shrink: 0; }
+.toast-close:hover { background: var(--color-hover); color: var(--color-gray-900); }
+.toast-text { overflow-wrap: anywhere; }
 .toast-success::after { background: var(--color-success); }
 .toast-error::after   { background: var(--color-danger); }
 .toast-info::after    { background: var(--color-primary); }
@@ -88,9 +96,13 @@ function toastIconName(item: { kind: "success" | "error" | "info" }): "success" 
   line-height: 1.4;
 }
 
-.toast-enter-active { transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
-.toast-leave-active { transition: all 0.25s ease-in; }
-.toast-enter-from { opacity: 0; transform: translateX(40px); }
-.toast-leave-to { opacity: 0; transform: translateX(40px); }
-.toast-move { transition: transform 0.3s ease; }
+.toast-enter-active { transition: opacity 180ms ease, transform 320ms var(--motion-spring); }
+.toast-leave-active { transition: opacity 0.14s, transform 0.14s ease-in; }
+.toast-enter-from { opacity: 0; transform: translateX(20px) scale(.97); }
+.toast-leave-to { opacity: 0; transform: translateX(12px); }
+.toast-move { transition: transform 240ms var(--motion-spring); }
+</style>
+
+<style scoped>
+@media (prefers-reduced-motion: reduce) { .toast-item::after { animation: none; display: none; } }
 </style>

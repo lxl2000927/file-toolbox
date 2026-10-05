@@ -19,6 +19,7 @@ import hmac
 from collections import deque
 from dataclasses import asdict, is_dataclass, replace
 from typing import Any, Callable, Dict
+from functools import wraps
 
 ENGINE_AUTH_TOKEN = os.environ.get("FILE_TOOLBOX_ENGINE_TOKEN", "")
 ENGINE_DEBUG_ERRORS = os.environ.get("FILE_TOOLBOX_ENGINE_DEBUG_ERRORS", "").strip().lower() in {
@@ -58,9 +59,27 @@ _PDF_SCAN_IMPORT_LOCK = threading.Lock()
 
 # ── 全局 HistoryManager（所有引擎共享，操作自动记录） ────────
 from src.utils.history_manager import HistoryManager
+from src.utils.input_guard import input_context
+from src.utils.rpc_validation import validate_path_params
+from src.utils.preview_dispatcher import LatestPreviewWorker, PreviewCancelled
+
+_REFERENCE_PREVIEWS = LatestPreviewWorker()
+
+
+def _task_inputs(runner):
+    @wraps(runner)
+    def bound(task_id, params, cancel_flag):
+        # ContextVars do not automatically propagate to worker threads. Keep
+        # each queued job's own captured identities through all deferred opens.
+        identities = params.get("_input_identities", {} if ENGINE_AUTH_TOKEN else None)
+        with input_context(identities):
+            return runner(task_id, params, cancel_flag)
+    return bound
 
 _HISTORY_DIR = os.path.join(os.getenv("APPDATA") or os.path.expanduser("~"), "FileToolbox")
 _HISTORY_PATH = os.path.join(_HISTORY_DIR, "history.json")
+from src.utils.preset_store import PresetStore
+_PRESETS = PresetStore(os.path.join(_HISTORY_DIR, 'presets.json'))
 try:
     _HISTORY_MANAGER = HistoryManager(storage_path=_HISTORY_PATH)
 except OSError:
@@ -407,6 +426,7 @@ def handle_rename_undo(params: dict) -> dict:
         return {"restored": [], "failed": [{"path": "", "error": "撤销令牌无效或已使用"}]}
     restored: list[dict] = []
     failed: list[dict] = []
+    remaining: list[dict] = []
     for op in operations:
         try:
             if not isinstance(op, dict):
@@ -426,6 +446,7 @@ def handle_rename_undo(params: dict) -> dict:
                 continue
             if not os.path.exists(new_path):
                 failed.append({"path": new_path, "error": "目标不存在"})
+                remaining.append(op)
                 continue
             if operation == "copy":
                 os.remove(new_path)
@@ -435,14 +456,18 @@ def handle_rename_undo(params: dict) -> dict:
                 continue
             if os.path.exists(original):
                 failed.append({"path": original, "error": "原路径已存在，跳过避免覆盖"})
+                remaining.append(op)
                 continue
             os.rename(new_path, original)
             restored.append({"from": new_path, "to": original})
         except Exception as exc:
             failed.append({"path": str(op.get("new_path") or ""), "error": str(exc)})
-    # [P1 #9] 仅当没有失败项时才销毁令牌；保留令牌以便用户重试
-    if not failed:
-        with _UNDO_LOCK:
+            remaining.append(op)
+    # Retrying must not revisit copies already deleted or paths already restored.
+    with _UNDO_LOCK:
+        if remaining:
+            _UNDO_RECORDS[undo_token] = remaining
+        else:
             _UNDO_RECORDS.pop(undo_token, None)
     return {"restored": restored, "failed": failed}
 
@@ -525,6 +550,7 @@ def handle_pdf_split_execute_removed(params: dict) -> dict:
     )
 
 
+@_task_inputs
 def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     pdf_paths = list(params.get("pdf_paths", []) or [])
     config = params.get("config", {}) or {}
@@ -663,6 +689,7 @@ def _format_probe_log_lines(result: dict, options=None) -> list[str]:
     return lines
 
 
+@_task_inputs
 def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
     log_tail: deque[str] = deque(maxlen=200)
@@ -698,6 +725,9 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
             progress=progress,
             log=log,
             cancel_check=cancel_check,
+            phase_progress=lambda phase, current, total: send_notification("task.progress", {
+                "task_id": task_id, "phase": phase, "current": current, "total": total,
+            }),
         )
 
         serialized = _serialize_scan_result(result)
@@ -707,8 +737,11 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
         serialized.setdefault("cancelled", cancelled)
         serialized.setdefault("log_tail", list(log_tail))
         has_outputs = bool(serialized.get("output_files"))
-        success = (not cancelled) and has_outputs
-        error = "已取消" if cancelled else (None if has_outputs else "未生成输出文件")
+        failure = serialized.get("error") or ""
+        warnings = serialized.get("warnings") or []
+        no_markers = not serialized.get("marker_pages") and bool(warnings)
+        success = not cancelled and not failure and (has_outputs or no_markers)
+        error = "已取消" if cancelled else (failure or (None if success else "未生成输出文件"))
         _record_scan_history(params, serialized, success, error)
         send_notification("task.complete", {
             "task_id": task_id, "ok": success,
@@ -751,9 +784,12 @@ def _record_scan_history(params: dict, result: dict, success: bool, error: str |
         "cancelled": bool(result.get("cancelled")),
         "log_tail": result.get("log_tail") or [],
         "performance_stats": result.get("performance_stats") or {},
+        "warnings": result.get("warnings") or [],
+        "failed_segments": result.get("failed_segments") or [],
+        "pending_segments": result.get("pending_segments") or [],
     }
     description = f"{description_prefix} {os.path.basename(pdf_path) or 'PDF'}"
-    level = "warning" if details.get("cancelled") else "error" if not success or error else "warning" if details.get("suspect_segments") else "success"
+    level = "warning" if details.get("cancelled") else "error" if not success or error else "warning" if details.get("suspect_segments") or details.get("warnings") else "success"
     _HISTORY_MANAGER.add_record(
         "scan_split",
         description,
@@ -780,6 +816,7 @@ def handle_scan_split_execute_async(params: dict) -> dict:
     return {"task_id": task_id}
 
 
+@_task_inputs
 def _run_probe_page(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
     log_tail: deque[str] = deque(maxlen=200)
@@ -855,6 +892,7 @@ def handle_scan_probe_page(params: dict) -> dict:
     return {"task_id": task_id}
 
 
+@_task_inputs
 def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> None:
     started_at = time.perf_counter()
     log_tail: deque[str] = deque(maxlen=200)
@@ -877,7 +915,7 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             log_tail.append(message)
             send_notification("task.log", {"task_id": task_id, "message": message})
 
-        log(f"快速扫描范围：前 {page_limit} 页")
+        log(f"快速扫描范围：前 {page_limit} 页" if page_limit else "全量扫描，完成后等待人工复核")
         log(PdfScanSplitEngine._format_scan_options_log(options))
 
         result = PdfScanSplitEngine.scan_only(
@@ -890,12 +928,17 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
             cancel_check=lambda: cancel_flag.is_set(),
         )
         serialized = _serialize_scan_result(result)
+        if not cancel_flag.is_set() and page_limit == 0:
+            import hashlib
+            from src.utils.input_guard import read_input_bytes
+            serialized['file_signature'] = hashlib.sha256(read_input_bytes(params.get('pdf_path'), 512 * 1024 * 1024)).hexdigest()
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
         cancelled = cancel_flag.is_set()
         serialized.setdefault("elapsed_ms", elapsed_ms)
         serialized.setdefault("cancelled", cancelled)
         serialized.setdefault("log_tail", list(log_tail))
-        _record_scan_history(params, serialized, not cancelled, "已取消" if cancelled else None, description_prefix="快速扫描")
+        _record_scan_history(params, serialized, not cancelled, "已取消" if cancelled else None,
+                             description_prefix="快速扫描" if page_limit else "全量扫描")
         send_notification("task.progress", {"task_id": task_id, "phase": "done", "current": 1, "total": 1})
         send_notification("task.complete", {
             "task_id": task_id,
@@ -908,7 +951,8 @@ def _run_scan_only(task_id: str, params: dict, cancel_flag: threading.Event) -> 
         })
     except Exception as exc:
         elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        _record_scan_history(params, {"elapsed_ms": elapsed_ms, "log_tail": list(log_tail), "cancelled": cancel_flag.is_set()}, False, str(exc), description_prefix="快速扫描")
+        _record_scan_history(params, {"elapsed_ms": elapsed_ms, "log_tail": list(log_tail), "cancelled": cancel_flag.is_set()},
+                             False, str(exc), description_prefix="快速扫描" if params.get("page_limit") else "全量扫描")
         send_notification("task.complete", {
             "task_id": task_id,
             "ok": False,
@@ -951,7 +995,13 @@ def handle_scan_preview_reference(params: dict) -> dict:
         return {"ok": False, "error": "参考文件不存在"}
     try:
         import cv2
+        cancel_check = params.get("_preview_cancel_check")
+        def check_cancelled():
+            if callable(cancel_check) and cancel_check():
+                raise PreviewCancelled("预览请求已被更新")
+        check_cancelled()
         bgr = PdfScanSplitEngine._read_reference_bgr(path)
+        check_cancelled()
         try:
             nfeatures = int(params.get("nfeatures", 1200) or 1200)
         except Exception:
@@ -961,6 +1011,7 @@ def handle_scan_preview_reference(params: dict) -> dict:
 
         orb = cv2.ORB_create(nfeatures=nfeatures)
         kps, _ = orb.detectAndCompute(bgr, None)
+        check_cancelled()
         kps = kps or []
         vis = cv2.drawKeypoints(bgr, kps, None, color=(0, 255, 0))
 
@@ -982,6 +1033,7 @@ def handle_scan_preview_reference(params: dict) -> dict:
             )
 
         ok, buf = cv2.imencode(".png", vis)
+        check_cancelled()
         if not ok:
             return {"ok": False, "error": "图像编码失败"}
         data_url = "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode("ascii")
@@ -1009,7 +1061,7 @@ def handle_history_get(params: dict) -> dict:
     if _HISTORY_MANAGER is None:
         return {"records": [], "session_id": ""}
     try:
-        count = int(params.get("count", 50) or 50)
+        count = int(params.get("count", 50))
     except Exception:
         count = 50
     count = max(0, min(500, count))
@@ -1025,6 +1077,7 @@ def handle_history_get(params: dict) -> dict:
     return {
         "records": [r.to_dict() for r in records],
         "session_id": _HISTORY_MANAGER.session_id,
+        "storage_error": _HISTORY_MANAGER.last_error,
     }
 
 
@@ -1053,9 +1106,10 @@ def handle_shutdown(params: dict) -> dict:
     """[Bug#2 Fix] 优雅关闭：立即刷盘历史记录，置位退出标志。
     主循环会在发送本响应后 sys.exit(0)，触发 atexit 的 _flush_exit 兜底。"""
     global _SHUTDOWN_REQUESTED
+    _REFERENCE_PREVIEWS.close()
     if _HISTORY_MANAGER is not None:
         try:
-            _HISTORY_MANAGER._flush_to_disk()
+            _HISTORY_MANAGER.flush_pending()
         except Exception:
             pass
     _SHUTDOWN_REQUESTED = True
@@ -1064,7 +1118,54 @@ def handle_shutdown(params: dict) -> dict:
 
 # ── 路由表 ─────────────────────────────────────────────────
 
+@_task_inputs
+def _run_pdf_tools(task_id, params, cancel_flag):
+    from src.core.pdf_tools_engine import run_pdf_tool
+    started = time.perf_counter()
+    action = params.get('action')
+    try:
+        results = run_pdf_tool(action, params.get('files'), params.get('options'),
+                               cancel_check=cancel_flag.is_set,
+                               progress=lambda phase, current, total: send_notification('task.progress', {
+                                   'task_id': task_id, 'phase': phase, 'current': current, 'total': total}))
+        cancelled = results.get('cancelled', False)
+        errors = results.get('errors', [])
+        ok = not cancelled and not errors
+        if _HISTORY_MANAGER and action not in ('inspect', 'thumbnails'):
+            _HISTORY_MANAGER.add_record('pdf_tools', f'PDF 工作台 · {action}', results, success=ok,
+                                        error_message='已取消' if cancelled else '; '.join(errors) or None)
+        send_notification('task.complete', {'task_id': task_id, 'task_type': 'pdf_tools', 'ok': ok,
+            'result': results, 'cancelled': cancelled, 'elapsed_ms': int((time.perf_counter() - started) * 1000),
+            **({'error': '已取消' if cancelled else '; '.join(errors)} if not ok else {})})
+    except Exception as exc:
+        if _HISTORY_MANAGER and action not in ('inspect', 'thumbnails'):
+            _HISTORY_MANAGER.add_record('pdf_tools', f'PDF 工作台 · {action}', {}, success=False, error_message=str(exc))
+        send_notification('task.complete', {'task_id': task_id, 'task_type': 'pdf_tools', 'ok': False,
+                                           'cancelled': cancel_flag.is_set(), 'error': str(exc)})
+    finally:
+        _release_task(task_id)
+
+
+def handle_pdf_tools(params):
+    from src.core.pdf_tools_engine import ACTIONS
+    if params.get('action') not in ACTIONS:
+        raise ValueError('未知 PDF 操作')
+    task_id = _task_id_from_params(params, 'pdf_tools')
+    flag, queued, position = _reserve_task(task_id, 'pdf_tools.run', params, _run_pdf_tools)
+    if not queued:
+        try:
+            threading.Thread(target=_run_pdf_tools, args=(task_id, params, flag), daemon=True).start()
+        except Exception:
+            _release_task(task_id)
+            raise
+    return {'task_id': task_id, 'queued': queued, 'position': position}
+
+
 ROUTES: Dict[str, Callable] = {
+    'pdf_tools.run':              handle_pdf_tools,
+    'presets.list':               lambda p: _PRESETS.list(p.get('scope')),
+    'presets.save':               lambda p: _PRESETS.save(p.get('scope'), p.get('name'), p.get('settings')),
+    'presets.delete':             lambda p: _PRESETS.delete(p.get('scope'), p.get('id')),
     "ping":                       handle_ping,
     "rename.preview":             handle_rename_preview,
     "rename.execute":             handle_rename_execute,
@@ -1083,6 +1184,41 @@ ROUTES: Dict[str, Callable] = {
     "history.clear":              handle_history_clear,
     "shutdown":                   handle_shutdown,  # [Bug#2 Fix] 优雅关闭路由
 }
+
+
+def _guard_route(method, handler):
+    @wraps(handler)
+    def guarded(params):
+        inputs = validate_path_params(method, params)
+        identities = params.get("_input_identities")
+        if ENGINE_AUTH_TOKEN and inputs:
+            if not isinstance(identities, dict) or any(path not in identities for path in inputs):
+                raise ValueError("缺少输入文件授权信息")
+        with input_context(identities, required=bool(ENGINE_AUTH_TOKEN and inputs)):
+            return handler(params)
+    return guarded
+
+
+ROUTES = {method: _guard_route(method, handler) for method, handler in ROUTES.items()}
+
+
+def _dispatch_reference_preview(req_id, has_request_id, handler, params):
+    def work(cancelled):
+        if not isinstance(params, dict):
+            return handler(params)
+        return handler({**params, "_preview_cancel_check": cancelled.is_set})
+
+    def complete(result, error):
+        if not has_request_id:
+            return
+        if isinstance(error, PreviewCancelled):
+            send(success_response(req_id, {"ok": False, "cancelled": True, "error": str(error)}))
+        elif error is not None:
+            send(error_response(req_id, -32000, str(error)))
+        else:
+            send(success_response(req_id, result))
+
+    _REFERENCE_PREVIEWS.submit(work, complete)
 
 
 # ── 主循环 ─────────────────────────────────────────────────
@@ -1118,6 +1254,15 @@ def main() -> None:
         except Exception:
             pass
 
+    # Initialize native numerical libraries on the main thread. On Windows,
+    # their first import in a worker can stall while stdin is waiting for input.
+    # Preview/scanning work itself still runs outside the request loop.
+    try:
+        _ensure_pdf_scan_engine()
+        if PdfScanSplitEngine is not None:
+            PdfScanSplitEngine._require_deps()
+    except Exception:
+        exception_trace_for_client("scan dependencies could not be initialized")
     send({"jsonrpc": "2.0", "method": "ready", "params": {}})
 
     for line in sys.stdin:
@@ -1156,18 +1301,6 @@ def main() -> None:
 
         method = str(request.get("method", "") or "")
         params = request.get("params", {})
-        if not isinstance(params, dict):
-            params = {}
-
-        # 路由级参数校验（防御极端输入）
-        if method in ("rename.preview", "rename.execute"):
-            if not isinstance(params.get("files"), (list, tuple)):
-                params["files"] = []
-            if len(params.get("files", [])) > 5000:
-                if has_request_id:
-                    send(error_response(req_id, -32002, "文件列表过长（最多5000个）"))
-                continue
-
         handler = ROUTES.get(method)
         if not handler:
             if has_request_id:
@@ -1175,9 +1308,12 @@ def main() -> None:
             continue
 
         try:
-            result = handler(params)
-            if has_request_id:
-                send(success_response(req_id, result))
+            if method == "scan_split.preview_reference":
+                _dispatch_reference_preview(req_id, has_request_id, handler, params)
+            else:
+                result = handler(params)
+                if has_request_id:
+                    send(success_response(req_id, result))
         except Exception as exc:
             trace = exception_trace_for_client(f"request failed: {method}")
             if has_request_id:

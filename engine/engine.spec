@@ -6,10 +6,15 @@ from pathlib import Path
 
 engine_dir = Path(SPECPATH).resolve()
 project_root = str(engine_dir.parent)
+ocr_data = engine_dir.parent / 'assets' / 'tessdata'
+if not all((ocr_data / f'{language}.traineddata').is_file() for language in ('eng', 'chi_sim')):
+    raise RuntimeError('Run scripts/setup_ocr.py before packaging the engine')
 hiddenimports = [
     'src.core.rename_engine',
     'src.core.pdf_split_engine',
     'src.core.pdf_scan_split_engine',
+    'src.core.pdf_tools_engine',
+    'src.core.pdf_ocr',
     'src.utils.history_manager',
     'src.utils.path_utils',
     'src.utils.pdf_output',
@@ -32,7 +37,7 @@ a = Analysis(
     [str(engine_dir / 'server.py')],
     pathex=[project_root],
     binaries=binaries,
-    datas=[],
+    datas=[(str(ocr_data), 'assets/tessdata')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

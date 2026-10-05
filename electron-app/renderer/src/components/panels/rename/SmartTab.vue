@@ -48,6 +48,13 @@ function patch(p: RenameRulePatch<"smart_recognize">) {
         />
       </template>
     </div>
+    <div class="rule-guide">
+      <span class="rule-guide-label">{{ rule.mode === 'invoice_info' ? '发票信息' : '标题提取' }}</span>
+      <p v-if="rule.mode === 'invoice_info'">从 PDF 中提取发票号码、代码或日期，组合为文件名。</p>
+      <p v-else>PDF 优先使用元数据标题，再尝试正文首行；文本文件读取首行内容。</p>
+      <div class="example-flow"><span>文件内容</span><span class="example-arrow">→</span><strong>{{ rule.mode === 'invoice_info' ? '发票字段' : '识别标题' }}</strong><span class="example-arrow">→</span><span>新文件名</span></div>
+      <p>未提取到有效内容时保留原名。添加文件后，先核对左侧预览再执行。</p>
+    </div>
   </fieldset>
 </template>
 

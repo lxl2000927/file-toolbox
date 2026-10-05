@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, computed, watch } from "vue";
+import { ref, nextTick, onMounted, onBeforeUnmount, onActivated, onDeactivated, computed, watch } from "vue";
 import type { AppUpdateStatus } from "../../env";
 import AppIcon from "../common/AppIcon.vue";
 import AppSelect from "../common/AppSelect.vue";
+import AppTabs from "../common/AppTabs.vue";
 import { useAppDialog } from "../../composables/useAppDialog";
 import { useToast } from "../../composables/useToast";
 import { marked } from "marked";
@@ -12,12 +13,12 @@ const toast = useToast();
 
 type SettingsTab = "logs" | "updates" | "about";
 type LogLevelFilter = "all" | "error" | "warning" | "success" | "info" | "debug";
-type LogSourceFilter = "all" | "rename" | "pdf_split" | "scan_split" | "system";
+type LogSourceFilter = "all" | "rename" | "pdf_split" | "scan_split" | "pdf_tools" | "system";
 type UnknownRecord = Record<string, unknown>;
 type LogRecord = UnknownRecord;
 
 function asRecord(value: unknown): UnknownRecord {
-  return value && typeof value === "object" ? value as UnknownRecord : {};
+  return value && typeof value === "object" && !Array.isArray(value) ? value as UnknownRecord : {};
 }
 
 function errorMessage(error: unknown, fallback = "未知错误"): string {
@@ -36,35 +37,37 @@ const settingsTabs: { key: SettingsTab; label: string }[] = [
 ];
 
 const aboutFeatures = [
+  { icon: 'pdf' as const, label: 'PDF 工作台', title: '页面自由整理，文档轻松归档',
+    description: '缩略图排页、合并、图片互转、空白复核、压缩与中英文离线 OCR。',
+    steps: '导入文件 → 整理复核 → 优化输出' },
   {
+    icon: "rename" as const,
     label: "批量重命名",
-    title: "规则组合与实时预览",
-    description: "支持插入字符/编号、替换、删除或保留字符、智能识别和自定义规则；执行前可实时预览新文件名，覆盖模式支持撤销上次操作。",
+    title: "杂乱文件，有序归档",
+    description: "组合编号、替换和识别规则，预览后批量应用。支持撤销上次操作。",
+    steps: "组合规则 → 预览名称 → 批量执行",
   },
   {
+    icon: "pdf" as const,
     label: "PDF 普通拆分",
-    title: "多模式拆分与批量处理",
-    description: "支持按页数、文件大小、页码范围和书签拆分；可批量校验 PDF，生成可复制的拆分预览，并在执行时显示任务进度。",
+    title: "长篇文档，按需拆分",
+    description: "按页数、大小、范围或书签生成独立文档，一次处理多个 PDF。",
+    steps: "选择方式 → 确认预览 → 输出文档",
   },
   {
+    icon: "scan" as const,
     label: "扫描拆分",
-    title: "标记页识别与调参工具",
-    description: "支持二维码、印章和特征点匹配三类识别方式；可框选 ROI 提升稳定性，支持命中后跳过页数、快速扫描、单页测试和高级参数预设。",
+    title: "成叠扫描件，自动分组",
+    description: "识别二维码、印章或参考特征。框选识别区域，用单页测试调整参数。",
+    steps: "设置识别 → 人工复核 → 确认拆分",
   },
 ];
 
 const aboutArchitecture = [
   "Electron 主进程负责窗口、文件选择、更新检查和本地系统能力。",
   "Vue 3 渲染端负责交互界面、实时预览状态、任务进度和结果展示。",
-  "Python 引擎通过 stdio JSON-RPC 提供重命名、PDF 拆分、扫描拆分和历史记录能力。",
+  "Python 引擎通过 stdio JSON-RPC 提供 PDF 工作台、离线 OCR、重命名、拆分和历史记录能力。",
   "核心处理逻辑位于 src/core，历史记录与路径处理位于 src/utils。",
-];
-
-const aboutTips = [
-  "重命名前建议开启实时预览，确认规则顺序和目标文件名后再执行。",
-  "PDF 拆分前先生成预览；如果设置变化，过期预览会提醒重新生成。",
-  "扫描拆分遇到误检或漏检时，优先尝试 ROI 和检测模式，再调整高级参数。",
-  "运行日志可在“日志”分段导出，用于排查任务失败或记录批处理过程。",
 ];
 
 const updateStatus = ref<AppUpdateStatus>({
@@ -75,6 +78,23 @@ const updateStatus = ref<AppUpdateStatus>({
   current: "",
 });
 let unsubscribeUpdateStatus: (() => void) | null = null;
+let updateStatusRevision = 0;
+let updateRequestRevision = 0;
+const updateActionPending = ref(false);
+
+async function readUpdateStatus(request: () => Promise<AppUpdateStatus>, fallback: string) {
+  const revision = updateStatusRevision;
+  const requestRevision = ++updateRequestRevision;
+  const current = () => revision === updateStatusRevision && requestRevision === updateRequestRevision;
+  try {
+    const status = await request();
+    if (current()) updateStatus.value = status;
+  } catch (error) {
+    if (current()) {
+      updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(error, fallback) };
+    }
+  }
+}
 const ALLOWED_RELEASE_TAGS = new Set([
   "a", "p", "br", "strong", "em", "b", "i", "u", "s", "code", "pre", "blockquote",
   "ul", "ol", "li", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "table", "thead", "tbody", "tr", "th", "td", "img",
@@ -135,7 +155,7 @@ const releaseBodyHtml = computed(() => {
   releaseBodyHtmlCache.set(cacheKey, result);
   return result;
 });
-const updateBusy = computed(() => ["checking", "downloading", "installing"].includes(updateStatus.value.state));
+const updateBusy = computed(() => updateActionPending.value || ["checking", "downloading", "installing"].includes(updateStatus.value.state));
 const updateHasRelease = computed(() => Boolean(updateStatus.value.latest) && ["available", "downloading", "downloaded", "installing"].includes(updateStatus.value.state));
 const updatePercent = computed(() => Math.max(0, Math.min(100, Math.round(Number(updateStatus.value.percent) || 0))));
 const updatePackageLabel = computed(() => ({
@@ -178,11 +198,18 @@ const updateMessage = computed(() => {
 });
 const dataDirMsg = ref("");
 const activeSettingsTab = ref<SettingsTab>("logs");
-const activeSettingsTabIndex = computed(() => settingsTabs.findIndex((tab) => tab.key === activeSettingsTab.value));
+
+async function showSettingsTab(tab: SettingsTab) {
+  activeSettingsTab.value = tab;
+  await nextTick();
+  document.getElementById(`settings-${tab}-tab`)?.focus();
+}
+
 
 const logRaw = ref<LogRecord[]>([]);
 const logLoading = ref(false);
 const logClearing = ref(false);
+const logExporting = ref(false);
 const logError = ref("");
 const logLevelFilter = ref<LogLevelFilter>("all");
 const logSourceFilter = ref<LogSourceFilter>("all");
@@ -207,6 +234,7 @@ const logSourceOptions: { label: string; value: LogSourceFilter; icon: "scan" | 
   { label: "来源：全部", value: "all", icon: "package" },
   { label: "重命名", value: "rename", icon: "rename" },
   { label: "PDF拆分", value: "pdf_split", icon: "pdf" },
+  { label: "PDF工作台", value: "pdf_tools", icon: "pdf" },
   { label: "扫描拆分", value: "scan_split", icon: "scan" },
   { label: "系统", value: "system", icon: "settings" },
 ];
@@ -218,7 +246,7 @@ function formatLogRecord(rawRecord: unknown) {
   const details = asRecord(record?.details);
   const _status = details.cancelled ? "已取消" : record?.success === true ? "成功" : record?.success === false ? "失败" : "未知";
   const detailLogs = Array.isArray(details.log_tail) ? details.log_tail.map((line: unknown) => String(line)).filter(Boolean) : [];
-  const scanOptionsText = formatScanOptions(details.options);
+  const scanOptionsText = _src === 'scan_split' ? formatScanOptions(details.options) : '';
   const perfText = formatPerformanceStats(details.performance_stats);
   const detailTruncatedText = details.log_tail_truncated
     ? `\n    （详细日志已截断${Number(details.log_tail_original_count) > 0 ? `，原 ${Number(details.log_tail_original_count)} 条` : ""}）`
@@ -229,6 +257,7 @@ function formatLogRecord(rawRecord: unknown) {
   const metaText = formatLogMeta(details);
   const _rawText = `[${record.timestamp}] [${_src}] [_LEVEL_] ${_msg} · ${_status}` +
     metaText +
+    formatLogResults(details) +
     scanOptionsText +
     (record?.error_message ? `\n  错误：${record.error_message}` : "") +
     perfText +
@@ -236,6 +265,18 @@ function formatLogRecord(rawRecord: unknown) {
   const level = normalizeLogLevel(record?.level, _rawText, record);
   const text = _rawText.replace("[_LEVEL_]", `[${level}]`);
   return text;
+}
+
+function formatLogResults(details: UnknownRecord) {
+  const parts: string[] = [];
+  for (const [key, label] of [['output_files', '输出文件'], ['warnings', '警告'], ['errors', '处理错误']]) {
+    const values = details[key];
+    if (!Array.isArray(values) || !values.length) continue;
+    parts.push(`\n  ${label}：\n${values.map(value => `    ${typeof value === 'string' ? value : JSON.stringify(value)}`).join('\n')}`);
+    if (details[`${key}_truncated`]) parts.push(`\n    （已截断，原 ${details[`${key}_original_count`] || '更多'} 条）`);
+  }
+  if (details.details_truncated) parts.push('\n  部分详细信息因大小限制已截断。');
+  return parts.join('');
 }
 
 function formatDuration(seconds: unknown) {
@@ -249,7 +290,7 @@ function formatDuration(seconds: unknown) {
 
 function formatScanOptions(rawOptions: unknown) {
   const options = asRecord(rawOptions);
-  if (!options || typeof options !== "object") return "";
+  if (!Object.keys(options).length) return "";
   const modeMap: Record<string, string> = {
     auto: "自动",
     qrcode: "二维码",
@@ -282,7 +323,7 @@ function formatScanOptions(rawOptions: unknown) {
     ? "不保存标记页"
     : options.marker_as_first_page === false ? "标记页放上一份末尾" : "标记页放下一份开头";
   parts.push(markerMode);
-  if (Number(options.max_segment_pages) > 0) parts.push(`每份最多 ${Number(options.max_segment_pages)} 页`);
+  if (Number(options.max_segment_pages) > 0) parts.push(`疑似漏检提醒：超过 ${Number(options.max_segment_pages)} 页`);
   if (Number.isFinite(Number(options.nfeatures))) parts.push(`特征点 ${Number(options.nfeatures)}`);
   if (Number.isFinite(Number(options.min_matches))) parts.push(`最小匹配 ${Number(options.min_matches)}`);
   if (Number.isFinite(Number(options.ratio))) parts.push(`比例 ${Number(options.ratio)}`);
@@ -308,7 +349,7 @@ function formatLogMeta(rawDetails: unknown) {
 
 function formatPerformanceStats(rawStats: unknown) {
   const stats = asRecord(rawStats);
-  if (!stats || typeof stats !== "object") return "";
+  if (!Object.keys(stats).length) return "";
   const pagesScanned = Number(stats.pages_scanned || 0);
   const pagesSkipped = Number(stats.pages_skipped || 0);
   const markerCount = Number(stats.markers_found || 0);
@@ -337,6 +378,8 @@ function normalizeLogLevel(value: unknown, _fallbackText: string, record?: LogRe
   // 兜底：后端未提供 level 时按 success 字段推断
   if (asRecord(record?.details).cancelled === true) return "warning";
   if (record?.success === false) return "error";
+  const warnings = asRecord(record?.details).warnings;
+  if (Array.isArray(warnings) && warnings.length) return "warning";
   if (record?.success === true) return "success";
   return "info";
 }
@@ -344,6 +387,7 @@ function normalizeLogLevel(value: unknown, _fallbackText: string, record?: LogRe
 function normalizeLogSource(operationType: string): LogSourceFilter {
   const type = String(operationType || "").toLowerCase();
   if (type.includes("rename")) return "rename";
+  if (type.includes("pdf_tools")) return "pdf_tools";
   if (type.includes("pdf_split")) return "pdf_split";
   if (type.includes("scan_split")) return "scan_split";
   return "system";
@@ -353,6 +397,8 @@ const logItems = computed(() => logRaw.value.map((record) => {
   const text = formatLogRecord(record);
   return {
     text,
+    title: String(record.message || record.description || "日志记录"),
+    timestamp: String(record.timestamp || "时间未知"),
     level: normalizeLogLevel(record?.level, text, record),
     source: normalizeLogSource(String(record?.source || record?.operation_type || "")),
     record,
@@ -403,23 +449,17 @@ onMounted(() => {
   const updateApi = window.electronAPI?.update;
   if (updateApi) {
     unsubscribeUpdateStatus = updateApi.onStatus((status) => {
+      updateStatusRevision += 1;
       updateStatus.value = status;
     });
-    updateApi.getStatus()
-      .then((status) => { updateStatus.value = status; })
-      .catch((error: unknown) => {
-        updateStatus.value = {
-          ...updateStatus.value,
-          state: "error",
-          error: errorMessage(error, "无法读取更新状态"),
-        };
-      });
+    readUpdateStatus(() => updateApi.getStatus(), "无法读取更新状态");
   }
 });
 
 onBeforeUnmount(() => {
   stopLogAutoRefresh();
   logRefreshGeneration += 1;
+  updateRequestRevision += 1;
   logIo?.disconnect();
   unsubscribeUpdateStatus?.();
   unsubscribeUpdateStatus = null;
@@ -481,7 +521,7 @@ async function refreshLogs(options: { silent?: boolean } = {}) {
       const res = await engine.history.get(100, { currentSession: false });
       if (generation !== logRefreshGeneration) return;
       logRaw.value = Array.isArray(res?.records) ? res.records.map(asRecord) : [];
-      logError.value = "";
+      logError.value = res.storage_error ? `历史记录存储异常：${res.storage_error}` : "";
     } catch (error: unknown) {
       if (generation !== logRefreshGeneration) return;
       logError.value = `无法获取历史记录：${errorMessage(error)}`;
@@ -498,19 +538,18 @@ async function refreshLogs(options: { silent?: boolean } = {}) {
 
 async function clearLogs() {
   const engine = window.engine;
-  if (!engine || !logRaw.value.length) return;
-  // #29 清空前必须确认，操作不可撤销
-  const confirmed = await dialog.confirm({
-    title: "清空历史记录",
-    message: "此操作不可撤销，确定要清空全部历史记录吗？",
-    kind: "warning",
-    confirmText: "清空",
-  });
-  if (!confirmed) return;
-  logRefreshGeneration += 1;
+  if (!engine || !logRaw.value.length || logClearing.value) return;
   logClearing.value = true;
-  logError.value = "";
   try {
+    const confirmed = await dialog.confirm({
+      title: "清空历史记录",
+      message: "此操作不可撤销，确定要清空全部历史记录吗？",
+      kind: "warning",
+      confirmText: "清空",
+    });
+    if (!confirmed) return;
+    logRefreshGeneration += 1;
+    logError.value = "";
     const res = await engine.history.clear();
     if (!res?.cleared) throw new Error(res?.error || "历史记录未能写入磁盘");
     logRaw.value = [];
@@ -526,44 +565,41 @@ async function clearLogs() {
 }
 
 async function exportLogsTxt() {
-  if (!filteredLogLines.value.length) return;
-  // #33 导出加 try/catch，失败时 toast 提示
-  try {
-    const text = filteredLogLines.value.join("\n");
-    await window.electronAPI?.saveFile({
-      content: text,
-      defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.txt`,
-      filters: [{ name: "文本文件", extensions: ["txt"] }],
-    });
-  } catch (e: unknown) {
-    toast.error("导出失败：" + errorMessage(e));
-  }
+  await exportLogs('txt');
 }
 
 async function exportLogsJson() {
-  if (!filteredLogRaw.value.length) return;
-  // #33 导出加 try/catch，失败时 toast 提示
+  await exportLogs('json');
+}
+
+async function exportLogs(format: 'txt' | 'json') {
+  if (!filteredLogRaw.value.length || logExporting.value || logClearing.value) return;
+  const saveFile = window.electronAPI?.saveFile;
+  if (!saveFile) { toast.error('导出功能尚未连接'); return; }
+  logExporting.value = true;
   try {
-    const text = JSON.stringify(filteredLogRaw.value, null, 2);
-    await window.electronAPI?.saveFile({
-      content: text,
-      defaultName: `file-toolbox-logs-${new Date().toISOString().slice(0, 10)}.json`,
-      filters: [{ name: "JSON 文件", extensions: ["json"] }],
+    const now = new Date();
+    const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+    const result = await saveFile({
+      content: format === 'txt' ? filteredLogLines.value.join('\n') : JSON.stringify(filteredLogRaw.value, null, 2),
+      defaultName: `file-toolbox-logs-${date}.${format}`,
+      filters: [{ name: format === 'txt' ? '文本文件' : 'JSON 文件', extensions: [format] }],
     });
+    if (result.saved) toast.success('已导出筛选后的日志');
   } catch (e: unknown) {
     toast.error("导出失败：" + errorMessage(e));
+  } finally {
+    logExporting.value = false;
   }
 }
 
 async function checkUpdate() {
   const updateApi = window.electronAPI?.update;
-  if (!updateApi || updateBusy.value) return;
+  if (!updateApi || updateBusy.value || updateStatus.value.state === "downloaded") return;
   activeSettingsTab.value = "updates";
-  try {
-    updateStatus.value = await updateApi.check();
-  } catch (e: unknown) {
-    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "检查更新失败") };
-  }
+  updateActionPending.value = true;
+  try { await readUpdateStatus(() => updateApi.check(), "检查更新失败"); }
+  finally { updateActionPending.value = false; }
 }
 
 function handleUpdatePrimaryAction() {
@@ -573,11 +609,9 @@ function handleUpdatePrimaryAction() {
 async function downloadUpdate() {
   const updateApi = window.electronAPI?.update;
   if (!updateApi || updateBusy.value) return;
-  try {
-    updateStatus.value = await updateApi.download();
-  } catch (e: unknown) {
-    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "下载更新失败") };
-  }
+  updateActionPending.value = true;
+  try { await readUpdateStatus(() => updateApi.download(), "下载更新失败"); }
+  finally { updateActionPending.value = false; }
 }
 
 async function openUpdateRelease() {
@@ -585,26 +619,24 @@ async function openUpdateRelease() {
   try {
     await window.electronAPI?.openExternal(url);
   } catch (e: unknown) {
-    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "无法打开发布页") };
+    toast.error(errorMessage(e, "无法打开发布页"));
   }
 }
 
 async function installUpdate() {
   const updateApi = window.electronAPI?.update;
-  if (!updateApi || updateStatus.value.state !== "downloaded") return;
-  const confirmed = await dialog.confirm({
-    title: "重启并安装更新",
-    message: "应用将退出并安装新版本。正在运行的文件处理任务会被终止，确定继续吗？",
-    kind: "warning",
-    confirmText: "重启并安装",
-  });
-  if (!confirmed) return;
+  if (!updateApi || updateBusy.value || updateStatus.value.state !== "downloaded") return;
+  updateActionPending.value = true;
   try {
-    const result = await updateApi.install();
-    updateStatus.value = result.status;
-  } catch (e: unknown) {
-    updateStatus.value = { ...updateStatus.value, state: "error", error: errorMessage(e, "无法启动安装程序") };
-  }
+    const confirmed = await dialog.confirm({
+      title: "重启并安装更新",
+      message: "应用将退出并安装新版本。正在运行的文件处理任务会被终止，确定继续吗？",
+      kind: "warning",
+      confirmText: "重启并安装",
+    });
+    if (!confirmed || updateStatus.value.state !== 'downloaded') return;
+    await readUpdateStatus(async () => (await updateApi.install()).status, '无法启动安装程序');
+  } finally { updateActionPending.value = false; }
 }
 
 function formatBytes(value: unknown) {
@@ -615,9 +647,14 @@ function formatBytes(value: unknown) {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
-function openGithub(e: Event) {
+async function openProjectLink(e: Event, section: "" | "/issues" = "") {
+  if (!window.electronAPI) return;
   e.preventDefault();
-  window.electronAPI?.openExternal("https://github.com/LXL2000927/file-toolbox");
+  try {
+    await window.electronAPI.openExternal(`https://github.com/LXL2000927/file-toolbox${section}`);
+  } catch (error) {
+    toast.error(`无法打开链接：${errorMessage(error)}`);
+  }
 }
 
 async function openDataDir() {
@@ -634,41 +671,22 @@ async function openDataDir() {
 
 <template>
   <div class="about-shell panel-shell panel-shell-responsive">
-    <div
-      class="settings-tabs segmented-control segmented-animated"
-      role="tablist"
-      aria-label="设置分组"
-      :style="{ '--segment-count': settingsTabs.length, '--active-index': activeSettingsTabIndex }"
-    >
-      <button
-        v-for="tab in settingsTabs"
-        :key="tab.key"
-        class="settings-tab segmented-item"
-        :class="{ active: activeSettingsTab === tab.key }"
-        type="button"
-        role="tab"
-        :aria-selected="activeSettingsTab === tab.key"
-        @click="activeSettingsTab = tab.key"
-      >
-        {{ tab.label }}
-      </button>
-    </div>
+    <AppTabs id="settings" class="settings-tabs" :model-value="activeSettingsTab" label="设置分组" :options="settingsTabs.map((tab) => ({ value: tab.key, label: tab.label }))" @update:model-value="activeSettingsTab = $event as SettingsTab" />
 
     <div class="settings-content">
-      <Transition name="settings-view" mode="out-in">
-      <div v-if="activeSettingsTab === 'logs'" key="logs" class="settings-section logs-section glass-card section-card">
+      <Transition name="settings-view">
+      <div v-if="activeSettingsTab === 'logs'" key="logs" id="settings-logs-panel" role="tabpanel" aria-labelledby="settings-logs-tab" class="settings-section logs-section glass-card section-card">
         <div class="logs-toolbar section-toolbar">
           <button class="log-tool-button log-refresh-button" @click="() => refreshLogs()" :disabled="logLoading || logClearing">
             {{ logLoading ? "刷新中…" : "刷新" }}
           </button>
           <AppSelect class="log-filter-select" v-model="logLevelFilter" :options="logLevelOptions" min-width="128px" />
           <AppSelect class="log-filter-select" v-model="logSourceFilter" :options="logSourceOptions" min-width="136px" />
-          <input v-model="logSearch" class="input log-search" placeholder="搜索日志..." />
+          <input v-model="logSearch" aria-label="搜索日志" class="input log-search" placeholder="搜索日志..." />
           <button class="log-tool-button" :disabled="!logRaw.length || logClearing" @click="clearLogs">
             {{ logClearing ? "清空中…" : "清空" }}
           </button>
-          <button class="log-tool-button" :disabled="!filteredLogLines.length" @click="exportLogsTxt">导出 TXT</button>
-          <button class="log-tool-button" :disabled="!filteredLogRaw.length" @click="exportLogsJson">导出 JSON</button>
+          <AppSelect class="log-export-select" model-value="" ariaLabel="导出日志格式" min-width="100px" :disabled="!filteredLogItems.length || logExporting || logClearing" :options="[{ label: '导出日志', value: '', disabled: true }, { label: '文本 TXT', value: 'txt' }, { label: '结构 JSON', value: 'json' }]" @update:model-value="$event === 'txt' ? exportLogsTxt() : exportLogsJson()" />
           <button class="log-tool-button" @click="openDataDir">数据目录</button>
         </div>
         <div v-if="dataDirMsg" class="settings-message">{{ dataDirMsg }}</div>
@@ -679,12 +697,15 @@ async function openDataDir() {
             {{ logRaw.length ? "没有符合筛选条件的日志" : logError ? "当前无法显示历史记录" : "暂无操作记录" }}
           </div>
           <div v-else class="log-record-list selectable">
-            <pre
-              v-for="(item, index) in visibleLogItems"
-              :key="`${item.record?.timestamp || index}-${index}`"
-              class="log-text log-record"
-              :class="`log-record-${item.level}`"
-            >{{ item.text }}</pre>
+            <details v-for="(item, index) in visibleLogItems" :key="String(item.record?.id || `${item.record?.timestamp || index}-${index}`)" class="log-record" :class="`log-record-${item.level}`">
+              <summary class="log-record-summary">
+                <span class="log-level-badge">{{ logLevelOptions.find((option) => option.value === item.level)?.label || item.level }}</span>
+                <span class="log-record-title" :title="item.title">{{ item.title }}</span>
+                <span class="log-record-source">{{ logSourceOptions.find((option) => option.value === item.source)?.label || item.source }}</span>
+                <time class="log-record-time">{{ item.timestamp }}</time>
+              </summary>
+              <pre class="log-text log-record-detail">{{ item.text }}</pre>
+            </details>
             <div
               v-if="hasMoreLogs"
               :ref="setupLogSentinel"
@@ -696,7 +717,7 @@ async function openDataDir() {
         </div>
       </div>
 
-      <div v-else-if="activeSettingsTab === 'updates'" key="updates" class="settings-section updates-section glass-card section-card">
+      <div v-else-if="activeSettingsTab === 'updates'" key="updates" id="settings-updates-panel" role="tabpanel" aria-labelledby="settings-updates-tab" class="settings-section updates-section glass-card section-card">
         <div class="app-brand compact">
           <span class="app-logo"><AppIcon name="package" :size="28" /></span>
           <div>
@@ -757,6 +778,7 @@ async function openDataDir() {
               class="btn btn-primary"
               type="button"
               @click="downloadUpdate"
+              :disabled="updateBusy"
             >立即下载</button>
             <button
               v-else-if="updateStatus.state === 'available'"
@@ -769,6 +791,7 @@ async function openDataDir() {
               class="btn btn-primary"
               type="button"
               @click="installUpdate"
+              :disabled="updateBusy"
             >重启并安装</button>
           </div>
         </div>
@@ -806,58 +829,51 @@ async function openDataDir() {
           <span class="update-empty-icon"><AppIcon name="package" :size="28" /></span>
           <div class="update-empty-title">版本检查</div>
           <p>当前版本 v{{ updateStatus.current || '未知' }}</p>
+          <p class="update-idle-help">点击右上角检查更新，查看新版内容。<br />文件处理始终在本机完成。</p>
         </div>
         </Transition>
       </div>
 
-      <div v-else key="about" class="settings-section glass-card section-card about-section">
-        <div class="about-hero">
-          <span class="app-logo"><AppIcon name="package" :size="28" /></span>
-          <div class="about-hero-info">
-            <span class="app-name">File Toolbox</span>
-            <div class="version-pills">
-              <span class="version-pill">v{{ updateStatus.current || '未知' }}</span>
-              <span class="version-pill version-pill-sub">Electron</span>
-              <span class="version-pill version-pill-sub">Python Engine</span>
-            </div>
+      <div v-else key="about" id="settings-about-panel" role="tabpanel" aria-labelledby="settings-about-tab" class="settings-section glass-card section-card about-section">
+        <header class="about-hero">
+          <div class="about-intro">
+            <div class="about-brand"><span class="about-brand-icon"><AppIcon name="package" :size="26" /></span><span>File Toolbox<small>桌面文件工具箱</small></span></div>
+            <h2>把重复的文件处理，<br /><span>交给工具。</span></h2>
+            <p>页面整理、文档优化与扫描件分组。<br />从预览到输出，在一个本地工作区完成。</p>
           </div>
-          <a href="#" class="about-github-link" @click.prevent="openGithub" title="在 GitHub 上查看源码">
-            GitHub · LXL2000927/file-toolbox
-          </a>
-        </div>
-
-        <p class="about-lead">
-          File Toolbox 是一个 Electron + Vue 3 + Python 的本地文件处理工具箱，聚焦批量重命名、PDF 普通拆分和扫描件自动拆分。应用通过桌面界面组织任务，通过 Python 引擎在本机完成实际文件处理。
-        </p>
+          <section class="about-version" aria-label="版本信息">
+            <div class="about-version-heading"><span>当前版本</span><span class="version-pill version-pill-sub">{{ updatePackageLabel }}</span></div>
+            <strong>{{ updateStatus.current ? `v${updateStatus.current}` : '本地开发预览' }}</strong>
+            <p v-if="updateHasRelease">{{ updateStatus.state === 'downloaded' ? '新版已就绪，可前往更新页安装。' : `新版本 v${updateStatus.latest} 可用` }}</p>
+            <p v-else>{{ updateStatus.state === 'up-to-date' ? '已是最新版本' : '查看版本状态与更新说明' }}</p>
+            <button class="btn btn-primary" @click="showSettingsTab('updates')">{{ updateHasRelease ? '查看新版本' : '前往更新' }}<span aria-hidden="true">↗</span></button>
+            <div class="about-version-links">
+              <a href="https://github.com/LXL2000927/file-toolbox" target="_blank" rel="noopener noreferrer" @click="openProjectLink($event)">项目主页 ↗</a>
+              <a href="https://github.com/LXL2000927/file-toolbox/issues" target="_blank" rel="noopener noreferrer" @click="openProjectLink($event, '/issues')">反馈问题 ↗</a>
+            </div>
+          </section>
+        </header>
 
         <div class="about-feature-grid">
           <article v-for="(feature, index) in aboutFeatures" :key="feature.label" class="about-feature-card" :class="`accent-${index + 1}`">
-            <span class="about-feature-label">{{ feature.label }}</span>
+            <div class="about-feature-label"><AppIcon :name="feature.icon" :size="20" /><h3>{{ feature.label }}</h3><span class="about-feature-number">0{{ index + 1 }}</span></div>
             <h4>{{ feature.title }}</h4>
             <p>{{ feature.description }}</p>
+            <div class="about-feature-steps">{{ feature.steps }}</div>
           </article>
         </div>
 
-        <div class="about-info-grid">
-          <section class="about-info-card span-2">
-            <h4>处理架构</h4>
-            <ul class="arch-list">
-              <li v-for="item in aboutArchitecture" :key="item">{{ item }}</li>
-            </ul>
+        <div class="about-footer">
+          <section class="about-local-note">
+            <AppIcon name="folder" :size="20" />
+            <div><h3>文件留在本机</h3><p>处理文件无需上传。检查和下载更新时才会连接 GitHub。</p></div>
           </section>
-          <section class="about-info-card">
-            <h4>本地与隐私</h4>
-            <p>
-              文件处理在本机完成，不需要上传到第三方服务器。检查或下载更新时，应用会连接 GitHub Release 获取版本信息和安装包。
-            </p>
-          </section>
-          <section class="about-info-card">
-            <h4>使用建议</h4>
-            <ul class="tips-list">
-              <li v-for="tip in aboutTips" :key="tip">{{ tip }}</li>
-            </ul>
-          </section>
+          <button class="about-log-link" @click="showSettingsTab('logs')">遇到问题？查看运行日志 <span aria-hidden="true">→</span></button>
         </div>
+        <details class="about-technical">
+          <summary>技术信息与处理架构</summary>
+          <ul class="arch-list"><li v-for="item in aboutArchitecture" :key="item">{{ item }}</li></ul>
+        </details>
       </div>
       </Transition>
     </div>
@@ -870,6 +886,7 @@ async function openDataDir() {
   align-items: center;
   flex-shrink: 0;
   align-self: flex-start;
+  max-width: 300px;
 }
 .settings-tab {
   min-width: 74px;
@@ -898,9 +915,10 @@ async function openDataDir() {
 .settings-view-leave-active {
   transition: opacity 0.14s ease, transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
 }
+.settings-view-leave-active { position: absolute; inset: 0; pointer-events: none; }
 .settings-view-enter-from {
   opacity: 0;
-  transform: translateY(4px);
+  transform: translateY(3px);
 }
 .settings-view-leave-to {
   opacity: 0;
@@ -955,135 +973,91 @@ async function openDataDir() {
   color: var(--color-gray-600);
   font-weight: 500;
 }
+.about-section { padding: 0; container-type: inline-size; }
 .about-hero {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 276px;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 12px;
+  gap: 32px;
+  padding: 30px 32px 28px;
+  background: radial-gradient(ellipse at 65% 0%, var(--color-primary-bg), transparent 70%);
+  border-bottom: 1px solid var(--color-border);
 }
-.about-hero-info {
-  flex: 1;
-  min-width: 0;
-}
-.about-github-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 12px;
-  border-radius: 999px;
-  border: 1px solid var(--color-border-strong);
-  background: rgba(255, 255, 255, 0.54);
-  color: var(--color-gray-700);
-  font-size: var(--font-sm);
-  font-weight: 500;
-  text-decoration: none;
-  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
-  white-space: nowrap;
-}
-.about-github-link:hover {
-  border-color: var(--color-primary);
-  color: var(--color-primary-dark);
-  background: var(--color-primary-bg);
-}
-.about-lead {
-  margin: 0 0 12px;
-  color: var(--color-gray-700);
-  font-size: var(--font-md);
-  line-height: 1.7;
-}
+.about-brand { display: flex; align-items: center; gap: 12px; font-size: 18px; font-weight: 700; letter-spacing: -.4px; color: var(--color-gray-900); }
+.about-brand small { display: block; margin-top: 3px; font-size: 11px; font-weight: 500; letter-spacing: 1.2px; color: var(--color-gray-500); }
+.about-brand-icon { display: grid; place-items: center; width: 44px; height: 44px; border-radius: 13px; color: #fff; background: #3264cc; box-shadow: 0 5px 14px rgba(50, 100, 204, .17); }
+.about-intro h2 { margin: 22px 0 12px; font-size: clamp(24px, 3cqw, 34px); line-height: 1.4; letter-spacing: -.8px; font-weight: 700; color: var(--color-gray-900); }
+.about-intro h2 span { color: var(--color-primary-dark); }
+.about-intro > p { margin: 0; color: var(--color-gray-600); font-size: 13px; line-height: 1.8; }
+.about-version { padding: 20px; border: 1px solid var(--color-border); border-radius: 16px; background: var(--color-surface); box-shadow: 0 4px 20px rgba(30, 55, 90, .04); }
+.about-version-heading { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: 12px; color: var(--color-gray-600); }
+.about-version > strong { display: block; margin: 15px 0 7px; color: var(--color-gray-900); font-size: 25px; font-weight: 650; letter-spacing: -.6px; }
+.about-version > p { min-height: 18px; margin: 0 0 18px; font-size: 12px; color: var(--color-gray-500); }
+.about-version > .btn { width: 100%; justify-content: space-between; }
+.about-version-links { display: flex; justify-content: space-between; margin-top: 16px; gap: 12px; }
+.about-version-links a { color: var(--color-gray-600); text-decoration: none; font-size: 12px; }
+.about-version-links a:hover { color: var(--color-primary-dark); text-decoration: underline; text-underline-offset: 3px; }
 .about-feature-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 24px 32px;
+  gap: 22px;
 }
 .about-feature-card {
-  position: relative;
-  padding: 10px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.34);
-  overflow: hidden;
-}
-.about-feature-card::before {
-  content: "";
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 4px;
-  background: var(--color-primary);
-  opacity: 0.88;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
 .about-feature-label {
-  position: relative;
-  display: inline-flex;
+  display: flex;
   align-items: center;
-  min-height: 22px;
-  padding: 0;
+  gap: 9px;
   color: var(--color-primary-dark);
-  font-size: var(--font-sm);
-  font-weight: 700;
 }
-.about-feature-card h4,
-.about-info-card h4 {
-  position: relative;
-  margin: 8px 0 4px;
+.about-feature-label h3 { margin: 0; font-size: 13px; font-weight: 600; }
+.about-feature-number { margin-left: auto; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--color-gray-400); }
+.accent-2 .about-feature-label { color: #9f6043; }
+.accent-3 .about-feature-label { color: #347c6a; }
+.about-feature-card h4 {
+  margin: 16px 0 8px;
   color: var(--color-gray-900);
-  font-size: var(--font-lg);
+  font-size: 15px;
+  font-weight: 600;
 }
-.about-feature-card p,
-.about-info-card p {
-  position: relative;
+.about-feature-card p {
+  flex: 1;
   margin: 0;
   color: var(--color-gray-600);
-  font-size: var(--font-md);
-  line-height: 1.6;
+  font-size: 12px;
+  line-height: 1.8;
 }
-.about-info-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-}
-.about-info-card {
-  padding: 10px 2px 2px;
-  border-top: 1px solid var(--color-border);
-}
-.about-info-card.span-2 {
-  grid-column: 1 / -1;
-}
-.about-info-card ul {
-  margin: 6px 0 0;
-  padding-left: 18px;
-  color: var(--color-gray-600);
-  font-size: var(--font-md);
-  line-height: 1.65;
-}
+.about-feature-steps { margin-top: 17px; padding-top: 12px; border-top: 1px solid var(--color-border); font-size: 11px; color: var(--color-gray-500); line-height: 1.7; }
+.about-footer { margin: 0 32px; padding: 18px 0; display: flex; align-items: center; gap: 20px; border-top: 1px solid var(--color-border); }
+.about-local-note { display: flex; gap: 12px; align-items: center; color: var(--color-gray-500); flex: 1; }
+.about-local-note h3 { margin: 0 0 5px; color: var(--color-gray-700); font-size: 12px; font-weight: 600; }
+.about-local-note p { margin: 0; font-size: 11px; line-height: 1.7; }
+.about-log-link { padding: 8px 0 8px 12px; border: 0; background: transparent; color: var(--color-primary-dark); font-size: 12px; flex-shrink: 0; cursor: pointer; }
+.about-log-link:hover { text-decoration: underline; text-underline-offset: 4px; }
+.about-technical { margin: 0 32px 20px; color: var(--color-gray-500); font-size: 11px; }
+.about-technical summary { cursor: pointer; width: fit-content; padding: 5px 0; }
+.about-technical summary:hover { color: var(--color-gray-800); }
 .arch-list {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   column-gap: 24px;
   padding-left: 18px;
+  line-height: 1.8;
 }
-.tips-list {
-  columns: 2;
-  column-gap: 28px;
+@container (max-width: 750px) {
+  .about-hero { padding: 24px; gap: 20px; grid-template-columns: minmax(0, 1fr) 230px; }
+  .about-feature-grid { padding: 24px; gap: 18px; }
+  .about-footer, .about-technical { margin-left: 24px; margin-right: 24px; }
+  .about-feature-steps { font-size: 10px; }
 }
-.tips-list li {
-  break-inside: avoid;
-  margin-bottom: 4px;
-}
-@media (max-width: 1100px) {
-  .about-feature-grid,
-  .about-info-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .tips-list {
-    columns: 1;
-  }
-
-  .arch-list {
-    grid-template-columns: 1fr;
-  }
+@container (max-width: 560px) {
+  .about-hero, .about-feature-grid, .arch-list { grid-template-columns: 1fr; }
+  .about-footer { flex-direction: column; align-items: flex-start; }
+  .about-log-link { padding-left: 0; }
 }
 .settings-message {
   margin: 0 0 8px;
@@ -1394,7 +1368,7 @@ async function openDataDir() {
 .log-record-list {
   display: flex;
   flex-direction: column;
-  gap: 0;
+  gap: 8px;
 }
 .log-sentinel {
   text-align: center;
@@ -1416,11 +1390,22 @@ async function openDataDir() {
   border: 0;
   border-bottom: 1px solid rgba(148, 163, 184, 0.20);
   border-left: 3px solid transparent;
-  border-radius: 0;
-  background: rgba(255, 255, 255, 0.34);
+  border-radius: 8px;
+  background: var(--color-gray-50);
   content-visibility: auto;
-  contain-intrinsic-size: auto 80px;
+  contain-intrinsic-size: auto 48px;
 }
+.log-export-select { flex: 0 0 110px; }
+.log-record-summary { display: flex; align-items: center; gap: 10px; cursor: pointer; font-size: 12px; }
+.log-record-summary::before { content: '›'; color: var(--color-gray-500); transform: rotate(0deg); transition: transform 140ms ease; font-size: 18px; }
+.log-record[open] .log-record-summary::before { transform: rotate(90deg); }
+.log-record-title { flex: 1; min-width: 0; color: var(--color-gray-900); white-space: nowrap; text-overflow: ellipsis; overflow: hidden; font-size: 13px; }
+.log-level-badge { flex-shrink: 0; font-weight: 600; }
+.log-record-source, .log-record-time { color: var(--color-gray-500); flex-shrink: 0; }
+.log-record-detail { padding: 12px 0 4px; margin-top: 8px; border-top: 1px solid var(--color-border); }
+.technical-details summary { cursor: pointer; font-weight: 600; color: var(--color-gray-700); font-size: 13px; }
+.technical-details .arch-list { margin-top: 12px; }
+.update-idle-help { margin-top: 12px; font-size: 12px; line-height: 1.8; }
 .log-record-success {
   border-left-color: var(--color-success);
   background: color-mix(in srgb, var(--color-success-bg) 48%, white);

@@ -1,5 +1,8 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+assets/tessdata/*.traineddata
+assets/tessdata/*.download
+acceptance-samples/
 *.py[cod]
 *$py.class
 

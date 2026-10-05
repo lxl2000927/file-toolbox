@@ -137,6 +137,11 @@ export type ScanSplitOptions = {
   max_segment_pages?: number;
   enable_multithread?: boolean;
   enable_gpu?: boolean;
+  auto_detect_stamp?: boolean;
+  auto_detect_qrcode?: boolean;
+  auto_detect_feature?: boolean;
+  feature_strict?: boolean;
+  qrcode_dpi_retries?: number;
 };
 
 export type EngineNotificationParams = {
@@ -165,6 +170,14 @@ export type EngineNotificationPayload = {
 };
 
 export interface EngineAPI {
+  pdfTools: {
+    run: (action: PdfToolAction, files: string[], options: PdfToolOptions, taskId: string) => Promise<{ task_id: string; queued?: boolean; position?: number }>;
+  };
+  presets: {
+    list: (scope: PresetScope) => Promise<SavedPreset[]>;
+    save: (scope: PresetScope, name: string, settings: Record<string, unknown>) => Promise<SavedPreset>;
+    delete: (scope: PresetScope, id: string) => Promise<{ deleted: boolean }>;
+  };
   status: () => Promise<{ status: "starting" | "ready" | "error"; error?: string }>;
   ping: () => Promise<{ pong: boolean }>;
   rename: {
@@ -186,13 +199,37 @@ export interface EngineAPI {
   };
   cancelTask: (taskId: string) => Promise<{ cancelled: boolean; task_id: string }>;
   history: {
-    get: (count?: number, options?: { operationType?: string; currentSession?: boolean; sessionId?: string }) => Promise<{ records: unknown[]; session_id: string }>;
+    get: (count?: number, options?: { operationType?: string; currentSession?: boolean; sessionId?: string }) => Promise<{ records: unknown[]; session_id: string; storage_error?: string | null }>;
     clear: () => Promise<{ cleared: boolean; session_id: string; error?: string }>;
   };
   onNotification: (callback: (payload: EngineNotificationPayload) => void) => () => void;
 }
 
 export type AppUpdateState = "idle" | "checking" | "available" | "downloading" | "downloaded" | "installing" | "up-to-date" | "unsupported" | "error";
+
+export type PresetScope = "scan" | "workbench";
+export type SavedPreset = { id: string; scope: PresetScope; name: string; settings: Record<string, unknown> };
+export type PdfToolAction = "inspect" | "thumbnails" | "assemble" | "interleave" | "detect_blank" | "export_images" | "extract_images" | "compress" | "ocr" | "segments";
+export type PdfPageRef = { source: number; index: number; rotation?: number };
+export type PdfToolOptions = {
+  compact_inspect?: boolean; partial_inspect?: boolean;
+  thumbnail_size?: number;
+  pages?: PdfPageRef[]; signatures?: string[]; output_dir?: string; filename?: string;
+  dpi?: number; quality?: number; compression?: "none" | "lossless" | "raster";
+  reverse_back?: boolean; image_format?: "png" | "jpeg"; ocr?: boolean; ocr_text?: boolean;
+  language?: "chi_sim+eng" | "chi_sim" | "eng"; segments?: number[][];
+};
+export type PdfSource = { path: string; name: string; kind: "pdf" | "image"; page_count: number; signature: string; size: number;
+  pages: { index: number; width: number; height: number; rotation: number }[] };
+export type PdfToolResult = { action: PdfToolAction; output_files: string[]; errors: string[]; cancelled: boolean;
+  text_files?: string[]; input_pages?: number; output_pages?: number; comparison_eligible?: boolean;
+  ocr_pages?: { output_file: string; page: number; text: string; truncated: boolean }[];
+  ocr_total_pages?: number; ocr_preview_limit?: number; ocr_preview_chars?: number;
+  bytes_before: number; bytes_after: number; warnings?: string[]; recognized_text?: string[];
+  sources?: PdfSource[]; ocr?: { available: boolean; languages: string[] };
+  thumbnails?: (PdfPageRef & { data_url: string })[];
+  candidates?: (PdfPageRef & { ink_ratio: number; brightness: number })[]; checked?: number;
+};
 export type AppPackageType = "development" | "installer" | "portable" | "archive";
 
 export type AppUpdateStatus = {
@@ -227,6 +264,10 @@ export interface ElectronAPI {
   };
   openExternal: (url: string) => Promise<void>;
   openDataDir: () => Promise<string>;
+  openDocument: (path: string) => Promise<void>;
+  revealDocument: (path: string) => Promise<void>;
+  copyText: (text: string) => Promise<void>;
+  saveTextCopy: (path: string) => Promise<{ saved: boolean; path?: string }>;
   restartEngine: () => Promise<void>;
   saveFile: (options: { content: string; defaultName?: string; filters?: { name: string; extensions: string[] }[] }) => Promise<{ saved: boolean; path?: string }>;
   getPathForFile: (file: File) => string;
