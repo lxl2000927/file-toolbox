@@ -6,7 +6,7 @@ export type WorkspaceSource = {
 export type WorkspacePage = { uid: string; source: number; index: number; rotation: number };
 export type WorkspaceReview = { source: number; total: number; markers: number[]; segments: number[][]; options: Record<string, unknown>; expanded: boolean };
 export type WorkspaceState = { version: 1; sources: WorkspaceSource[]; pages: WorkspacePage[]; settings: Record<string, unknown>; blankIds?: string[]; review?: WorkspaceReview };
-export type WorkspaceSourceStatus = { index: number; path: string; status: 'ready' | 'missing' | 'changed'; message?: string };
+export type WorkspaceSourceStatus = { index: number; path: string; role?: 'document' | 'reference'; status: 'ready' | 'missing' | 'changed'; message?: string };
 export type WorkspaceLoadResult = { state: WorkspaceState | null; sources: WorkspaceSourceStatus[]; savedAt: string | null };
 export interface WorkspaceAPI {
   load(scope: WorkspaceScope): Promise<WorkspaceLoadResult>;

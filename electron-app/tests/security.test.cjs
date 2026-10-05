@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
+const { EventEmitter } = require('node:events');
 const { pathToFileURL } = require('node:url');
 const { buildSync } = require('esbuild');
 
@@ -13,8 +14,9 @@ function mainHarness() {
   const appPath = path.resolve(__dirname, '../dist/main');
   const appUrl = pathToFileURL(path.join(appPath, '../renderer/index.html')).href;
   const frame = { url: appUrl };
-  const contents = { mainFrame: frame };
-  const window = { webContents: contents, isDestroyed: () => false };
+  const contents = Object.assign(new EventEmitter(), { mainFrame: frame, isLoadingMainFrame: () => false, send() {}, setWindowOpenHandler() {} });
+  const window = Object.assign(new EventEmitter(), { webContents: contents, isDestroyed: () => false,
+    setMinimumSize() {}, show() {}, loadFile: async () => {}, loadURL: async () => {} });
   const event = { sender: contents, senderFrame: frame };
   let response = 1;
   let confirmations = 0;
@@ -30,6 +32,7 @@ function mainHarness() {
     },
   });
   const electron = {
+    BrowserWindow: function () { return window; },
     app: { isPackaged: true, requestSingleInstanceLock: () => true, getVersion: () => 'test', on() {}, whenReady: () => new Promise(() => {}) },
     ipcMain: { handle: (channel, handler) => handlers.set(channel, handler) },
     protocol: { registerSchemesAsPrivileged() {} },
@@ -39,7 +42,7 @@ function mainHarness() {
   };
   const input = fs.readFileSync(path.join(__dirname, '../main/index.ts'), 'utf8');
   const code = buildSync({
-    stdin: { contents: input + '\nexport const harness = { setupIPC, authorizePath, isAuthorizedPath, isAllowedAppUrl, init(w,b) { mainWindow=w; bridge=b; engineStatus="ready"; previewEngine.call=b.call.bind(b); } };', resolveDir: path.join(__dirname, '../main'), loader: 'ts' },
+    stdin: { contents: input + '\nexport const harness = { setupIPC, authorizePath, isAuthorizedPath, isAllowedAppUrl, createWindow, flushWorkspaceBeforeClose, setStore(store) { workspaceStore=store; }, init(w,b) { mainWindow=w; bridge=b; engineStatus="ready"; previewEngine.call=b.call.bind(b); } };', resolveDir: path.join(__dirname, '../main'), loader: 'ts' },
     bundle: true, platform: 'node', format: 'cjs', write: false,
     external: ['electron', 'electron-updater'],
   }).outputFiles[0].text;
@@ -53,7 +56,7 @@ function mainHarness() {
   api.init(window, { call: async (method, params) => { engineCalls.push([method, params]); return responder(method, params); } });
   api.setupIPC();
   return {
-    ...api, appUrl, event,
+    ...api, appUrl, event, contents,
     engineCalls, respond: fn => { responder = fn; },
     actions, saveTo: p => { savePath = p; },
     invoke: (channel, arg, sender = event) => handlers.get(channel)(sender, arg),
@@ -234,3 +237,64 @@ test('retry uses journal params and rejects changed original inputs before dispa
   await assert.rejects(h.call('tasks.retry', { task_id: 'original_task' }), /变化/);
   assert.equal(h.engineCalls.filter(c => c[0] === 'pdf_split.execute_async').length, before);
 }));
+
+test('successful in-place rename and undo transfer only the selected file grant', async () => fixture(async root => {
+  const h = mainHarness(), before = path.join(root, 'before.txt'), after = path.join(root, 'after.txt');
+  fs.writeFileSync(before, 'selected content'); await h.authorizePath(before);
+  h.respond(async (method, params) => {
+    if (method === 'rename.execute') {
+      fs.renameSync(before, after);
+      return { operations: [{ success: true, original_path: before, new_path: after, operation_type: 'overwrite' }] };
+    }
+    if (method === 'rename.undo') { fs.renameSync(after, before); return { restored: [{ from: after, to: before }] }; }
+    return params;
+  });
+  await h.call('rename.execute', { files: [before], rules: [], save_method: 'overwrite' });
+  await h.call('rename.preview', { files: [after], rules: [] });
+  assert.equal(await h.isAuthorizedPath(path.join(root, 'unselected.txt')), false);
+  await h.call('rename.undo', { undo_token: 'engine-token' });
+  await h.call('rename.preview', { files: [before], rules: [] });
+}));
+
+test('rename result cannot grant replaced or unrelated file identities', async () => fixture(async root => {
+  const h = mainHarness(), original = path.join(root, 'source.txt'), target = path.join(root, 'target.txt');
+  fs.writeFileSync(original, 'source'); fs.writeFileSync(target, 'unselected'); await h.authorizePath(original);
+  h.respond(async () => ({ operations: [{ success: true, original_path: original, new_path: target, operation_type: 'overwrite' }] }));
+  await h.call('rename.execute', { files: [original], rules: [], save_method: 'overwrite' });
+  assert.equal(await h.isAuthorizedPath(target), false);
+}));
+
+test('retry retains the verified ancestor identity after an output child has been created', async () => fixture(async root => {
+  const h = mainHarness(), input = path.join(root, 'input.pdf'), out = path.join(root, 'new-output');
+  fs.writeFileSync(input, '%PDF'); await h.authorizePath(root);
+  const initial = await h.call('pdf_split.execute_async', { pdf_paths: [input], config: { output_dir: out } });
+  fs.mkdirSync(out);
+  h.respond(async (method, params) => method === 'tasks.retry_spec' ? {
+    method: 'pdf_split.execute_async', params: { pdf_paths: [input], config: { output_dir: out } },
+    input_identities: initial._input_identities, output_identities: initial._output_identities,
+  } : params);
+  const retried = await h.call('tasks.retry', { task_id: 'initial-task' });
+  assert.deepEqual(JSON.parse(JSON.stringify(retried._output_identities)), JSON.parse(JSON.stringify(initial._output_identities)));
+}));
+
+test('a crashed renderer closes after main-process writes without a renderer handshake', async () => {
+  const h = mainHarness(); h.createWindow(); let flushes = 0;
+  h.setStore({ flush: async () => { flushes++; } });
+  h.contents.send = () => { throw new Error('cannot send to crashed renderer'); };
+  h.contents.emit('render-process-gone', {}, { reason: 'crashed' });
+  await h.flushWorkspaceBeforeClose(); assert.equal(flushes, 1);
+  h.setStore({ flush: async () => { throw new Error('disk full'); } });
+  await assert.rejects(h.flushWorkspaceBeforeClose(), /disk full/);
+});
+
+test('a crash during close releases the outstanding handshake and still flushes writes', async () => {
+  const h = mainHarness(); h.createWindow(); let token, complete = false, flushed = false;
+  h.contents.send = (_channel, value) => { token = value; };
+  h.setStore({ flush: async () => { flushed = true; } });
+  const pending = h.flushWorkspaceBeforeClose().then(() => { complete = true; });
+  h.contents.emit('render-process-gone', {}, { reason: 'crashed' });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const completedAfterCrash = complete;
+  await h.invoke('workspace:flushed', token); await pending;
+  assert.equal(completedAfterCrash, true); assert.equal(flushed, true);
+});

@@ -12,6 +12,7 @@ class PdfSources:
         self.opener, self.reader, self.max_bytes = opener, reader, max_bytes
         self.check, self.result = check, result
         self.info = {}
+        self._page_bytes = {}
         self._stack, self._index, self._document = ExitStack(), None, None
 
     def __enter__(self):
@@ -40,11 +41,12 @@ class PdfSources:
         expected = self.signatures[index] if self.signatures is not None else self.info.get(index, {}).get('signature')
         if expected is not None and expected != signature:
             raise ValueError('输入文件已发生变化，请重新载入后复核')
-        doc, kind = self.opener(path, data, self._stack)
+        doc, kind = self.opener(path, data, self._stack, self.check)
         if index not in self.info:
             self.result['bytes_before'] += len(data)
         self.info[index] = {'path': path, 'name': os.path.basename(path), 'kind': kind,
                             'page_count': len(doc), 'signature': signature, 'size': len(data)}
+        self._page_bytes[index] = getattr(doc, '_toolbox_page_bytes', None)
         self._index, self._document = index, doc
         return doc
 
@@ -52,6 +54,15 @@ class PdfSources:
         if index not in self.info:
             self[index]
         return self.info[index]['page_count']
+
+    def memory_size(self, index):
+        return max(self.info[index]['size'], sum(self._page_bytes.get(index) or []))
+
+    def selected_bytes(self, index, pages):
+        page_bytes = self._page_bytes.get(index)
+        if page_bytes is not None:
+            return sum(page_bytes[page] for page in pages)
+        return self.info[index]['size'] * len(pages) / self.info[index]['page_count']
 
     def describe(self, index, compact=False):
         doc = self[index]

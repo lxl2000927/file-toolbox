@@ -23,13 +23,13 @@ export function useWorkspacePersistence(scope: WorkspaceScope, snapshot: () => W
     try {
       // Publish unavailable sources before mounting restored page grids. An
       // awaited apply can otherwise render one tick with every source ready.
-      statuses.value = result.sources;
+      statuses.value = result.sources.map(item => ({ ...item, role: result.state?.sources[item.index]?.role }));
       if (result.state) await apply(result.state);
       savedAt.value = result.savedAt || '';
       error.value = '';
       await nextTick();
-      applied = true; dirty = false;
-    } finally { restoring.value = false; ready.value = true; }
+      applied = true; dirty = false; ready.value = true;
+    } finally { restoring.value = false; }
   }
   function schedule() {
     if (!api || !ready.value || restoring.value || disposed || !applied) return;
@@ -43,6 +43,9 @@ export function useWorkspacePersistence(scope: WorkspaceScope, snapshot: () => W
     if (draining) return draining;
     const attempt = (async () => {
       await initialLoad;
+      // An unread workspace must never be overwritten by the initial empty
+      // editor, nor acknowledged as safely saved during the close handshake.
+      if (!applied) throw new Error(error.value || '工作区尚未恢复，请先重试恢复。');
       for (;;) {
         await nextTick();
         if (timer) { clearTimeout(timer); timer = undefined; }
@@ -73,8 +76,9 @@ export function useWorkspacePersistence(scope: WorkspaceScope, snapshot: () => W
     if (!api) return;
     restoring.value = true; error.value = '';
     try { await accept(await api.load(scope)); }
-    catch (caught) { error.value = `无法恢复工作区：${String(caught)}`; restoring.value = false; ready.value = true; }
+    catch (caught) { error.value = `无法恢复工作区：${String(caught)}`; restoring.value = false; ready.value = false; }
   }
+  async function retry() { if (!applied) { initialLoad = restore(); await initialLoad; } else await flush(); }
   async function relocate(index: number) {
     if (!api || restoring.value) return;
     try {
@@ -93,5 +97,5 @@ export function useWorkspacePersistence(scope: WorkspaceScope, snapshot: () => W
     // unmount must not lose the last debounced edit.
     void flush().catch(() => {}).finally(() => flushers.delete(flush));
   });
-  return { ready, restoring, saving, error, savedAt, statuses, label, flush, restore, relocate };
+  return { ready, restoring, saving, error, savedAt, statuses, label, flush, restore, retry, relocate, markDirty: schedule };
 }

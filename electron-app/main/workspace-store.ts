@@ -8,6 +8,9 @@ import type { WorkspaceLoadResult, WorkspaceScope, WorkspaceSource, WorkspaceSou
 export type WorkspaceIdentity = { canonical: string; dev: string; ino: string; size: string; mtime_ns: string; signature: string; sha256: string };
 export type WorkspaceStoreOptions = {
   capture(source: WorkspaceSource): Promise<WorkspaceIdentity>;
+  // Only native selection grants may advance this value. Renderer metadata
+  // cannot request identity renewal, including for sources with blank signatures.
+  getSelectionGeneration?(source: WorkspaceSource): number | undefined;
   verify(source: WorkspaceSource, identity: WorkspaceIdentity): Promise<Pick<WorkspaceSourceStatus, 'status' | 'message'>>;
   relocate(source: WorkspaceSource, identity: WorkspaceIdentity, path: string): Promise<{ source: WorkspaceSource; identity: WorkspaceIdentity }>;
   atomicWrite?: (path: string, content: string) => Promise<void>;
@@ -104,6 +107,7 @@ function checkedIdentity(value: WorkspaceIdentity): WorkspaceIdentity {
 export class WorkspaceStore {
   private queue: Promise<unknown> = Promise.resolve();
   private errors = new Map<WorkspaceScope, unknown>();
+  private capturedSelections = new Map<WorkspaceScope, Map<string, number>>();
   constructor(private directory: string, private options: WorkspaceStoreOptions) {}
   private enqueue<T>(scope: WorkspaceScope, operation: () => Promise<T>): Promise<T> {
     checkScope(scope);
@@ -134,9 +138,17 @@ export class WorkspaceStore {
       const previous = await this.read(scope);
       const known = new Map(previous?.state.sources.map((s, i) => [`${s.path}\0${s.signature}`, previous.identities[i]]) || []);
       const identities: WorkspaceIdentity[] = [];
-      for (const source of state.sources) identities.push(known.get(`${source.path}\0${source.signature}`) || checkedIdentity(await this.options.capture(source)));
+      const generations = new Map<string, number>();
+      for (const source of state.sources) {
+        const key = `${source.path}\0${source.signature}`;
+        const generation = this.options.getSelectionGeneration?.(source);
+        const selectedAgain = generation !== undefined && this.capturedSelections.get(scope)?.get(key) !== generation;
+        identities.push(!selectedAgain && known.has(key) ? known.get(key)! : checkedIdentity(await this.options.capture(source)));
+        if (generation !== undefined) generations.set(key, generation);
+      }
       const savedAt = new Date().toISOString();
       await this.write(scope, { version: 1, savedAt, state, identities });
+      this.capturedSelections.set(scope, generations);
       return { savedAt };
     });
   }

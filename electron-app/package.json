@@ -1,6 +1,6 @@
 {
   "name": "file-toolbox-electron",
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "File Toolbox - Electron + Python 桌面应用",
   "main": "dist/main/index.js",
   "engines": {
@@ -23,7 +23,8 @@
     "package:zip": "npm run build && electron-builder --win zip",
     "package:publish": "npm run build && electron-builder --win nsis --publish always",
     "typecheck": "vue-tsc --noEmit",
-    "test:reliable": "node tests/run-desktop-reliable.cjs"
+    "test:reliable": "node tests/run-desktop-reliable.cjs",
+    "test:fixes": "node tests/run-desktop-fixes-271.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.19.20",

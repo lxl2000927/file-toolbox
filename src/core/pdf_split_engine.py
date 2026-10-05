@@ -569,7 +569,7 @@ class PdfSplitEngine:
                 from src.utils.task_store import verify_outputs
                 artifacts = [unit['files']['pdf'] for key, unit in checkpoint['units'].items()
                              if key.startswith(f'{input_index}:')]
-                verify_outputs(artifacts)
+                verify_outputs(artifacts, cancel_check)
                 results['successful'] += 1
                 results['output_files'].extend(artifact['path'] for artifact in artifacts)
                 results['operations'].append(previous)
@@ -623,7 +623,10 @@ class PdfSplitEngine:
             if checkpoint is not None and record.success:
                 checkpoint['completed_inputs'][str(input_index)] = dict(_op)
                 if on_checkpoint:
-                    on_checkpoint(checkpoint)
+                    if callable(getattr(on_checkpoint, 'update_meta', None)):
+                        on_checkpoint.update_meta(checkpoint['operation'], {'completed_inputs': {str(input_index): dict(_op)}})
+                    else:
+                        on_checkpoint(checkpoint)
         
         self._record_to_history(results)
         

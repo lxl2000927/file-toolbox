@@ -2491,6 +2491,11 @@ class PdfScanSplitEngine:
             if not isinstance(scan, dict) or not isinstance(scan.get('markers'), list) or not isinstance(scan.get('total_pages'), int):
                 raise ValueError('扫描检查点损坏')
             markers, total_pages = scan['markers'], scan['total_pages']
+            with _open_pdf(pdf_path) as source:
+                if (isinstance(total_pages, bool) or total_pages != source.page_count
+                        or any(type(page) is not int or page < 0 or page >= total_pages for page in markers)
+                        or markers != sorted(set(markers))):
+                    raise ValueError('扫描检查点页数或标记与实际来源不一致')
             if log:
                 log('已恢复完整扫描结果，继续未完成输出')
         else:
@@ -2501,7 +2506,10 @@ class PdfScanSplitEngine:
             if not PdfScanSplitEngine._is_cancelled(cancel_check):
                 saved['scan'] = {'markers': markers, 'total_pages': total_pages}
                 if on_checkpoint:
-                    on_checkpoint(saved)
+                    if callable(getattr(on_checkpoint, 'update_meta', None)):
+                        on_checkpoint.update_meta(saved['operation'], {'scan': saved['scan']})
+                    else:
+                        on_checkpoint(saved)
         scan_elapsed_s = time.perf_counter() - scan_started_at
         perf.scan_seconds = scan_elapsed_s
 
@@ -2540,16 +2548,27 @@ class PdfScanSplitEngine:
         warnings = [f"发现 {len(suspect_segments)} 个超长分段，请检查是否漏掉标记页"] if suspect_segments else []
 
         write_started_at = time.perf_counter()
-        def save_segments(value):
-            saved['segments'] = value
-            saved['units'] = value['units']
-            if on_checkpoint:
-                on_checkpoint(saved)
+        class SegmentCheckpoint:
+            def __call__(self, value):
+                saved['segments'] = value
+                saved['units'] = value['units']
+                if on_checkpoint:
+                    on_checkpoint(saved)
+
+            def commit_unit(self, operation, key, unit, *, meta=None):
+                segment = saved.setdefault('segments', {'version': 1, 'operation': operation, 'units': {}})
+                segment['units'][key] = unit
+                saved['units'][key] = unit
+                if callable(getattr(on_checkpoint, 'commit_unit', None)):
+                    on_checkpoint.commit_unit(saved['operation'], key, unit, meta={
+                        'segments': {'version': 1, 'operation': operation, 'units': {key: unit}}})
+                elif on_checkpoint:
+                    on_checkpoint(saved)
         try:
             outputs = PdfScanSplitEngine.write_segments(
                 pdf_path, segments, output_dir=output_dir, prefix=prefix or "", log=log,
                 cancel_check=cancel_check, phase_progress=phase_progress,
-                checkpoint=saved.get('segments'), on_checkpoint=save_segments if on_checkpoint is not None else None,
+                checkpoint=saved.get('segments'), on_checkpoint=SegmentCheckpoint() if on_checkpoint is not None else None,
             )
         except ScanWriteError as exc:
             perf.write_seconds = time.perf_counter() - write_started_at

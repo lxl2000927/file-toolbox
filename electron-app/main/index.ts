@@ -59,6 +59,7 @@ let ipcReady = false;
 let startEnginePromise: Promise<void> | null = null;
 let workspaceStore: WorkspaceStore | null = null;
 let allowWindowClose = false, closePending = false;
+let rendererUnavailable = false;
 const workspaceFlushes = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 const previewEngine = new PreviewEngine(async () => {
   const worker = new PythonBridge();
@@ -82,6 +83,8 @@ type FileIdentity = { dev: string; ino: string; size: string; mtime_ns: string; 
 type AuthorizedPath = { kind: "file" | "directory"; canonical: string; identity: FileIdentity };
 const authorizedPaths = new Map<string, AuthorizedPath>();
 const authorizedDirectories = new Map<string, AuthorizedPath>();
+const selectionGenerations = new Map<string, number>();
+let selectionGeneration = 0;
 const MAX_AUTHORIZED_PATHS = 12000;
 const ENGINE_AUTH_TOKEN = randomBytes(32).toString("hex");
 const ENGINE_METHODS = new Set(["ping", "rename.preview", "rename.execute", "rename.undo", "pdf_split.validate", "pdf_split.preview", "pdf_split.preview_many", "pdf_split.execute_async", "scan_split.execute_async", "scan_split.preview_reference", "scan_split.probe_page", "scan_split.scan_only", "task.cancel", "history.get", "history.clear"]);
@@ -131,6 +134,7 @@ function grantSaved(path: string, saved: SavedIdentity, kind: 'file' | 'director
 function getWorkspaceStore(): WorkspaceStore {
   if (workspaceStore) return workspaceStore;
   workspaceStore = new WorkspaceStore(join(process.env.APPDATA || app.getPath('appData'), 'FileToolbox', 'workspaces'), {
+    getSelectionGeneration: source => selectionGenerations.get(grantKey(source.path)),
     async capture(source) {
       if (!await isAuthorizedPath(source.path)) throw new Error('工作区来源尚未授权');
       const identity = await captureDocument(source.path, sourceByteLimit(source));
@@ -159,12 +163,13 @@ function getWorkspaceStore(): WorkspaceStore {
 }
 
 async function flushWorkspaceBeforeClose(): Promise<void> {
-  if (mainWindow && !mainWindow.isDestroyed() && typeof mainWindow.webContents.isLoadingMainFrame === 'function' && !mainWindow.webContents.isLoadingMainFrame()) {
+  if (!rendererUnavailable && mainWindow && !mainWindow.isDestroyed() && typeof mainWindow.webContents.isLoadingMainFrame === 'function' && !mainWindow.webContents.isLoadingMainFrame()) {
     const token = randomBytes(16).toString('hex');
     await new Promise<void>((resolvePromise, reject) => {
       const timer = setTimeout(() => { workspaceFlushes.delete(token); reject(new Error('等待工作区保存超时，请稍后再试')); }, 30000);
       workspaceFlushes.set(token, { resolve: () => { clearTimeout(timer); resolvePromise(); }, reject: error => { clearTimeout(timer); reject(error); } });
-      mainWindow!.webContents.send('workspace:flush-requested', token);
+      try { mainWindow!.webContents.send('workspace:flush-requested', token); }
+      catch (error) { const pending = workspaceFlushes.get(token); workspaceFlushes.delete(token); pending?.reject(error instanceof Error ? error : new Error(String(error))); }
     });
   }
   await workspaceStore?.flush();
@@ -180,7 +185,7 @@ async function restoreTaskAccess(event: Electron.IpcMainInvokeEvent, method: str
     assertPathString(output);
     await validateInputFile(output, RESULT_DOCUMENT_EXTENSIONS, Infinity);
     if (!isMainSender(event)) throw new Error('IPC 调用来源无效');
-    await authorizePath(output);
+    await authorizePath(output, false);
     shell.showItemInFolder(await documentPath(event, output));
     return;
   }
@@ -199,6 +204,15 @@ async function restoreTaskAccess(event: Electron.IpcMainInvokeEvent, method: str
     if (!spec.input_identities[path]) throw new Error('任务来源身份缺失');
     await verifyIdentity(path, spec.input_identities[path], 'file');
   }
+  // A formerly missing child may now exist. Keep the original verified ancestor
+  // proof instead of changing the identity set used by the task journal.
+  const savedOutputs = spec.output_identities || {};
+  for (const identity of Object.values(checked._output_identities) as FileIdentity[]) {
+    if (!Object.values(savedOutputs).some(saved => containsPath((saved as SavedIdentity).canonical, identity.canonical!))) {
+      throw new Error('任务输出目录与原授权范围不一致');
+    }
+  }
+  checked._output_identities = savedOutputs;
   if (!isMainSender(event) || bridge !== currentBridge) throw new Error('引擎已重启，请重试');
   return currentBridge.call(spec.method, { ...checked, task_id: `retry_${randomBytes(12).toString('hex')}`, _resume_task_id: id });
 }
@@ -284,7 +298,7 @@ function authorizationCandidates(pathValue: string): AuthorizedPath[] {
   return candidates;
 }
 
-async function authorizePath(pathValue: string): Promise<void> {
+async function authorizePath(pathValue: string, nativeSelection = true): Promise<void> {
   assertPathString(pathValue);
   const canonical = await canonicalPath(pathValue);
   const stat = await fsp.stat(canonical, { bigint: true });
@@ -292,6 +306,35 @@ async function authorizePath(pathValue: string): Promise<void> {
   const entry: AuthorizedPath = { kind: stat.isDirectory() ? "directory" : "file", canonical, identity: fileIdentity(stat) };
   rememberAuthorizedPath(resolve(pathValue), entry);
   rememberAuthorizedPath(canonical, entry);
+  if (nativeSelection) {
+    const generation = ++selectionGeneration;
+    selectionGenerations.set(grantKey(pathValue), generation);
+    selectionGenerations.set(grantKey(canonical), generation);
+    while (selectionGenerations.size > MAX_AUTHORIZED_PATHS) selectionGenerations.delete(selectionGenerations.keys().next().value!);
+  }
+}
+
+async function transferRenameGrants(method: string, checked: any, result: any): Promise<void> {
+  const operations = method === 'rename.execute' ? result?.operations : result?.restored;
+  if (!Array.isArray(operations)) return;
+  for (const operation of operations) {
+    if (method === 'rename.execute' && (!operation?.success || operation.operation_type !== 'overwrite')) continue;
+    if (method === 'rename.undo' && operation?.operation === 'copy') continue;
+    const from = method === 'rename.execute' ? operation.original_path : operation?.from;
+    const to = method === 'rename.execute' ? operation.new_path : operation?.to;
+    if (typeof from !== 'string' || typeof to !== 'string' || !samePath(dirname(resolve(from)), dirname(resolve(to)))) continue;
+    const selected = authorizedPaths.get(grantKey(from));
+    const identity = method === 'rename.execute' ? checked._input_identities[from] : selected?.kind === 'file' ? selected.identity : undefined;
+    if (!identity) continue;
+    try {
+      const canonical = await canonicalPath(to);
+      if (identity.canonical && !samePath(dirname(canonical), dirname(identity.canonical))) continue;
+      const stat = await fsp.stat(canonical, { bigint: true });
+      if (!stat.isFile() || !['dev', 'ino', 'size', 'mtime_ns'].every(key => fileIdentity(stat)[key as keyof FileIdentity] === identity[key])) continue;
+      const entry: AuthorizedPath = { kind: 'file', canonical, identity: fileIdentity(stat) };
+      rememberAuthorizedPath(to, entry); rememberAuthorizedPath(canonical, entry);
+    } catch { /* A moved or externally replaced result must be selected again. */ }
+  }
 }
 
 function fileIdentity(stat: import("fs").BigIntStats): FileIdentity {
@@ -547,6 +590,7 @@ function canRunPython(exePath: string): boolean {
 
 function createWindow() {
   allowWindowClose = false;
+  rendererUnavailable = false;
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -576,6 +620,7 @@ function createWindow() {
     mainWindow = null;
     authorizedPaths.clear();
     authorizedDirectories.clear();
+    selectionGenerations.clear();
   });
 
   mainWindow.once("ready-to-show", () => {
@@ -605,8 +650,14 @@ function createWindow() {
   });
 
   mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    rendererUnavailable = true;
+    // Renderer memory has already been lost. Drain writes accepted by the main
+    // process, rather than waiting for an acknowledgement that cannot arrive.
+    for (const pending of workspaceFlushes.values()) pending.resolve();
+    workspaceFlushes.clear();
     console.error(`[main] 渲染进程崩溃: ${details.reason}`);
   });
+  mainWindow.webContents.on('did-finish-load', () => { rendererUnavailable = false; });
 
   if (isDev) {
     mainWindow.loadURL(DEV_RENDERER_URL).catch((err) => {
@@ -662,7 +713,9 @@ function setupIPC() {
     if (!isMainSender(event)) throw new Error("Invalid IPC sender");
     if (method === 'task.cancel' && previewEngine.owns(checked.task_id)) return previewEngine.cancel(checked.task_id);
     if (method === 'scan_split.preview_reference' || method === 'pdf_tools.run' && ['inspect', 'thumbnails'].includes(checked.action)) return previewEngine.call(method, checked);
-    return bridge.call(method, checked);
+    const result = await bridge.call(method, checked);
+    if (method === 'rename.execute' || method === 'rename.undo') await transferRenameGrants(method, checked, result);
+    return result;
   });
 
   ipcMain.handle("engine:status", async (event) => {

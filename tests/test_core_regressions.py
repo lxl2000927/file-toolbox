@@ -75,6 +75,8 @@ class CoreRegressionTests(unittest.TestCase):
             {'success': True, 'operation': 'copy', 'original_path': str(self.root / 'first'), 'new_path': str(first)},
             {'success': True, 'operation': 'overwrite', 'original_path': str(original), 'new_path': str(second)},
         ]
+        for operation in operations:
+            operation['_undo_identity'] = server._rename_output_identity(operation['new_path'])
         with patch.dict(server._UNDO_RECORDS, {'test-token': operations}):
             result = server.handle_rename_undo({'undo_token': 'test-token'})
             self.assertEqual(len(result['restored']), 1)

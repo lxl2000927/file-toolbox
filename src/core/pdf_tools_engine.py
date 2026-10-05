@@ -83,7 +83,7 @@ def render(page, dpi=100, *, max_edge=None, grayscale=False):
     return page.get_pixmap(matrix=fitz.Matrix(scale, scale), colorspace=fitz.csGRAY if grayscale else fitz.csRGB, alpha=False)
 
 
-def _open_source(path, data, stack):
+def _open_source(path, data, stack, check=lambda: None):
     if os.path.splitext(path)[1].lower() == '.pdf':
         doc = stack.enter_context(fitz.open(stream=data, filetype='pdf'))
         if doc.needs_pass:
@@ -91,22 +91,61 @@ def _open_source(path, data, stack):
         kind = 'pdf'
     else:
         with Image.open(io.BytesIO(data)) as original:
-            if original.width * original.height > MAX_RENDER_PIXELS:
-                raise ValueError('图片超过 3200 万像素，请先缩小')
-            # All frames of TIFF/GIF become pages; EXIF orientation is applied.
-            frame_count = getattr(original, 'n_frames', 1)
-            if frame_count > 1000:
-                raise ValueError('单张图片文件帧数超过 1000')
+            # Check headers before building the source PDF. GIF seeks may
+            # decode the preceding canvas, so budget the current frame before
+            # advancing as well. Never enumerate unbounded n_frames eagerly.
+            budget = memory_budget()
+            def check_image_memory(required):
+                try:
+                    check_memory(required, budget)
+                except ValueError:
+                    raise ValueError(f'图片导入预计需要 {required / MIB:.0f} MB 内存，当前预算 {budget / MIB:.0f} MB；'
+                                     '请先缩小图片或拆分多帧文件，再重新导入。') from None
+
+            pixels_by_frame = []
+            decoded_bytes, peak_pixels = 0, 0
+            for frame in range(1001):
+                check()
+                pixels = original.width * original.height
+                if not 0 < pixels <= MAX_RENDER_PIXELS:
+                    raise ValueError('图片超过 3200 万像素，请先缩小')
+                check_image_memory(16 * MIB + len(data) * 2 + decoded_bytes * 2
+                                   + max(peak_pixels, pixels) * 24)
+                try:
+                    original.seek(frame)
+                except EOFError:
+                    break
+                check()
+                pixels = original.width * original.height
+                if not 0 < pixels <= MAX_RENDER_PIXELS:
+                    raise ValueError('图片超过 3200 万像素，请先缩小')
+                if frame == 1000:
+                    raise ValueError('单张图片文件帧数超过 1000')
+                pixels_by_frame.append(pixels)
+                decoded_bytes += pixels * 3
+                peak_pixels = max(peak_pixels, pixels)
+                # Account for retained PDF RGB resources and the live Pillow
+                # frame, EXIF copy, RGBA, white background, mask and encoding.
+                check_image_memory(16 * MIB + len(data) * 2 + decoded_bytes * 2
+                                   + peak_pixels * 24)
             doc = stack.enter_context(fitz.open())
-            for frame in range(frame_count):
+            for frame in range(len(pixels_by_frame)):
+                check()
                 original.seek(frame)
-                img = ImageOps.exif_transpose(original).convert('RGBA')
-                background = Image.new('RGB', img.size, 'white')
-                background.paste(img, mask=img.getchannel('A'))
-                stream = io.BytesIO()
-                background.save(stream, format='PNG')
-                page = doc.new_page(width=img.width, height=img.height)
-                page.insert_image(page.rect, stream=stream.getvalue())
+                check()
+                if original.width * original.height != pixels_by_frame[frame]:
+                    raise ValueError('图片帧尺寸发生变化，请重新载入')
+                check_image_memory(16 * MIB + len(data) * 2 + decoded_bytes * 2
+                                   + peak_pixels * 24)
+                with ImageOps.exif_transpose(original) as oriented, oriented.convert('RGBA') as img:
+                    check()
+                    with Image.new('RGB', img.size, 'white') as background, img.getchannel('A') as mask, io.BytesIO() as stream:
+                        background.paste(img, mask=mask)
+                        background.save(stream, format='PNG')
+                        check()
+                        page = doc.new_page(width=img.width, height=img.height)
+                        page.insert_image(page.rect, stream=stream.getvalue())
+            doc._toolbox_page_bytes = [pixels * 3 for pixels in pixels_by_frame]
         kind = 'image'
     if not len(doc) or len(doc) > MAX_SOURCE_PAGES:
         raise ValueError('文件页数须在 1–10000 之间')
@@ -311,7 +350,7 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, 
                         continue
                     page = docs[ref['source']][ref['index']]
                     pixels = min(MAX_RENDER_PIXELS, page.rect.width * page.rect.height * (dpi / 72) ** 2)
-                    check_memory(int(pixels * 12 + docs.info[ref['source']]['size'] * 2 + 16 * MIB))
+                    check_memory(int(pixels * 12 + docs.memory_size(ref['source']) * 2 + 16 * MIB))
                     check_disk(output_dir, int(pixels * 4))
                     old_rotation = page.rotation
                     try:
@@ -338,7 +377,7 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, 
                             include(reused, 'image')
                             continue
                         pixels = info[2] * info[3]
-                        check_memory(int(pixels * 8 + docs.info[ref['source']]['size'] * 2 + 16 * MIB))
+                        check_memory(int(pixels * 8 + docs.memory_size(ref['source']) * 2 + 16 * MIB))
                         check_disk(output_dir, int(pixels * 4))
                         extracted = doc.extract_image(info[0])
                         if extracted:
@@ -379,8 +418,8 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, 
                         groups = [ordered[i:i + chunk_pages] for i in range(0, len(ordered), chunk_pages)]
 
                 # Estimate complete output units before constructing any merged
-                # document. Source span bytes include temporary pages copied to
-                # preserve links; raster/OCR include encoded output and scratch.
+                # document. Count selected occurrences, including duplicates;
+                # raster/OCR include encoded output and scratch.
                 pixels_by_page = {}
                 if compression == 'raster' or wants_ocr:
                     indexes_by_source = {}
@@ -408,12 +447,9 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, 
                     spans = {}
                     for ref in group:
                         spans.setdefault(ref['source'], []).append(ref['index'])
-                    copy_counts = {i: max(pages) - min(pages) + 1 + len(pages) - len(set(pages))
-                                   for i, pages in spans.items()}
-                    source_bytes = sum(docs.info[i]['size'] * copy_counts[i] / docs.info[i]['page_count']
-                                       for i, pages in spans.items())
-                    source_peak = max(docs.info[i]['size'] for i in spans) * 2
-                    copied_pages = sum(copy_counts.values())
+                    source_bytes = sum(docs.selected_bytes(i, pages) for i, pages in spans.items())
+                    source_peak = max(docs.memory_size(i) for i in spans) * 2
+                    copied_pages = len(group)
                     encoded_pixels = sum(pixels_by_page.get((r['source'], r['index']), 0) for r in group)
                     peak_pixels = max((pixels_by_page.get((r['source'], r['index']), 0) for r in group), default=0)
                     estimate = int(max(source_bytes * 2, encoded_pixels * 0.75) + len(group) * 8192)
@@ -441,52 +477,78 @@ def run_pdf_tool(action, files, options=None, cancel_check=None, progress=None, 
                     check_memory(required)
                     notify('处理输出单元', n, len(groups))
                     with fitz.open() as output:
-                        # Copy whole source page trees first so internal links
-                        # and form relationships survive. select() remaps page
-                        # references after sorting/deleting/extracting pages.
-                        offsets = {}
+                        # Import only selected contiguous runs. Keep repeated
+                        # occurrences as separate page objects and rebuild
+                        # links after all targets exist, including targets in
+                        # another run of the same source.
+                        copied = {}
                         source_indexes = {}
                         for ref in group:
                             source_indexes.setdefault(ref['source'], []).append(ref['index'])
                         source_metadata, source_bookmarks = {}, {}
+                        source_links = {}
                         for source_id, indices in source_indexes.items():
                             check()
-                            first_page, last_page = min(indices), max(indices)
-                            offsets[source_id] = len(output) - first_page
                             source = docs[source_id]
                             source_metadata[source_id] = source.metadata
                             source_bookmarks[source_id] = source.get_toc()
-                            output.insert_pdf(source, from_page=first_page, to_page=last_page, links=True, annots=True, widgets=True)
-                            notify('合并来源文件', len(offsets), len(source_indexes))
-                        chosen = [offsets[ref['source']] + ref['index'] for ref in group]
-                        # select() may alias repeated page objects. Independent
-                        # copies keep each chosen occurrence's rotation intact.
-                        seen_pages = set()
-                        for i, page_index in enumerate(chosen):
-                            if page_index in seen_pages:
+                            selected_indices = set(indices)
+                            for index in selected_indices:
                                 check()
-                                output.fullcopy_page(page_index)
-                                chosen[i] = len(output) - 1
-                            else:
-                                seen_pages.add(page_index)
+                                page = source[index]
+                                links = page.get_links()
+                                for link in links:
+                                    link['from'] = link['from'] * page.derotation_matrix
+                                    if link['kind'] == fitz.LINK_GOTO and link.get('page') in selected_indices and isinstance(link.get('to'), fitz.Point):
+                                        link['to'] = link['to'] * source[link['page']].derotation_matrix
+                                source_links[(source_id, index)] = links
+                            runs = []
+                            for index in indices:
+                                if runs and index == runs[-1][1] + 1:
+                                    runs[-1][1] = index
+                                else:
+                                    runs.append([index, index])
+                            copied[source_id] = iter(range(len(output), len(output) + len(indices)))
+                            for run_index, (first_page, last_page) in enumerate(runs):
+                                check()
+                                output.insert_pdf(source, from_page=first_page, to_page=last_page,
+                                    links=False, annots=True, widgets=True, final=run_index == len(runs) - 1)
+                            notify('合并来源文件', len(copied), len(source_indexes))
+                        chosen = [next(copied[ref['source']]) for ref in group]
                         if chosen != list(range(len(output))):
                             output.select(chosen)
+                        positions = {}
+                        rotations = []
+                        for i, ref in enumerate(group):
+                            positions.setdefault((ref['source'], ref['index']), i)
+                            page = output[i]
+                            rotations.append((page.rotation + ref['rotation']) % 360)
+                            page.set_rotation(0)
                         for i, ref in enumerate(group):
                             check()
                             page = output[i]
-                            page.set_rotation((page.rotation + ref['rotation']) % 360)
+                            for link in source_links[(ref['source'], ref['index'])]:
+                                mapped = dict(link)
+                                if mapped['kind'] == fitz.LINK_GOTO:
+                                    destination = positions.get((ref['source'], mapped.get('page')))
+                                    if destination is None:
+                                        continue
+                                    # Links to a repeated target use its first
+                                    # output occurrence, as do bookmarks.
+                                    mapped['page'] = destination
+                                if mapped['kind'] in (fitz.LINK_GOTO, fitz.LINK_GOTOR, fitz.LINK_URI, fitz.LINK_LAUNCH, fitz.LINK_NAMED):
+                                    page.insert_link(mapped)
                             notify('整理页面', i + 1, len(group))
-                        output.set_metadata(source_metadata[group[0]['source']] if len(offsets) == 1 else {'producer': 'File Toolbox', 'title': name})
-                        positions = {}
-                        for i, ref in enumerate(group):
-                            positions.setdefault((ref['source'], ref['index']), i + 1)
+                        for i, rotation in enumerate(rotations):
+                            output[i].set_rotation(rotation)
+                        output.set_metadata(source_metadata[group[0]['source']] if len(copied) == 1 else {'producer': 'File Toolbox', 'title': name})
                         bookmarks = []
-                        for source_id in offsets:
+                        for source_id in copied:
                             for level, title, old_page in source_bookmarks[source_id]:
                                 new_page = positions.get((source_id, old_page - 1))
-                                if new_page:
+                                if new_page is not None:
                                     level = min(level, bookmarks[-1][0] + 1 if bookmarks else 1)
-                                    bookmarks.append([level, title, new_page])
+                                    bookmarks.append([level, title, new_page + 1])
                         if bookmarks:
                             output.set_toc(bookmarks)
                         filename = f'{name}_{n + 1:03d}' if action == 'segments' or output_mode != 'single' else name

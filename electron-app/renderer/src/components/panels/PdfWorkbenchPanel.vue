@@ -46,7 +46,7 @@ const importing = ref(false);
 const importDone = ref(0), importTotal = ref(0);
 const importIssues = shallowRef<string[]>([]);
 const preparing = ref(false);
-const busy = computed(() => importing.value || preparing.value || task.busy.value || workspace.restoring.value);
+const busy = computed(() => importing.value || preparing.value || task.busy.value || workspace.restoring.value || !workspace.ready.value);
 let importStopped = false, disposed = false;
 onBeforeUnmount(() => { disposed = true; importStopped = true; });
 const dialog = useAppDialog();
@@ -75,14 +75,20 @@ const workspace = useWorkspacePersistence('workbench', (): WorkspaceState => ({ 
   sourceFilter.value = -1;
   notice.value = `已恢复 ${saved.sources.length} 份来源、${saved.pages.length} 页及上次设置。`;
 });
-const sourceProblems = computed(() => workspace.statuses.value.filter(item => item.status !== 'ready' && sources.value[item.index]?.path === item.path));
+const referencedSources = computed(() => new Set(pages.value.map(page => page.source)));
+const sourceProblems = computed(() => workspace.statuses.value.filter(item => item.status !== 'ready' && referencedSources.value.has(item.index) && sources.value[item.index]?.path === item.path));
 const unavailableSources = computed(() => sourceProblems.value.map(item => item.index));
 const shownPages = computed(() => sourceFilter.value < 0 ? pages.value : pages.value.filter(page => page.source === sourceFilter.value));
 function jumpToPage(page: number) { sourceFilter.value = -1; jumpPage.value = page; jumpToken.value++; }
-function filterSource(source: number) { sourceFilter.value = source; jumpPage.value = 1; jumpToken.value++; }
+function filterSource(source: number) {
+  sourceFilter.value = source; jumpPage.value = 1; jumpToken.value++; lastSelected = '';
+  const visible = new Set(shownPages.value.map(page => page.uid));
+  selected.value = selected.value.filter(uid => visible.has(uid));
+}
+watch(pages, () => { if (sourceFilter.value >= 0 && !referencedSources.value.has(sourceFilter.value)) filterSource(-1); });
 watch(workspace.restoring, async restoring => {
   if (restoring || !window.engine) return;
-  const source = sources.value.find((_, index) => !unavailableSources.value.includes(index));
+  const source = sources.value.find((_, index) => referencedSources.value.has(index) && !unavailableSources.value.includes(index));
   if (!source) return;
   try { const inspected = await task.run('inspect', [source.path], { compact_inspect: true }); ocrAvailable.value = Boolean(inspected.ocr?.available); }
   catch (caught) { notice.value = `工作区已恢复，OCR 状态检查暂未完成：${String(caught)}`; }
@@ -108,11 +114,15 @@ const modes: { value: PdfToolAction; title: string; description: string }[] = [
 function edit(next: WorkPage[]) { history.value.commit(next); triggerRef(history); const ids = new Set(next.map(p => p.uid)); selected.value = selected.value.filter(id => ids.has(id)); notice.value = ''; }
 function select(uid: string, range: boolean) {
   if (busy.value) return;
-  const a = pages.value.findIndex(page => page.uid === lastSelected), b = pages.value.findIndex(page => page.uid === uid);
-  if (range && a >= 0) selected.value = [...new Set([...selected.value, ...pages.value.slice(Math.min(a, b), Math.max(a, b) + 1).map(p => p.uid)])];
+  const a = shownPages.value.findIndex(page => page.uid === lastSelected), b = shownPages.value.findIndex(page => page.uid === uid);
+  if (b < 0) return;
+  if (range && a >= 0) selected.value = [...new Set([...selected.value, ...shownPages.value.slice(Math.min(a, b), Math.max(a, b) + 1).map(p => p.uid)])];
   else selected.value = selected.value.includes(uid) ? selected.value.filter(id => id !== uid) : [...selected.value, uid];
   lastSelected = uid;
 }
+const allShownSelected = computed(() => shownPages.value.length > 0 && shownPages.value.every(page => selectedSet.value.has(page.uid)));
+function selectAll() { if (!busy.value) { selected.value = allShownSelected.value ? [] : shownPages.value.map(page => page.uid); lastSelected = ''; } }
+function selectBulk(ids: string[]) { if (!busy.value) { filterSource(-1); selected.value = ids; } }
 function rotate() { edit(pages.value.map(page => selectedSet.value.has(page.uid) ? { ...page, rotation: (page.rotation + 90) % 360 } : page)); }
 function removeSelected() { edit(pages.value.filter(page => !selectedSet.value.has(page.uid))); }
 function move(dragged: string, before: string) { edit(movePages(pages.value, selected.value.includes(dragged) ? selected.value : [dragged], before)); }
@@ -179,15 +189,24 @@ async function clear() {
   if (busy.value) return;
   if (pages.value.length && !await dialog.confirm({ title: '清空工作区', message: '清空当前页面和编辑记录？原文件和已导出文件不受影响。' })) return;
   sources.value = []; history.value = new PageHistory(); selected.value = []; blankIds.value = []; notice.value = ''; result.value = null; resultIsPrevious.value = false; importIssues.value = []; error.value = '';
+  workspace.statuses.value = []; filterSource(-1); lastSelected = '';
+}
+function taskInputs(snapshot: WorkPage[]) {
+  // Keep source slots stable for undo, but only send sources used by this task.
+  const used = new Set(snapshot.map(page => page.source));
+  const indexes = sources.value.map((_, index) => index).filter(index => used.has(index));
+  const remap = new Map(indexes.map((index, next) => [index, next]));
+  return { sources: indexes.map(index => sources.value[index]), pages: snapshot.map(page => ({ ...page, source: remap.get(page.source)! })) };
 }
 async function detectBlank() {
   if (sourceProblems.value.length) { error.value = '请先重新定位缺失或已变化的来源。'; return; }
   error.value = '';
   try {
-    const data = await task.run('detect_blank', sources.value.map(s => s.path), { pages: pages.value, signatures: sources.value.map(s => s.signature) });
+    const input = taskInputs(pages.value);
+    const data = await task.run('detect_blank', input.sources.map(s => s.path), { pages: input.pages, signatures: input.sources.map(s => s.signature) });
     if (data.cancelled) { notice.value = '检查已取消，页面未修改。'; return; }
     const found = new Set(data.candidates?.map(p => `${p.source}:${p.index}`));
-    blankIds.value = pages.value.filter(p => found.has(`${p.source}:${p.index}`)).map(p => p.uid);
+    blankIds.value = input.pages.filter(p => found.has(`${p.source}:${p.index}`)).map(p => p.uid);
     notice.value = blankIds.value.length ? `找到 ${blankIds.value.length} 个疑似空白页。请放大检查，选择后删除；可撤销。` : '未发现符合保守阈值的空白页，页面均已保留。';
     activeTab.value = 'pages';
   } catch (caught) { error.value = String(caught); }
@@ -204,17 +223,19 @@ async function chooseOutput() {
 }
 async function execute(onlySelected = false) {
   if (busy.value || !pages.value.length) return;
-  if (sourceProblems.value.length) { error.value = '请先重新定位缺失或已变化的来源，再输出文件。'; return; }
+  const snapshot = onlySelected ? chosenPages.value : pages.value;
+  const requestedSources = new Set(snapshot.map(page => page.source));
+  if (sourceProblems.value.some(item => requestedSources.has(item.index))) { error.value = '请先重新定位缺失或已变化的来源，再输出文件。'; return; }
   error.value = ''; notice.value = '';
   preparing.value = true;
-  const snapshot = onlySelected ? chosenPages.value : pages.value;
   const exportsImages = !onlySelected && isImageExport.value;
   try {
     if (!snapshot.length) return;
     if (!outputDir.value || outputNeedsSelection) { await chooseOutput(); if (!outputDir.value || outputNeedsSelection) return; }
     if (!exportsImages && compression.value === 'raster' && !await dialog.confirm({ title: '扫描图片压缩', message: '页面会转换为图片，表单和链接将丢失。需要保留可搜索文字时，请同时开启离线 OCR。', kind: 'warning', confirmText: '继续输出' })) return;
-    const completed = await task.run(onlySelected ? 'assemble' : action.value, sources.value.map(s => s.path), {
-      pages: snapshot, signatures: sources.value.map(s => s.signature), output_dir: outputDir.value, filename: filename.value || '整理结果',
+    const input = taskInputs(snapshot);
+    const completed = await task.run(onlySelected ? 'assemble' : action.value, input.sources.map(s => s.path), {
+      pages: input.pages, signatures: input.sources.map(s => s.signature), output_dir: outputDir.value, filename: filename.value || '整理结果',
       compression: compression.value === 'none' && action.value === 'compress' ? 'lossless' : compression.value,
       ocr: !exportsImages && wantsOcr.value, ocr_text: !exportsImages && wantsOcr.value && ocrText.value, language: language.value, dpi: Number(dpi.value), quality: Number(quality.value), image_format: imageFormat.value,
       output_mode: outputMode.value, chunk_pages: Math.max(1, Math.min(10000, Math.floor(Number(chunkPages.value) || 200))),
@@ -252,15 +273,15 @@ function applyPreset(settings: Record<string, unknown>) {
       <section class="document-space">
         <div class="workspace-header"><AppTabs v-model="activeTab" label="工作台内容" id="pdf-workbench" :options="[{ value: 'pages', label: `页面整理${pages.length ? ` · ${pages.length}` : ''}` }, { value: 'outputs', label: `输出结果${result?.output_files.length ? ` · ${result.output_files.length}` : ''}` }]" /><button v-if="sources.length" class="btn small" :disabled="busy" @click="clear">清空</button></div>
         <div v-if="error" class="wb-message error" role="alert">{{ error }}</div>
-        <div v-if="workspace.error.value" class="wb-message error" role="alert">{{ workspace.error.value }} <button class="btn small" @click="workspace.flush">重试保存</button></div>
+        <div v-if="workspace.error.value" class="wb-message error" role="alert">{{ workspace.error.value }} <button class="btn small" :disabled="workspace.restoring.value" @click="workspace.retry">{{ workspace.ready.value ? '重试保存' : '重试恢复' }}</button></div>
         <div v-if="sourceProblems.length" class="wb-message error" role="alert">{{ sourceProblems.length }} 份来源缺失或已变化，页面顺序已保留。请在来源导航中重新定位内容相同的文件。</div>
         <div v-if="notice && (activeTab === 'pages' || !result || resultIsPrevious)" class="wb-message" role="status">{{ notice }}</div>
         <div v-if="importing" class="wb-message" role="status">正在导入 {{ importDone }} / {{ importTotal }} 份 · 已载入 {{ sources.length }} 份，可翻页预览</div>
         <details v-if="importIssues.length" class="import-issues"><summary>{{ importIssues.length }} 项未导入 · 查看原因</summary><ul><li v-for="(issue, i) in importIssues.slice(0, 100)" :key="i">{{ issue }}</li></ul><p v-if="importIssues.length > 100">仅显示前 100 项，请减少选择后分批重试。</p></details>
         <template v-if="activeTab === 'pages'">
           <WorkspaceSources v-if="sources.length" :sources="sources" :pages="pages" :statuses="workspace.statuses.value" :disabled="busy" @jump="jumpToPage" @filter="filterSource" @relocate="workspace.relocate" />
-          <div v-if="sources.length" class="selection-toolbar"><span>已选 {{ selected.length }} 页</span><button class="btn small" :disabled="busy || !pages.length" @click="selected = selected.length === pages.length ? [] : pages.map(p => p.uid)">{{ selected.length === pages.length ? '取消全选' : '全选' }}</button><button class="btn small" :disabled="busy || !selected.length" @click="rotate">旋转 90°</button><button class="btn small" :disabled="busy || !selected.length" @click="moveSelected(-1)">前移</button><button class="btn small" :disabled="busy || !selected.length" @click="moveSelected(1)">后移</button><button class="btn small" :disabled="busy || !selected.length" @click="removeSelected">删除</button><span class="toolbar-spacer" /><button class="btn small" :disabled="busy || !history.canUndo" @click="undo">撤销</button><button class="btn small" :disabled="busy || !history.canRedo" @click="redo">重做</button></div>
-          <PageBulkTools v-if="sources.length" :pages="pages" :selected="selected" :disabled="busy" @select="selected = $event" @move="moveTo" />
+          <div v-if="sources.length" class="selection-toolbar"><span>已选 {{ selected.length }} 页</span><button class="btn small" :disabled="busy || !shownPages.length" @click="selectAll">{{ allShownSelected ? '取消全选' : '全选' }}</button><button class="btn small" :disabled="busy || !selected.length" @click="rotate">旋转 90°</button><button class="btn small" :disabled="busy || !selected.length" @click="moveSelected(-1)">前移</button><button class="btn small" :disabled="busy || !selected.length" @click="moveSelected(1)">后移</button><button class="btn small" :disabled="busy || !selected.length" @click="removeSelected">删除</button><span class="toolbar-spacer" /><button class="btn small" :disabled="busy || !history.canUndo" @click="undo">撤销</button><button class="btn small" :disabled="busy || !history.canRedo" @click="redo">重做</button></div>
+          <PageBulkTools v-if="sources.length" :pages="pages" :selected="selected" :disabled="busy" @select="selectBulk" @move="moveTo" />
           <div v-if="sources.length" class="document-scroll">
             <PdfPageGrid :sources="sources" :pages="shownPages" :all-pages="pages" :jump-page="jumpPage" :jump-token="jumpToken" :unavailable-sources="unavailableSources" :selected="selected" :badges="badges" :disabled="busy" movable @select="select" @move="move" />
             <div v-if="!pages.length" class="empty-pages">页面已全部移除。可以撤销，或继续添加文件。</div>
@@ -278,7 +299,7 @@ function applyPreset(settings: Record<string, unknown>) {
         <div class="settings-scroll">
           <div class="settings-heading"><span class="eyebrow">EXPORT</span><h2>处理与输出</h2></div>
           <div class="mode-options" role="group" aria-label="输出方式"><button v-for="mode in modes" :key="mode.value" :class="{ active: action === mode.value }" :aria-pressed="action === mode.value" :disabled="busy" @click="action = mode.value"><strong>{{ mode.title }}</strong><small>{{ mode.description }}</small></button></div>
-          <section class="option-section"><h3>页面辅助</h3><div class="inline-controls"><button class="btn" :disabled="busy || !pages.length" @click="detectBlank">查找空白页</button><button v-if="blankIds.length" class="btn" :disabled="busy" @click="selected = blankIds.filter(id => pages.some(p => p.uid === id))">选中候选 {{ blankIds.length }} 页</button></div><details class="interleave-settings"><summary>正反面交错合并</summary><p>依次导入正面和背面两个文件；交错后可继续调整。</p><label class="check-row"><input v-model="reverseBack" type="checkbox" :disabled="busy" /> 背面逆序（从最后一页开始）</label><button class="btn" :disabled="busy || sources.length !== 2" @click="interleave">应用交错页序</button></details></section>
+          <section class="option-section"><h3>页面辅助</h3><div class="inline-controls"><button class="btn" :disabled="busy || !pages.length" @click="detectBlank">查找空白页</button><button v-if="blankIds.length" class="btn" :disabled="busy" @click="selectBulk(blankIds.filter(id => pages.some(p => p.uid === id)))">选中候选 {{ blankIds.length }} 页</button></div><details class="interleave-settings"><summary>正反面交错合并</summary><p>依次导入正面和背面两个文件；交错后可继续调整。</p><label class="check-row"><input v-model="reverseBack" type="checkbox" :disabled="busy" /> 背面逆序（从最后一页开始）</label><button class="btn" :disabled="busy || sources.length !== 2" @click="interleave">应用交错页序</button></details></section>
           <section v-if="!isImageExport" class="option-section"><h3>文档优化</h3><label class="field-label" for="wb-compression">压缩方式</label><select id="wb-compression" v-model="compression" :disabled="busy"><option v-if="action !== 'compress'" value="none">不压缩</option><option value="lossless">结构优化 · 保留文字</option><option value="raster">扫描图片压缩 · 可调画质</option></select><p v-if="compression === 'raster'" class="hint caution">页面会转换为图片，链接和表单将丢失。</p><label v-if="action !== 'ocr'" class="check-row"><input v-model="ocr" type="checkbox" :disabled="busy || !ocrAvailable" /> 添加可搜索文字（离线 OCR）</label><template v-if="wantsOcr"><label class="check-row"><input v-model="ocrText" type="checkbox" :disabled="busy" /> 同时导出完整文字 TXT</label><label class="field-label" for="wb-language">识别语言</label><select id="wb-language" v-model="language" :disabled="busy"><option value="chi_sim+eng">简体中文 + English</option><option value="chi_sim">简体中文</option><option value="eng">English</option></select><p class="hint">{{ ocrAvailable ? '语言数据已就绪，文件无需上传。' : '导入文件后检查语言数据状态。' }} OCR 结果请复核。</p></template></section>
           <section v-if="action === 'export_images' || compression === 'raster' || wantsOcr" class="option-section"><h3>画质设置</h3><label v-if="compression === 'raster' && !isImageExport" class="field-label" for="wb-quality-preset">画质预设<select id="wb-quality-preset" :value="qualityPreset" :disabled="busy" @change="setQualityPreset"><option v-for="preset in compressionPresets" :key="preset.id" :value="preset.id">{{ preset.label }} · {{ preset.dpi }} DPI / {{ preset.quality }}</option><option value="custom" disabled>自定义</option></select></label><label v-if="action === 'export_images'" class="field-label">图片格式<select v-model="imageFormat" :disabled="busy"><option value="png">PNG · 无损</option><option value="jpeg">JPEG · 较小体积</option></select></label><div class="field-pair"><label>DPI<input v-model.number="dpi" type="number" min="72" max="400" :disabled="busy" /></label><label v-if="compression === 'raster' || imageFormat === 'jpeg'">JPEG 质量<input v-model.number="quality" type="number" min="30" max="100" :disabled="busy" /></label></div><p class="hint">DPI 越高，细节越多；大尺寸页面会限制像素以控制内存。</p></section>
           <section v-if="!isImageExport" class="option-section"><h3>文件分卷</h3><label class="field-label" for="wb-output-mode">输出组织</label><select id="wb-output-mode" v-model="outputMode" :disabled="busy"><option value="single">合并为单个 PDF</option><option value="source">每个来源单独输出</option><option value="chunks">按页数分卷</option></select><label v-if="outputMode === 'chunks'" class="field-label">每卷页数<input v-model.number="chunkPages" type="number" min="1" max="10000" :disabled="busy" /></label><p class="hint">{{ outputMode === 'source' ? '按来源首次出现的顺序输出，保留每份来源在工作区中的页序。' : outputMode === 'chunks' ? '按工作区页序连续分卷，最后一卷保留剩余页面。' : '单个大 PDF 的内存需求会随文档增长。大量页面建议按来源或页数分卷。' }}</p></section>

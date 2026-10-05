@@ -153,12 +153,19 @@ class OutputCheckpoint:
         record = file_identity(path)
         self.verified[(unit, kind)] = record
         entry = self.state['units'].get(unit)
+        updating = isinstance(entry, dict) and isinstance(entry.get('files'), dict)
         if not isinstance(entry, dict) or not isinstance(entry.get('files'), dict):
             entry = {'files': {}}
             self.state['units'][unit] = entry
         entry['files'][kind], entry['complete'] = record, complete
-        snapshot = copy.deepcopy(self.state)
-        self.result['checkpoint'] = snapshot
-        if self.callback:
-            self.callback(snapshot)
+        # The operation owns this state until it returns. Copy only at an
+        # external callback boundary; walking every previous unit at each
+        # commit makes a many-output job quadratic even without persistence.
+        self.result['checkpoint'] = self.state
+        if self.callback is not None:
+            callback = getattr(self.callback, 'update_unit' if updating else 'commit_unit', None)
+            if callable(callback):
+                callback(self.state['operation'], unit, copy.deepcopy(entry))
+            else:
+                self.callback(copy.deepcopy(self.state))
         return record

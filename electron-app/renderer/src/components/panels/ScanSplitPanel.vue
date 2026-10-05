@@ -222,7 +222,7 @@ const { state: taskState, logs, busy: scanTaskBusy, cancellable: taskCancellable
   },
 });
 
-const taskBusy = computed(() => scanTaskBusy.value || reviewBusy.value || workspace.restoring.value);
+const taskBusy = computed(() => scanTaskBusy.value || reviewBusy.value || workspace.restoring.value || !workspace.ready.value);
 const savedScanSettings = computed(() => ({ options: buildScanOptions(), prefix: prefix.value,
   useMaxSegment: useMaxSegment.value, compression: scanOutputCompression.value, ocr: scanOutputOcr.value }));
 function applySavedScan(settings: Record<string, unknown>) {
@@ -327,6 +327,7 @@ function formatScanOnlyTuneResult(payload: unknown): TuneResult {
 }
 
 async function pickPdf() {
+  if (!workspace.ready.value || workspace.restoring.value) return;
   const paths = await window.electronAPI?.openFileDialog({
     multi: false,
     filters: [{ name: "PDF 文件", extensions: ["pdf"] }],
@@ -334,11 +335,12 @@ async function pickPdf() {
   if (paths?.[0]) {
     restoredSourceMetadata.delete(paths[0]); review.value = null;
     workspace.statuses.value = workspace.statuses.value.filter(item => item.path !== paths[0]);
-    pdfPath.value = paths[0]; await updatePdfPageCount();
+    pdfPath.value = paths[0]; await updatePdfPageCount(); workspace.markDirty();
   }
 }
 
 async function pickReference() {
+  if (!workspace.ready.value || workspace.restoring.value) return;
   const paths = await window.electronAPI?.openFileDialog({
     multi: false,
     filters: [
@@ -348,7 +350,7 @@ async function pickReference() {
   if (paths?.[0]) {
     restoredSourceMetadata.delete(paths[0]); review.value = null;
     workspace.statuses.value = workspace.statuses.value.filter(item => item.path !== paths[0]);
-    referenceImage.value = paths[0]; loadReferencePreview();
+    referenceImage.value = paths[0]; loadReferencePreview(); workspace.markDirty();
   }
 }
 
@@ -1418,7 +1420,15 @@ const workspace = useWorkspacePersistence('scan', snapshotScanWorkspace, async s
     await nextTick();
   } finally { restoringWorkspace = false; }
 });
-const sourceProblems = computed(() => workspace.statuses.value.filter(item => item.status !== 'ready' && (item.path === pdfPath.value || item.path === referenceImage.value)));
+const sourceProblems = computed(() => {
+  const current = [
+    ...(pdfPath.value ? [{ path: pdfPath.value, role: 'document' }] : []),
+    ...(referenceImage.value ? [{ path: referenceImage.value, role: 'reference' }] : []),
+  ];
+  return workspace.statuses.value.filter(item => item.status !== 'ready')
+    .map(item => ({ ...item, index: current.findIndex(source => source.path === item.path && (!item.role || item.role === source.role)) }))
+    .filter(item => item.index >= 0);
+});
 const documentUnavailable = computed(() => sourceProblems.value.some(item => item.path === pdfPath.value));
 watch(workspace.restoring, restoring => {
   if (restoring) return;
@@ -1440,7 +1450,7 @@ function reviewOutputSelected(path: string) { outputDir.value = path; outputNeed
       title="扫描拆分"
       :message="scanBannerMessage"
     />
-    <div class="workspace-restore-status" role="status">{{ workspace.label.value }}<span v-if="workspace.error.value"> · {{ workspace.error.value }} <button class="btn btn-sm" @click="workspace.flush">重试保存</button></span><div v-for="item in sourceProblems" :key="item.path">{{ fileBasename(item.path) }}：{{ item.status === 'missing' ? '来源缺失' : '来源已变化' }}，复核标记已保留。<button class="btn btn-sm" :disabled="taskBusy" @click="workspace.relocate(item.index)">重新定位相同内容</button></div></div>
+    <div class="workspace-restore-status" role="status">{{ workspace.label.value }}<span v-if="workspace.error.value"> · {{ workspace.error.value }} <button class="btn btn-sm" :disabled="workspace.restoring.value" @click="workspace.retry">{{ workspace.ready.value ? '重试保存' : '重试恢复' }}</button></span><div v-for="item in sourceProblems" :key="item.path">{{ fileBasename(item.path) }}：{{ item.status === 'missing' ? '来源缺失' : '来源已变化' }}，复核标记已保留。<button class="btn btn-sm" :disabled="taskBusy" @click="workspace.relocate(item.index)">重新定位相同内容</button></div></div>
 
     <div v-show="review && reviewExpanded" class="scan-review-page glass-card">
       <ScanReview v-if="review" :key="review.pdfPath + review.signature + JSON.stringify(review.options)" :pdf-path="review.pdfPath" :signature="review.signature" :total="review.total" :initial-markers="review.markers" :initial-segments="review.segments" :options="review.options" :output-dir="outputDir" :prefix="prefix" :unavailable="documentUnavailable" :output-needs-selection="outputNeedsSelection" v-model:compression="scanOutputCompression" v-model:ocr="scanOutputOcr" @change="saveReviewEdits" @output-selected="reviewOutputSelected" @busy="reviewBusy = $event" @back="reviewExpanded = false" />
@@ -1474,7 +1484,7 @@ function reviewOutputSelected(path: string) { outputDir.value = path; outputNeed
         <section v-show="activityTab === 'reference'" id="scan-activity-reference-panel" class="ref-group" role="tabpanel" aria-labelledby="scan-activity-reference-tab">
           <div class="reference-heading">
             <div class="reference-heading-text"><span class="param-label" :title="referenceImage">{{ referenceImage ? fileBasename(referenceImage) : '参考文件' }}</span><span v-if="!referenceImage" class="section-caption">{{ needsReference ? '特征匹配必需' : '可选' }}</span></div>
-            <button class="btn btn-outline btn-sm" @click="pickReference">{{ referenceImage ? '更换参考' : '选择参考' }}</button>
+            <button class="btn btn-outline btn-sm" :disabled="taskBusy" @click="pickReference">{{ referenceImage ? '更换参考' : '选择参考' }}</button>
           </div>
           <div class="ref-group-inner">
             <div v-if="!referenceImage" class="ref-empty">

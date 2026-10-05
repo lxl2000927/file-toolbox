@@ -17,6 +17,7 @@ from src.utils.path_utils import make_unique_output_path, make_unique_temp_path
 from src.utils.input_guard import open_input
 from src.utils.file_metadata import copy_stream_metadata
 from src.utils.atomic_output import publish_exclusive
+from src.utils.output_resources import CheckedOutputStream, check_disk
 
 
 CancelCheck = Callable[[], bool]
@@ -105,6 +106,7 @@ def write_pdf_output_jobs(
         return []
 
     os.makedirs(output_dir, exist_ok=True)
+    check_disk(output_dir)
     if used_paths is None:
         used_paths = set()
     outputs: list[str] = []
@@ -140,7 +142,10 @@ def write_pdf_output_jobs(
                 try:
                     src_f.seek(0)
                     with open(tmp_path, "xb") as out_f:
-                        shutil.copyfileobj(src_f, out_f)
+                        check_disk(output_dir, os.fstat(src_f.fileno()).st_size)
+                        checked = CheckedOutputStream(out_f, output_dir)
+                        shutil.copyfileobj(src_f, checked)
+                        checked.finish()
                         copy_stream_metadata(src_f, out_f)
                     out_path = _publish_reserved_output(tmp_path, out_path, output_dir,
                         normalized_jobs[0].filename, used_paths, reserved)
@@ -156,19 +161,18 @@ def write_pdf_output_jobs(
                             raise
                         return outputs
                     raise
-                if _is_cancelled(cancel_check):
-                    if cleanup_outputs_on_cancel:
-                        try:
-                            if os.path.exists(out_path):
-                                os.remove(out_path)
-                        except Exception:
-                            pass
-                        _remove_paths(outputs)
-                        raise RuntimeError("已取消")
+                if not cleanup_outputs_on_cancel:
+                    # Resumable callers commit the artifact before check() may
+                    # block and announce that the task is safely paused.
                     outputs.append(out_path)
                     if on_output:
                         on_output(out_path, list(normalized_jobs[0].page_indexes), time.perf_counter() - started_at)
+                    _is_cancelled(cancel_check)
                     return outputs
+                if _is_cancelled(cancel_check):
+                    _remove_paths([out_path])
+                    _remove_paths(outputs)
+                    raise RuntimeError("已取消")
                 outputs.append(out_path)
                 if on_output:
                     on_output(out_path, list(normalized_jobs[0].page_indexes), time.perf_counter() - started_at)
@@ -193,7 +197,9 @@ def write_pdf_output_jobs(
                             if _is_cancelled(cancel_check):
                                 raise RuntimeError("已取消")
                             writer.add_page(reader.pages[page_index])
-                        writer.write(out_f)
+                        checked = CheckedOutputStream(out_f, output_dir)
+                        writer.write(checked)
+                        checked.finish()
                     out_path = _publish_reserved_output(tmp_path, out_path, output_dir,
                         job.filename, used_paths, reserved)
                 except Exception:
@@ -208,19 +214,17 @@ def write_pdf_output_jobs(
                             raise
                         return outputs
                     raise
-                if _is_cancelled(cancel_check):
-                    if cleanup_outputs_on_cancel:
-                        try:
-                            if os.path.exists(out_path):
-                                os.remove(out_path)
-                        except Exception:
-                            pass
-                        _remove_paths(outputs)
-                        raise RuntimeError("已取消")
+                if not cleanup_outputs_on_cancel:
                     outputs.append(out_path)
                     if on_output:
                         on_output(out_path, list(job.page_indexes), time.perf_counter() - started_at)
-                    return outputs
+                    if _is_cancelled(cancel_check):
+                        return outputs
+                    continue
+                if _is_cancelled(cancel_check):
+                    _remove_paths([out_path])
+                    _remove_paths(outputs)
+                    raise RuntimeError("已取消")
                 outputs.append(out_path)
                 if on_output:
                     on_output(out_path, list(job.page_indexes), time.perf_counter() - started_at)

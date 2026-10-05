@@ -160,10 +160,28 @@ def main():
             assert renamed['successful'] == 1
             assert not engine.call('rename.undo', {'undo_token': renamed['undo_token']})['failed']
             checks.append('rename copy and undo')
+            renamed = engine.call('rename.execute', {'files': [str(front)], 'rules': [{'type': 'insert_text', 'text': 'protected_'}],
+                'save_method': 'copy', 'output_dir': str(directory / 'renamed'), '_input_identities': {str(front): identity(front)}})
+            changed_copy = Path(renamed['operations'][0]['new_path'])
+            changed_copy.write_bytes(b'new user edit after copy')
+            conflict = engine.call('rename.undo', {'undo_token': renamed['undo_token']})
+            assert conflict['failed'] and not conflict['restored']
+            assert changed_copy.read_bytes() == b'new user edit after copy'
+            checks.append('2.7.1 undo preserves externally edited output')
             preset = engine.call('presets.save', {'scope': 'workbench', 'name': 'Smoke', 'settings': {'dpi': 150}})
             assert engine.call('presets.list', {'scope': 'workbench'})[0]['id'] == preset['id']
             assert engine.call('history.get', {'count': 100})['records']
             checks.append('preset persistence and operation history')
+
+            sparse_source = directory / 'sparse-1000.pdf'
+            with pymupdf.open() as document:
+                for page in range(1000):
+                    document.new_page(width=100, height=100).insert_text((10, 30), f'PAGE {page + 1}')
+                document.save(sparse_source)
+            sparse = tool('assemble', [sparse_source], filename='sparse',
+                          pages=[{'source': 0, 'index': 999, 'rotation': 90}, {'source': 0, 'index': 0}])
+            assert document_pages(sparse['output_files']) == [[('PAGE 1000', 90), ('PAGE 1', 0)]]
+            checks.append('2.7.1 sparse first/last pages preserve content, order and rotation')
 
             # Dedicated content fixtures make page ordering and output grouping
             # assertions independent of acceptance-sample artwork or metadata.

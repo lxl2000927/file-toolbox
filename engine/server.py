@@ -237,6 +237,24 @@ def _checkpoint(task_id, value=None):
     return _TASK_STORE.get_checkpoint(task_id)
 
 
+class _CheckpointCallback:
+    def __init__(self, task_id):
+        self.task_id = task_id
+
+    def __call__(self, value):
+        return _checkpoint(self.task_id, value)
+
+    def commit_unit(self, operation, key, unit, *, meta=None):
+        if _TASK_STORE is not None:
+            return _TASK_STORE.checkpoint_unit(self.task_id, operation, key, unit, meta=meta)
+
+    update_unit = commit_unit
+
+    def update_meta(self, operation, changes):
+        if _TASK_STORE is not None:
+            return _TASK_STORE.checkpoint_meta(self.task_id, operation, changes)
+
+
 def _new_task_id(prefix: str) -> str:
     return f"{prefix}_{os.urandom(8).hex()}"
 
@@ -488,6 +506,20 @@ def handle_rename_preview(params: dict) -> list[dict]:
     return [{"old": old, "new": new} for old, new in results]
 
 
+def _rename_output_identity(path):
+    """Bind undo to both the produced file object and its content."""
+    before = os.lstat(path)
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError('撤销目标不是普通文件')
+    content = output_identity(path)
+    after = os.lstat(path)
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns')
+    identity = tuple(getattr(before, key) for key in fields)
+    if identity != tuple(getattr(after, key) for key in fields):
+        raise ValueError('撤销目标在校验期间发生变化')
+    return {'file': identity, 'content': content}
+
+
 def handle_rename_execute(params: dict) -> dict:
     engine = _make_rename_engine()
     engine.set_rules(params.get("rules", []))
@@ -496,7 +528,13 @@ def handle_rename_execute(params: dict) -> dict:
         save_method=params.get("save_method", "copy"),
         output_dir=params.get("output_dir", ""),
     )
-    operations = [op for op in result.get("operations", []) if isinstance(op, dict) and op.get("success")]
+    operations = [dict(op) for op in result.get("operations", []) if isinstance(op, dict) and op.get("success")]
+    for operation in operations:
+        try:
+            operation['_undo_identity'] = _rename_output_identity(operation['new_path'])
+        except (OSError, ValueError):
+            # The rename succeeded, but an unverifiable output is never safe to delete.
+            operation['_undo_identity'] = None
     if operations:
         undo_token = os.urandom(16).hex()
         with _UNDO_LOCK:
@@ -546,6 +584,10 @@ def handle_rename_undo(params: dict) -> dict:
                 continue
             if not os.path.exists(new_path):
                 failed.append({"path": new_path, "error": "目标不存在"})
+                remaining.append(op)
+                continue
+            if not op.get('_undo_identity') or _rename_output_identity(new_path) != op['_undo_identity']:
+                failed.append({'path': new_path, 'error': '目标身份或内容已发生变化，已保留文件；无法安全撤销'})
                 remaining.append(op)
                 continue
             if operation == "copy":
@@ -661,7 +703,7 @@ def _run_pdf_split_async(task_id: str, params: dict, cancel_flag: threading.Even
         })
         engine = _make_pdf_split_engine()
         results = engine.execute_split(pdf_paths, config, cancel_check=lambda: _cancel_check(cancel_flag),
-                                       checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value))
+                                       checkpoint=_checkpoint(task_id), on_checkpoint=_CheckpointCallback(task_id))
         cancelled = cancel_flag.is_set()
         if cancelled and "已取消" not in results.get("errors", []):
             results.setdefault("errors", []).append("已取消")
@@ -830,7 +872,7 @@ def _run_scan_split_async(task_id: str, params: dict, cancel_flag: threading.Eve
             phase_progress=lambda phase, current, total: send_notification("task.progress", {
                 "task_id": task_id, "phase": phase, "current": current, "total": total,
             }),
-            checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value),
+            checkpoint=_checkpoint(task_id), on_checkpoint=_CheckpointCallback(task_id),
         )
 
         serialized = _serialize_scan_result(result)
@@ -1270,7 +1312,7 @@ def _run_pdf_tools(task_id, params, cancel_flag):
                                cancel_check=lambda: _cancel_check(cancel_flag),
                                progress=lambda phase, current, total: send_notification('task.progress', {
                                    'task_id': task_id, 'phase': phase, 'current': current, 'total': total}),
-                               checkpoint=_checkpoint(task_id), on_checkpoint=lambda value: _checkpoint(task_id, value))
+                               checkpoint=_checkpoint(task_id), on_checkpoint=_CheckpointCallback(task_id))
         final_checkpoint = results.pop('checkpoint', None)
         if final_checkpoint is not None:
             try:

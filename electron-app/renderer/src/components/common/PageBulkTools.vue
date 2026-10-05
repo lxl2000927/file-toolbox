@@ -21,11 +21,11 @@ function move() {
 </script>
 <template>
   <details class="bulk-tools">
-    <summary>批量选页与移动 <span>页码按当前排序计算</span></summary>
+    <summary>批量选页与移动 <span>页码按全部页面当前排序计算</span></summary>
     <div class="bulk-body">
       <form class="bulk-row" @submit.prevent="choose('range')"><input v-model="expression" aria-label="页码范围" placeholder="例如 1-5,8,12-20" :disabled="disabled" maxlength="20000" /><button class="btn" :disabled="disabled || !pages.length">按页码选中</button></form>
       <div class="bulk-row"><button v-for="item in ([['odd', '奇数页'], ['even', '偶数页'], ['invert', '反选']] as const)" :key="item[0]" class="btn" :disabled="disabled || !pages.length" @click="choose(item[0])">{{ item[1] }}</button><span>范围和奇偶页会替换当前选择</span></div>
-      <form class="bulk-row move-row" @submit.prevent="move"><label for="bulk-position">移动后起始位置</label><input id="bulk-position" v-model.number="position" type="number" min="1" :max="maximum" :disabled="disabled || !selected.length" /><button class="btn" :disabled="disabled || !selected.length">移动所选</button><span>保持所选页顺序 · 可撤销</span></form>
+      <form class="bulk-row move-row" @submit.prevent="move"><label for="bulk-position">全工作区移动后起始位置</label><input id="bulk-position" v-model.number="position" type="number" min="1" :max="maximum" :disabled="disabled || !selected.length" /><button class="btn" :disabled="disabled || !selected.length">移动所选</button><span>保持所选页顺序 · 可撤销</span></form>
       <p v-if="error" class="bulk-error" role="alert">{{ error }}</p>
     </div>
   </details>

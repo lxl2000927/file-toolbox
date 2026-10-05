@@ -5,8 +5,8 @@ const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 const { buildSync } = require('esbuild');
-function moduleUnderTest() {
-  const code = buildSync({ entryPoints: [path.join(__dirname, '../main/workspace-store.ts')], bundle: true, platform: 'node', format: 'cjs', write: false }).outputFiles[0].text;
+function moduleUnderTest(file = 'workspace-store.ts') {
+  const code = buildSync({ entryPoints: [path.join(__dirname, '../main', file)], bundle: true, platform: 'node', format: 'cjs', write: false }).outputFiles[0].text;
   const mod = { exports: {} }; vm.runInNewContext(code, { module: mod, exports: mod.exports, require, Buffer, process, console }); return mod.exports;
 }
 const source = (index = 0) => ({ path: `C:/docs/${index}.pdf`, name: `${index}.pdf`, kind: 'pdf', page_count: 1, signature: `sig-${index}`, size: 12 });
@@ -76,5 +76,28 @@ test('failed atomic replace retains previous document and reports failure from f
     await assert.rejects(f.store.save('workbench', changed), /disk full/); await assert.rejects(f.store.flush(), /disk full/);
     assert.equal((await f.store.load('workbench')).state.pages[0].rotation, 0);
     fail = false; await f.store.save('workbench', changed); await f.store.flush(); assert.equal((await f.store.load('workbench')).state.pages[0].rotation, 180);
+  } finally { await f.cleanup(); }
+});
+
+test('fresh native selection refreshes blank-signature identity once and ordinary edits reuse it', async () => {
+  const { captureDocument, verifyIdentity } = moduleUnderTest('restored-access.ts');
+  let generation = 1, captures = 0, failWrite = false;
+  const f = await fixture({ getSelectionGeneration: () => generation,
+    capture: async s => { captures++; return captureDocument(s.path, 1024); },
+    verify: async (s, id) => { try { await verifyIdentity(s.path, id, 'file'); return { status: 'ready' }; } catch { return { status: 'changed' }; } },
+    atomicWrite: async (file, content) => { if (failWrite) throw Error('disk full'); await fs.writeFile(file, content); },
+  });
+  try {
+    const document = path.join(f.dir, 'input.pdf'); await fs.writeFile(document, 'original synthetic identity bytes');
+    const input = state(); input.sources[0] = { ...input.sources[0], path: document, signature: '' };
+    await f.store.save('scan', input); assert.equal((await f.store.load('scan')).sources[0].status, 'ready');
+    await fs.writeFile(document, 'new native selection replacement bytes'); generation++;
+    await f.store.save('scan', input);
+    assert.equal((await f.store.load('scan')).sources[0].status, 'ready'); assert.equal(captures, 2);
+    input.settings.filename = 'ordinary edit'; await f.store.save('scan', input); assert.equal(captures, 2);
+    await fs.writeFile(document, 'third native selection replacement bytes'); generation++; failWrite = true;
+    await assert.rejects(f.store.save('scan', input), /disk full/); failWrite = false;
+    await f.store.save('scan', input); assert.equal(captures, 4);
+    assert.equal((await f.store.load('scan')).sources[0].status, 'ready');
   } finally { await f.cleanup(); }
 });

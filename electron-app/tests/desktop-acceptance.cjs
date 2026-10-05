@@ -113,7 +113,7 @@ app.whenReady().then(async () => {
       assert.equal(await js("document.querySelector('.page-caption').textContent.includes('90°')"), false);
     });
     await check('bulk range, odd/even, invert, stable move and undo use current page positions', async () => {
-      await click('批量选页与移动 页码按当前排序计算', '.bulk-tools summary');
+      await js("document.querySelector('.bulk-tools').open = true");
       await input('[aria-label="页码范围"]', '2,4'); await click('按页码选中');
       const selected = "[...document.querySelectorAll('.page-top input')].flatMap((e,i)=>e.checked?[i+1]:[])";
       assert.deepEqual(await js(selected), [2,4]);

@@ -1,6 +1,6 @@
 # Local fallback is allowed only when no existing installation or shortcut can
 # be replaced. All application data uses a new profile and the test uninstalls.
-param([switch] $LocalIsolated)
+param([switch] $LocalIsolated, [string] $CandidateManifest)
 
 $ErrorActionPreference = 'Stop'
 if (!$LocalIsolated -and ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_OS -ne 'Windows')) {
@@ -41,6 +41,18 @@ $cachedReleases = if ($LocalIsolated) {
 function Get-Installer([string] $tag, [string] $packageDirectory) {
     $assetName = "File.Toolbox-$($tag.Substring(1))-x64-setup.exe"
     $localAsset = Join-Path $PSScriptRoot "../electron-app/release/$assetName"
+    if ($CandidateManifest -and $tag -eq $env:RELEASE_TAG) {
+        $manifest = Get-Content -LiteralPath $CandidateManifest -Raw | ConvertFrom-Json
+        $record = @($manifest.records | Where-Object name -eq $assetName)
+        if (!$manifest.passed -or $manifest.version -ne $tag.Substring(1) -or $record.Count -ne 1) { throw 'Invalid local candidate manifest' }
+        if (!(Test-Path -LiteralPath $localAsset) -or
+            (Get-Item -LiteralPath $localAsset).Length -ne $record[0].size -or
+            (Get-FileHash -LiteralPath $localAsset -Algorithm SHA256).Hash.ToLowerInvariant() -ne $record[0].sha256) {
+            throw 'Local candidate does not match its verified manifest'
+        }
+        Copy-Item -LiteralPath $localAsset -Destination (Join-Path $packageDirectory $assetName)
+        return
+    }
     $remoteAsset = $cachedReleases | Where-Object tag_name -eq $tag | ForEach-Object assets | Where-Object name -eq $assetName
     if ($LocalIsolated -and $remoteAsset -and (Test-Path -LiteralPath $localAsset)) {
         $digest = 'sha256:' + (Get-FileHash -LiteralPath $localAsset -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -70,7 +82,8 @@ $executable = Join-Path $installDir 'File Toolbox.exe'
 $baseVersion = $env:BASE_TAG.Substring(1)
 $candidateVersion = $env:RELEASE_TAG.Substring(1)
 $baseArguments = @('--exe', $executable, '--type', 'installer', '--version', $baseVersion,
-    '--legacy-navigation', '--profile', $profileDir, '--set-collapsed', '--report', (Join-Path $evidenceDir 'base.json'))
+    '--profile', $profileDir, '--set-collapsed', '--report', (Join-Path $evidenceDir 'base.json'))
+if ([version]$baseVersion -lt [version]'2.7.0') { $baseArguments += '--legacy-navigation' }
 if ($env:VERIFY_UPDATE_CHANNEL -eq 'true') {
     $baseArguments += @('--update-version', $candidateVersion, '--download-update')
 }
